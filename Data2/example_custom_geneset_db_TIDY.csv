@@ -1,0 +1,69 @@
+Gene_Set_ID,Gene_Set_Name,UniProt_Accession
+p53_pathway,p53 / DNA-damage response,P04637
+p53_pathway,p53 / DNA-damage response,Q00987
+p53_pathway,p53 / DNA-damage response,P38936
+p53_pathway,p53 / DNA-damage response,Q13315
+p53_pathway,p53 / DNA-damage response,O96017
+p53_pathway,p53 / DNA-damage response,P38398
+p53_pathway,p53 / DNA-damage response,P51587
+p53_pathway,p53 / DNA-damage response,Q13535
+p53_pathway,p53 / DNA-damage response,O14757
+cell_cycle,Cell cycle progression,P24385
+cell_cycle,Cell cycle progression,P11802
+cell_cycle,Cell cycle progression,Q00534
+cell_cycle,Cell cycle progression,P06400
+cell_cycle,Cell cycle progression,Q01094
+cell_cycle,Cell cycle progression,P24864
+cell_cycle,Cell cycle progression,P24941
+apoptosis,Apoptosis,Q07812
+apoptosis,Apoptosis,P10415
+apoptosis,Apoptosis,P42574
+apoptosis,Apoptosis,P55211
+apoptosis,Apoptosis,O14727
+apoptosis,Apoptosis,P55957
+apoptosis,Apoptosis,Q16611
+pi3k_akt,PI3K-AKT signaling,P42336
+pi3k_akt,PI3K-AKT signaling,P31749
+pi3k_akt,PI3K-AKT signaling,P60484
+pi3k_akt,PI3K-AKT signaling,P42345
+pi3k_akt,PI3K-AKT signaling,P49841
+mapk_erk,MAPK / ERK signaling,P01116
+mapk_erk,MAPK / ERK signaling,P15056
+mapk_erk,MAPK / ERK signaling,Q02750
+mapk_erk,MAPK / ERK signaling,P28482
+mapk_erk,MAPK / ERK signaling,P27361
+mapk_erk,MAPK / ERK signaling,P00533
+wnt_signaling,Wnt signaling,P35222
+wnt_signaling,Wnt signaling,P25054
+wnt_signaling,Wnt signaling,O15169
+wnt_signaling,Wnt signaling,P04628
+wnt_signaling,Wnt signaling,Q9UP38
+wnt_signaling,Wnt signaling,O75581
+wnt_signaling,Wnt signaling,P36402
+autophagy,Autophagy,Q14457
+autophagy,Autophagy,Q9H1Y0
+autophagy,Autophagy,O95352
+autophagy,Autophagy,Q9GZQ8
+autophagy,Autophagy,Q13501
+autophagy,Autophagy,O75385
+dna_repair_mmr_ber,DNA repair (mismatch / base-excision),P40692
+dna_repair_mmr_ber,DNA repair (mismatch / base-excision),P43246
+dna_repair_mmr_ber,DNA repair (mismatch / base-excision),P52701
+dna_repair_mmr_ber,DNA repair (mismatch / base-excision),P54278
+dna_repair_mmr_ber,DNA repair (mismatch / base-excision),P18887
+dna_repair_mmr_ber,DNA repair (mismatch / base-excision),P09874
+dna_repair_mmr_ber,DNA repair (mismatch / base-excision),O15527
+immune_inflammation,Immune / inflammatory response,P01375
+immune_inflammation,Immune / inflammatory response,P05231
+immune_inflammation,Immune / inflammatory response,P01584
+immune_inflammation,Immune / inflammatory response,P19838
+immune_inflammation,Immune / inflammatory response,O00206
+immune_inflammation,Immune / inflammatory response,P40763
+immune_inflammation,Immune / inflammatory response,P01579
+metabolism_glucose,Glucose / insulin metabolism,P01308
+metabolism_glucose,Glucose / insulin metabolism,P06213
+metabolism_glucose,Glucose / insulin metabolism,P04406
+metabolism_glucose,Glucose / insulin metabolism,P14618
+metabolism_glucose,Glucose / insulin metabolism,P52789
+metabolism_glucose,Glucose / insulin metabolism,P37231
+metabolism_glucose,Glucose / insulin metabolism,P14672

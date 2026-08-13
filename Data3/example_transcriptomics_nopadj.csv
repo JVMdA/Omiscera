@@ -1,0 +1,11 @@
+Gene Symbol,log2FoldChange,pvalue
+TP53,-2.35,1.2e-9
+BRCA1,-1.85,4.5e-7
+BRCA2,-1.42,2.1e-6
+MYC,3.10,8.3e-10
+EGFR,2.75,6.7e-8
+KRAS,1.95,3.2e-6
+PTEN,-1.20,5.4e-5
+GAPDH,0.05,0.87
+ACTB,-0.08,0.79
+STAT3,0.95,1.2e-3

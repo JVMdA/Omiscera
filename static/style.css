@@ -1,0 +1,1450 @@
+/* Omiscera — palette and typography ported from main3.py's injected CSS. */
+
+:root {
+    --omiscera-bg: #FFFFFF;
+    --omiscera-bg-soft: #FDFDFD;
+    --omiscera-sidebar: #F4F7FB;
+    --omiscera-card-bg: #F8FAFC;
+    --omiscera-card-border: #E5EAF0;
+    --omiscera-btn-bg: #BFD3E3;
+    --omiscera-btn-border: #9FB8CC;
+    --omiscera-btn-hover: #B2C9DC;
+    --omiscera-btn-hover-light: #D7E4EE;
+    --omiscera-text: #102A43;
+    --omiscera-text-muted: #486581;
+    --omiscera-home-subtitle: #1F334A;
+    --omiscera-genomics: #083B6B;
+    --omiscera-transcriptomics: #7F9BB3;
+    --omiscera-proteomics: #AFC4D5;
+    --omiscera-proteomics-border: #9FB8CC;
+    --omiscera-metabolomics: #FF8289;
+    /* Results-screen section rail. Coral is already a brand colour (it IS
+       --omiscera-metabolomics, and half the Multiomics gradient), reused here
+       as global chrome rather than a module badge - the rail appears on every
+       results screen. To retreat to a module-aware tint later, only these four
+       values need changing (e.g. #EAF0F7 / #C8D6E6 / #083B6B / #4A6784). */
+    --omiscera-rail-bg: #FCEBEC;
+    --omiscera-rail-border: #F0C9CD;
+    --omiscera-rail-accent: #FF8289;
+    --omiscera-rail-label: #A65E63;
+    --omiscera-dark-text: #1F1F1F;
+    --omiscera-low-confidence: #ffd6d6;
+    --omiscera-significant: #d6f5e0;
+    /* Gene Function Annotation status badges (well-characterized/moderate/sparse) */
+    --omiscera-annot-well: #d6f5e0;
+    --omiscera-annot-moderate: #fff3cd;
+    --omiscera-annot-sparse: #e5eaf0;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+    margin: 0;
+    padding: 0;
+    background-color: var(--omiscera-bg);
+    color: var(--omiscera-text);
+    font-family: "Source Sans Pro", "Segoe UI", Arial, sans-serif;
+    font-size: 16px;
+}
+
+#app {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 0 2.2rem 3rem 2.2rem;
+}
+
+.hidden { display: none !important; }
+
+a { color: var(--omiscera-text); }
+
+/* ---------------- Top navigation ---------------- */
+
+.top-nav-bar {
+    width: 86%;
+    max-width: 1040px;
+    margin: 0.85rem auto 1.4rem auto;
+    padding: 0.52rem 0.65rem;
+    background-color: var(--omiscera-btn-bg);
+    border: 1px solid var(--omiscera-btn-border);
+    border-radius: 18px;
+    display: flex;
+    gap: 0.5rem;
+}
+
+.nav-btn {
+    flex: 1 1 0;
+    min-height: 2.75rem;
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: 13px;
+    color: var(--omiscera-text);
+    font-weight: 750;
+    font-size: 1.21rem;
+    cursor: pointer;
+    transition: background-color 0.12s ease;
+}
+
+.nav-btn:hover {
+    background-color: var(--omiscera-btn-hover-light);
+    border-color: #8FAFC7;
+}
+
+.nav-btn.active {
+    background-color: var(--omiscera-bg-soft);
+    border-color: #7EA4C1;
+    font-weight: 800;
+}
+
+/* ---------------- Generic buttons ---------------- */
+
+.btn {
+    min-height: 2.6rem;
+    padding: 0.5rem 1.1rem;
+    background-color: var(--omiscera-btn-bg);
+    border: 1px solid var(--omiscera-btn-border);
+    border-radius: 10px;
+    color: var(--omiscera-text);
+    font-weight: 650;
+    font-size: 1rem;
+    cursor: pointer;
+    width: 100%;
+}
+
+.btn:hover:not(:disabled) {
+    background-color: var(--omiscera-btn-hover);
+    border-color: #8FAFC7;
+}
+
+.btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.btn-primary {
+    background-color: var(--omiscera-genomics);
+    border-color: var(--omiscera-genomics);
+    color: #FFFFFF;
+}
+
+.btn-primary:hover:not(:disabled) {
+    background-color: #0a4d8c;
+    border-color: #0a4d8c;
+}
+
+.btn-row {
+    display: flex;
+    gap: 0.75rem;
+}
+
+.btn-row .btn { flex: 1 1 0; }
+
+.right-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 1.1rem;
+}
+
+.right-actions .btn-row { width: 40%; min-width: 320px; }
+
+/* ---------------- Home screen ---------------- */
+
+.home-screen { background-color: var(--omiscera-bg-soft); padding-top: 0.4rem; }
+
+.home-logo {
+    display: block;
+    width: 80%;
+    max-width: 967px;
+    height: auto;
+    margin: 0 10% 0.2rem auto;
+    object-fit: contain;
+}
+
+.home-heading { text-align: center; margin: 0 0 1.6rem 0; }
+
+.home-subtitle {
+    color: var(--omiscera-home-subtitle);
+    font-size: 2.1rem;
+    font-weight: 600;
+    line-height: 1.25;
+}
+
+.home-buttons {
+    width: 45%;
+    min-width: 340px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+}
+
+.big-btn {
+    min-height: 5.2rem;
+    background-color: var(--omiscera-btn-bg);
+    border: 1px solid var(--omiscera-btn-border);
+    border-radius: 14px;
+    color: var(--omiscera-text);
+    font-size: 1.57rem;
+    font-weight: 800;
+    text-align: center;
+    cursor: pointer;
+}
+
+.big-btn:hover { background-color: var(--omiscera-btn-hover); border-color: #8FAFC7; }
+
+/* ---------------- Annotation Analytics header / module grid ---------------- */
+
+.aa-header {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    margin: 1.45rem 0 1.1rem 0;
+}
+
+.aa-header img { height: 66px; width: auto; object-fit: contain; }
+
+.aa-header .title,
+.section-title {
+    font-size: 2.42rem;
+    font-weight: 750;
+    line-height: 1.14;
+    color: var(--omiscera-text);
+}
+
+.aa-omics-subtitle {
+    color: var(--omiscera-text);
+    font-size: 1.95rem;
+    font-weight: 750;
+    line-height: 1.2;
+    margin: 0 0 2.1rem 0;
+}
+
+.aa-module-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.4rem;
+}
+
+.aa-module-grid-top { margin-top: 1.65rem; }
+
+.aa-module-grid-bottom {
+    margin-top: 3.1rem;
+    grid-template-columns: 0.55fr 1fr 1fr 0.55fr;
+}
+
+.aa-module-grid-bottom .module-btn:first-child,
+.aa-module-grid-bottom .spacer { visibility: hidden; }
+
+.module-btn {
+    min-height: 5.2rem;
+    border: 1px solid var(--omiscera-btn-border);
+    border-radius: 14px;
+    font-size: 1.78rem;
+    font-weight: 800;
+    text-align: center;
+    cursor: pointer;
+    background-color: var(--omiscera-btn-bg);
+    color: var(--omiscera-text);
+}
+
+.module-btn:hover { background-color: var(--omiscera-btn-hover); }
+
+.module-btn.module-btn-disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+    filter: grayscale(40%);
+    pointer-events: none;
+}
+
+.module-btn.genomics {
+    min-height: 5.8rem;
+    background-color: var(--omiscera-genomics);
+    border-color: var(--omiscera-genomics);
+    color: #FFFFFF;
+}
+
+.module-btn.transcriptomics {
+    background-color: var(--omiscera-transcriptomics);
+    border-color: var(--omiscera-transcriptomics);
+    color: var(--omiscera-text);
+}
+
+.module-btn.proteomics {
+    background-color: var(--omiscera-proteomics);
+    border-color: var(--omiscera-proteomics-border);
+    color: var(--omiscera-text);
+}
+
+.module-btn.metabolomics {
+    background-color: var(--omiscera-metabolomics);
+    border-color: var(--omiscera-metabolomics);
+    color: var(--omiscera-dark-text);
+}
+
+.module-btn.multiomics {
+    background: linear-gradient(110deg, #879DB4 0%, #FF8289 100%);
+    border-color: #B991A1;
+    color: var(--omiscera-dark-text);
+}
+
+.aa-genomics-grid {
+    margin-top: 1.4rem;
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 2.2rem;
+}
+
+.aa-genomics-grid .module-btn { min-height: 5.8rem; }
+
+.aa-bottom-nav-spacer { height: 2.6rem; }
+
+/* ---------------- Forms / inputs ---------------- */
+
+.field-label { font-weight: 650; margin-bottom: 0.3rem; display: block; }
+
+.text-input, select {
+    width: 100%;
+    padding: 0.5rem 0.65rem;
+    border: 1px solid var(--omiscera-card-border);
+    border-radius: 8px;
+    font-size: 0.97rem;
+    background-color: #FFFFFF;
+    color: var(--omiscera-text);
+}
+
+.caption {
+    color: var(--omiscera-text-muted);
+    font-size: 0.86rem;
+    margin: 0.2rem 0 0.7rem 0;
+}
+
+.file-drop {
+    border: 1.5px dashed var(--omiscera-card-border);
+    border-radius: 10px;
+    padding: 1.1rem;
+    text-align: center;
+    background-color: var(--omiscera-card-bg);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.7rem;
+}
+
+.visually-hidden-file-input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+.file-choose-btn {
+    min-height: 2.3rem;
+    padding: 0.4rem 1rem;
+    background-color: #FFFFFF;
+    border: 1px solid var(--omiscera-btn-border);
+    border-radius: 8px;
+    color: var(--omiscera-text);
+    font-weight: 650;
+    font-size: 0.92rem;
+    cursor: pointer;
+}
+
+.file-choose-btn:hover { background-color: var(--omiscera-btn-hover-light); }
+
+.file-name-display {
+    color: var(--omiscera-text-muted);
+    font-size: 0.92rem;
+}
+
+.search-results {
+    margin-top: 0.4rem;
+}
+
+/* ---------------- Cards / containers ---------------- */
+
+.rank-card, .container-card {
+    border: 1px solid var(--omiscera-card-border);
+    border-radius: 10px;
+    padding: 1rem 1.1rem;
+    margin-bottom: 1rem;
+    background-color: #FFFFFF;
+}
+
+.db-checkbox-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.1rem;
+    margin: 0.5rem 0 0.9rem 0;
+}
+
+.db-checkbox-row label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-weight: 600;
+}
+
+/* ---------------- Metabolic Connection top accent ---------------- */
+
+#app:has(.mc-module-screen) {
+    position: relative;
+}
+
+#app:has(.mc-module-screen)::before,
+#app:has(.mc-module-screen)::after {
+    content: "";
+    position: absolute;
+    pointer-events: none;
+    z-index: 0;
+}
+
+#app:has(.mc-module-screen)::before {
+    top: 4.2rem;
+    right: -2.8rem;
+    width: 540px;
+    height: 190px;
+    opacity: 0.5;
+    background:
+        radial-gradient(circle at 8% 48%, #9fb8cc 0 4px, transparent 5px),
+        radial-gradient(circle at 28% 16%, #9fb8cc 0 4px, transparent 5px),
+        radial-gradient(circle at 40% 56%, #7f9bb3 0 6px, transparent 7px),
+        radial-gradient(circle at 58% 24%, #9fb8cc 0 4px, transparent 5px),
+        radial-gradient(circle at 76% 58%, #9fb8cc 0 5px, transparent 6px),
+        linear-gradient(19deg, transparent 17%, rgba(159, 184, 204, 0.42) 17.3%, transparent 18%),
+        linear-gradient(145deg, transparent 35%, rgba(159, 184, 204, 0.44) 35.4%, transparent 36.1%),
+        linear-gradient(76deg, transparent 48%, rgba(159, 184, 204, 0.34) 48.4%, transparent 49%),
+        linear-gradient(165deg, transparent 60%, rgba(255, 130, 137, 0.3) 60.4%, transparent 61.2%);
+}
+
+#app:has(.mc-module-screen)::after {
+    top: 6.4rem;
+    right: -2.5rem;
+    width: 355px;
+    height: 155px;
+    opacity: 0.44;
+    background:
+        repeating-linear-gradient(166deg, transparent 0 8px, rgba(127, 155, 179, 0.18) 8px 10px, transparent 10px 18px),
+        linear-gradient(158deg, transparent 0 46%, rgba(191, 211, 227, 0.34) 46% 70%, rgba(255, 130, 137, 0.24) 70% 88%, transparent 88%);
+    clip-path: polygon(4% 42%, 100% 0, 100% 100%, 0 90%);
+}
+
+#app:has(.mc-module-screen) .top-nav-bar,
+#app:has(.mc-module-screen) .mc-module-screen {
+    position: relative;
+    z-index: 1;
+}
+
+/* ---------------- Metabolic Connection step 3 ---------------- */
+
+.mc-step3-screen {
+    position: relative;
+}
+
+.mc-rank-count-row {
+    max-width: 280px;
+    margin: 0.45rem 0 1rem 0;
+}
+
+.mc-rank-count-row .field-label {
+    color: #08285a;
+    font-size: 1rem;
+    font-weight: 760;
+}
+
+.mc-rank-count-row select {
+    min-height: 2.65rem;
+    border-color: #c9d7e7;
+    box-shadow: inset 0 1px 0 rgba(8, 59, 107, 0.03);
+}
+
+.mc-rank-card {
+    position: relative;
+    padding: 1.35rem 1.75rem 1.1rem 1.75rem;
+    margin: 0 0 1.15rem 0;
+    border: 1px solid #d9e2f0;
+    border-top: 4px solid var(--omiscera-genomics);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.94);
+    box-shadow: 0 13px 28px rgba(18, 45, 80, 0.09);
+}
+
+.mc-rank-card-a { border-top-color: #083B6B; }
+.mc-rank-card-b { border-top-color: #1E5A86; }
+.mc-rank-card-c { border-top-color: #557A99; }
+.mc-rank-card-d { border-top-color: #7F9BB3; }
+.mc-rank-card-e { border-top-color: #AFC4D5; }
+.mc-rank-card-f { border-top-color: #C9A4AD; }
+.mc-rank-card-g { border-top-color: #FF8289; }
+.mc-rank-card-h { border-top-color: #FF5E66; }
+
+.mc-rank-title {
+    color: #08285a;
+    font-size: 1.42rem;
+    font-weight: 800;
+    line-height: 1.15;
+    margin: 0 0 0.75rem 0;
+}
+
+.mc-rank-db-row {
+    gap: 1rem;
+    margin: 0.3rem 0 0.4rem 0;
+}
+
+.mc-db-choice {
+    min-height: 2.8rem;
+    padding: 0.5rem 0.75rem;
+    border: 1.5px solid #d4deed;
+    border-radius: 8px;
+    background: #FFFFFF;
+    color: #112d5f;
+    font-size: 1.02rem;
+    font-weight: 700;
+}
+
+.mc-db-choice input {
+    width: 1.05rem;
+    height: 1.05rem;
+    accent-color: #08285a;
+}
+
+.mc-db-choice:has(input:checked) {
+    border-color: #7e99c7;
+    background: #f8fbff;
+    box-shadow: 0 7px 16px rgba(8, 59, 107, 0.06);
+}
+
+.mc-results-screen .mc-result-card {
+    margin-top: 1rem;
+}
+
+.mc-results-screen .table-wrap {
+    background: #FFFFFF;
+    box-shadow: inset 0 1px 0 rgba(8, 59, 107, 0.03);
+}
+
+.mc-results-screen details.expander {
+    border-color: #d9e2f0;
+    box-shadow: 0 7px 18px rgba(18, 45, 80, 0.05);
+}
+
+.mc-results-screen details.expander > summary {
+    color: #08285a;
+    font-weight: 760;
+}
+
+/* ---------------- Diagnostic / metric cards ---------------- */
+
+.diagnostic-cards, .metric-cards {
+    display: grid;
+    gap: 0.85rem;
+    margin: 0.8rem 0;
+}
+
+.diagnostic-card, .metric-card {
+    background-color: var(--omiscera-card-bg);
+    border: 1px solid var(--omiscera-card-border);
+    border-radius: 8px;
+    padding: 0.85rem 0.75rem;
+    min-height: 5.1rem;
+    text-align: center;
+}
+
+.diagnostic-value, .metric-value {
+    color: var(--omiscera-text);
+    font-size: 1.45rem;
+    font-weight: 800;
+    line-height: 1.15;
+}
+
+.diagnostic-label, .metric-label {
+    color: var(--omiscera-text-muted);
+    font-size: 0.85rem;
+    font-weight: 650;
+    line-height: 1.2;
+    margin-top: 0.35rem;
+}
+
+/* ---------------- Expander (mimics st.expander) ---------------- */
+
+details.expander {
+    border: 1px solid var(--omiscera-card-border);
+    border-radius: 8px;
+    margin: 0.9rem 0;
+    background-color: #FFFFFF;
+}
+
+details.expander > summary {
+    cursor: pointer;
+    padding: 0.6rem 0.9rem;
+    font-weight: 650;
+    list-style: none;
+}
+
+details.expander > summary::-webkit-details-marker { display: none; }
+
+details.expander > summary::before {
+    content: "▸ ";
+}
+
+details.expander[open] > summary::before {
+    content: "▾ ";
+}
+
+.expander-body { padding: 0 0.9rem 0.9rem 0.9rem; }
+
+/* ---------------- Tables ---------------- */
+
+.table-wrap {
+    width: 100%;
+    overflow-x: auto;
+    border: 1px solid var(--omiscera-card-border);
+    border-radius: 8px;
+    margin: 0.6rem 0;
+}
+
+table.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.92rem;
+}
+
+table.data-table th {
+    background-color: var(--omiscera-card-bg);
+    color: var(--omiscera-text);
+    text-align: left;
+    padding: 0.5rem 0.7rem;
+    border-bottom: 1px solid var(--omiscera-card-border);
+    position: sticky;
+    top: 0;
+}
+
+table.data-table td {
+    padding: 0.45rem 0.7rem;
+    border-bottom: 1px solid #F0F3F7;
+    color: var(--omiscera-text);
+    /* A cell holding a long wrapped gene list (see .td-long-list below) can
+       still be the tallest thing in its row. Without this, the browser's
+       default vertical-align:middle centers every OTHER cell in that same
+       row deep inside that height - visually off the bottom of the table's
+       scroll viewport, making a table with real data look empty. */
+    vertical-align: top;
+}
+
+table.data-table tbody tr:hover { background-color: #FAFCFE; }
+
+table.data-table tr.row-low-confidence { background-color: var(--omiscera-low-confidence); }
+table.data-table tr.row-significant { background-color: var(--omiscera-significant); }
+table.data-table tr.annot-status-well { background-color: var(--omiscera-annot-well); }
+table.data-table tr.annot-status-moderate { background-color: var(--omiscera-annot-moderate); }
+table.data-table tr.annot-status-sparse { background-color: var(--omiscera-annot-sparse); }
+
+/* Comma-joined gene-list cells (Overlapping Genes / Leading Edge Genes /
+   Genes - see TABLE_LONG_LIST_COLUMNS in app.js) can run to hundreds of
+   symbols. Capped to 3 lines with an ellipsis so one such cell can't inflate
+   its whole row to thousands of pixels tall; hover for the full list via
+   the cell's title tooltip, or use "Download result table" for the
+   uncapped CSV - this is a display cap only, the underlying data is never
+   truncated. */
+.td-long-list { max-width: 320px; }
+.td-long-list-content {
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    cursor: help;
+}
+
+.table-scroll { max-height: 480px; overflow-y: auto; }
+
+/* ---------------- Gene Function Annotation: per-gene cards ---------------- */
+
+.annot-gene-cards { display: flex; flex-direction: column; gap: 0.9rem; margin: 0.8rem 0; }
+
+.annot-gene-card {
+    border: 1px solid var(--omiscera-card-border);
+    border-left: 5px solid var(--omiscera-card-border);
+    border-radius: 10px;
+    padding: 0.9rem 1.1rem;
+    background-color: #FFFFFF;
+}
+.annot-gene-card.annot-status-well { border-left-color: #4CAF7D; }
+.annot-gene-card.annot-status-moderate { border-left-color: #E0B23C; }
+.annot-gene-card.annot-status-sparse { border-left-color: #98A6B5; }
+
+.annot-card-header {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem 1.6rem;
+    margin-bottom: 0.6rem;
+}
+
+.annot-field { display: flex; align-items: baseline; gap: 0.35rem; }
+.annot-field-label { color: var(--omiscera-text-muted); font-size: 0.85rem; }
+.annot-field-value { font-weight: 650; }
+
+.annot-status-badge {
+    display: inline-block;
+    padding: 0.12rem 0.55rem;
+    border-radius: 999px;
+    font-weight: 650;
+    font-size: 0.85rem;
+}
+.annot-status-badge.annot-status-well { background-color: var(--omiscera-annot-well); color: #1f6f43; }
+.annot-status-badge.annot-status-moderate { background-color: var(--omiscera-annot-moderate); color: #8a6d1a; }
+.annot-status-badge.annot-status-sparse { background-color: var(--omiscera-annot-sparse); color: #4b5a68; }
+
+.annot-card-sections { display: flex; flex-direction: column; gap: 0.4rem; }
+
+.annot-term-list { line-height: 1.6; }
+.annot-term-empty { color: var(--omiscera-text-muted); font-style: italic; }
+
+.annot-download-links { margin: 0.6rem 0; color: var(--omiscera-text-muted); font-size: 0.92rem; }
+.annot-download-links .ora-inline-example-link { margin: 0 0.15rem; }
+
+/* ---------------- Alerts (mimics st.info/warning/error/success) ---------------- */
+
+.alert {
+    border-radius: 8px;
+    padding: 0.65rem 0.9rem;
+    margin: 0.6rem 0;
+    font-size: 0.92rem;
+}
+
+.alert-info { background-color: #E8F1FA; color: #0B3D63; border: 1px solid #BFD9EF; }
+.alert-warning { background-color: #FFF6DD; color: #6B5300; border: 1px solid #F2DD9A; }
+.alert-error { background-color: #FCE7E7; color: #7A1F1F; border: 1px solid #F3B7B7; }
+.alert-success { background-color: #E7F7EC; color: #1F5C33; border: 1px solid #B9E3C4; }
+
+/* ---------------- Progress / spinner ---------------- */
+
+.progress-wrap {
+    margin: 0.8rem 0;
+}
+
+.progress-bar-outer {
+    width: 100%;
+    height: 0.65rem;
+    background-color: var(--omiscera-card-bg);
+    border: 1px solid var(--omiscera-card-border);
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.progress-bar-inner {
+    height: 100%;
+    background-color: var(--omiscera-btn-bg);
+    background: linear-gradient(90deg, #9FB8CC, #BFD3E3);
+    transition: width 0.25s ease;
+}
+
+.progress-label {
+    color: var(--omiscera-text-muted);
+    font-size: 0.85rem;
+    margin-top: 0.3rem;
+}
+
+/* ---------------- Misc layout ---------------- */
+
+.step-subheader {
+    font-size: 1.55rem;
+    font-weight: 700;
+    margin: 1.2rem 0 0.8rem 0;
+}
+
+.section-label { font-weight: 700; margin: 1rem 0 0.4rem 0; }
+
+.row { display: flex; gap: 1rem; align-items: flex-start; }
+.col { flex: 1 1 0; min-width: 0; }
+
+.checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.35rem 0;
+}
+
+.checkbox-row.disabled { opacity: 0.55; }
+
+.divider { border: none; border-top: 1px solid var(--omiscera-card-border); margin: 1.1rem 0; }
+
+.truncate { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 280px; display: inline-block; }
+
+/* ---------------- ORA charts ---------------- */
+
+.chart-container { min-height: 420px; width: 100%; overflow: visible; }
+.chart-pair { display: flex; flex-direction: column; gap: 18px; margin: 0.8rem 0; }
+.chart-pair .chart-container { flex: 1 1 100%; min-width: 0; }
+/* Relational charts (enrichment map / gene-concept network) render at a fixed,
+   roughly square height (matches _plotNetwork's layout.height default of 620px)
+   so the area doesn't look collapsed before Plotly finishes its first paint. */
+.chart-container.chart-network { min-height: 620px; }
+.chart-toggle-row { display: flex; gap: 0.75rem; flex-wrap: wrap; margin: 0.7rem 0 0.45rem 0; }
+.chart-toggle-btn { flex: 1 1 190px; }
+.chart-option-control {
+    flex: 1 1 190px;
+    min-height: 2.6rem;
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.35rem 0.55rem;
+    border: 1px solid var(--omiscera-card-border);
+    border-radius: 8px;
+    background: #FFFFFF;
+}
+.chart-option-label {
+    flex: 0 0 auto;
+    color: var(--omiscera-text-muted);
+    font-size: 0.86rem;
+    font-weight: 700;
+}
+.chart-option-select {
+    min-height: 1.9rem;
+    padding: 0.25rem 0.45rem;
+    border-radius: 6px;
+    font-size: 0.88rem;
+}
+.btn-small { padding: 0.2rem 0.6rem; font-size: 0.8rem; }
+
+.ora-chart-export-menu {
+    position: absolute;
+    z-index: 10000;
+    min-width: 178px;
+    padding: 0.38rem;
+    background: #FFFFFF;
+    border: 1px solid #CAD7E8;
+    border-radius: 8px;
+    box-shadow: 0 14px 32px rgba(16, 42, 67, 0.18);
+}
+
+.ora-chart-export-item {
+    display: block;
+    width: 100%;
+    min-height: 2.1rem;
+    padding: 0.45rem 0.65rem;
+    background: transparent;
+    border: 0;
+    border-radius: 6px;
+    color: var(--omiscera-text);
+    font: inherit;
+    font-size: 0.9rem;
+    font-weight: 650;
+    text-align: left;
+    cursor: pointer;
+}
+
+.ora-chart-export-item:hover {
+    background: var(--omiscera-btn-hover-light);
+}
+
+/* ---------------- ORA configure analysis ---------------- */
+
+#app:has(.ora-config-screen) {
+    max-width: 1260px;
+    padding: 0 2.25rem 1.4rem 2.25rem;
+    position: relative;
+    overflow: hidden;
+}
+
+#app:has(.ora-config-screen) .top-nav-bar {
+    width: 92%;
+    max-width: 1120px;
+    min-height: 4.2rem;
+    margin: 0.75rem auto 1.55rem auto;
+    padding: 0.42rem 0.56rem;
+    border-radius: 20px;
+    box-shadow: 0 10px 26px rgba(8, 59, 107, 0.09);
+}
+
+#app:has(.ora-config-screen) .nav-btn {
+    font-size: 1.2rem;
+    border-radius: 16px;
+}
+
+.ora-config-screen {
+    position: relative;
+    padding: 0 0.7rem 0.2rem 0.7rem;
+    isolation: isolate;
+}
+
+.ora-config-screen::before,
+.ora-config-screen::after {
+    content: "";
+    position: absolute;
+    pointer-events: none;
+    z-index: -1;
+}
+
+.ora-config-screen::before {
+    top: -1.7rem;
+    right: -5.8rem;
+    width: 560px;
+    height: 250px;
+    opacity: 0.42;
+    background:
+        radial-gradient(circle at 10% 65%, #8eaad0 0 4px, transparent 5px),
+        radial-gradient(circle at 30% 30%, #8eaad0 0 4px, transparent 5px),
+        radial-gradient(circle at 44% 80%, #8eaad0 0 5px, transparent 6px),
+        radial-gradient(circle at 62% 34%, #8eaad0 0 4px, transparent 5px),
+        radial-gradient(circle at 76% 70%, #8eaad0 0 5px, transparent 6px),
+        linear-gradient(19deg, transparent 17%, rgba(158, 184, 214, 0.55) 17.3%, transparent 18%),
+        linear-gradient(145deg, transparent 35%, rgba(158, 184, 214, 0.55) 35.4%, transparent 36.1%),
+        linear-gradient(76deg, transparent 48%, rgba(158, 184, 214, 0.45) 48.4%, transparent 49%),
+        linear-gradient(165deg, transparent 60%, rgba(255, 130, 137, 0.34) 60.4%, transparent 61.2%);
+}
+
+.ora-config-screen::after {
+    left: -3rem;
+    bottom: 3.1rem;
+    width: 160px;
+    height: 86px;
+    opacity: 0.55;
+    background-image: radial-gradient(circle, rgba(87, 134, 190, 0.38) 1.7px, transparent 2px);
+    background-size: 18px 18px;
+}
+
+.ora-config-screen .aa-header {
+    margin: 1.15rem 0 0.65rem 0;
+    gap: 1.05rem;
+}
+
+.ora-config-screen .aa-header img {
+    height: 70px;
+}
+
+.ora-config-screen .aa-header .title {
+    color: #062b54;
+    font-size: 2.72rem;
+    font-weight: 800;
+}
+
+.ora-config-title {
+    color: #06204d;
+    font-size: 2.04rem;
+    font-weight: 780;
+    margin: 0 0 0.85rem 0;
+}
+
+.ora-gene-count {
+    display: none !important;
+    color: #3f587c;
+    font-size: 1.03rem;
+    margin: 0 0 1.45rem 0;
+}
+
+.ora-select-label {
+    color: #08285a;
+    font-size: 1.08rem;
+    font-weight: 760;
+    margin-bottom: 0.6rem;
+}
+
+.ora-db-checkbox-row {
+    gap: 1rem;
+    margin: 0 0 1.15rem 0;
+}
+
+.ora-db-pill {
+    min-width: 128px;
+    min-height: 3.1rem;
+    padding: 0.55rem 1.05rem;
+    border: 1.5px solid #9bb1d5;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.82);
+    color: #112d5f;
+    font-size: 1rem;
+    font-weight: 650;
+    box-shadow: 0 7px 18px rgba(8, 59, 107, 0.06);
+}
+
+.ora-db-pill:has(input:checked) {
+    border-color: #7e99c7;
+    background: #ffffff;
+}
+
+.ora-db-checkbox {
+    width: 1.15rem;
+    height: 1.15rem;
+    accent-color: #08285a;
+    cursor: pointer;
+}
+
+/* MSigDB collection sub-selector: appears indented beneath the database pill
+   row when "MSigDB" is checked, so it reads as a sub-choice OF that database
+   rather than a fifth database sitting alongside the other four. */
+.ora-msigdb-collections {
+    margin: -0.4rem 0 1.15rem 0;
+    padding: 0.85rem 1.05rem 0.5rem 1.05rem;
+    border-left: 3px solid #9bb1d5;
+    background: rgba(240, 245, 252, 0.55);
+    border-radius: 0 8px 8px 0;
+}
+
+.ora-msigdb-collections .ora-db-pill {
+    min-width: 112px;
+    min-height: 2.5rem;
+    padding: 0.4rem 0.8rem;
+    font-size: 0.92rem;
+}
+
+.ora-db-card {
+    position: relative;
+    padding: 1.25rem 1.75rem 1.15rem 1.75rem;
+    margin: 0 0 1.15rem 0;
+    border: 1px solid #d9e2f0;
+    border-top: 4px solid #0969c3;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.92);
+    box-shadow: 0 13px 28px rgba(18, 45, 80, 0.09);
+}
+
+.ora-db-card-gwas-catalog {
+    border-top-color: #ff424a;
+}
+
+.ora-results-screen .ora-db-card-go {
+    border-top-color: #0969c3;
+}
+
+.ora-results-screen .ora-result-card {
+    margin-top: 1rem;
+}
+
+.ora-results-screen .table-wrap {
+    background: #FFFFFF;
+    box-shadow: inset 0 1px 0 rgba(8, 59, 107, 0.03);
+}
+
+.ora-results-screen .metric-cards {
+    margin: 0.9rem 0 1rem 0;
+}
+
+.ora-results-screen > .btn {
+    width: auto;
+    min-width: 190px;
+    margin-top: 0.65rem;
+}
+
+/* ---------------- Results screens: section navigation rail ----------------
+   Every results screen shows one section at a time in the body, with a
+   permanent right-hand rail listing every section the run actually produced
+   (see makeResultNav in app.js). Widen the page so the ~232px rail doesn't
+   eat into chart width. */
+#app:has(.ora-results-screen) {
+    max-width: 1460px;
+}
+
+.result-nav-layout {
+    display: flex;
+    gap: 1.25rem;
+    align-items: flex-start;
+}
+
+.result-nav-body {
+    flex: 1 1 0;
+    min-width: 0;   /* flex children default to min-width:auto - without this,
+                       wide tables/charts blow out the column instead of
+                       scrolling inside it */
+}
+
+.result-nav {
+    flex: 0 0 232px;
+    position: sticky;
+    top: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    background: var(--omiscera-rail-bg);
+    border: 1px solid var(--omiscera-rail-border);
+    /* Accent spine, echoing how .ora-db-card uses a 4px border-top accent. */
+    border-left: 4px solid var(--omiscera-rail-accent);
+    border-radius: 12px;
+    padding: 0.7rem;
+}
+
+.result-nav-btn {
+    text-align: left;
+    background: transparent;
+    border: none;
+    border-left: 3px solid transparent;
+    border-radius: 8px;
+    padding: 0.5rem 0.65rem;
+    font-size: 0.94rem;
+    font-weight: 650;
+    color: var(--omiscera-text);
+    cursor: pointer;
+    transition: background-color 0.12s ease;
+}
+/* A blue hover tint would read as a mistake on a blush surface - lift toward
+   white instead, which is also where the active state lives. */
+.result-nav-btn:hover { background-color: rgba(255, 255, 255, 0.55); }
+/* The active state was #FFFFFF on a #F4F7FB rail - i.e. white on near-white,
+   so the one thing the rail must communicate was invisible. White now reads
+   as a raised pill because the surround is finally tinted. */
+.result-nav-btn.active {
+    background-color: #FFFFFF;
+    border-left-color: var(--omiscera-rail-accent);
+    color: #08285a;
+    font-weight: 800;
+    box-shadow: 0 2px 6px rgba(120, 40, 45, 0.13);
+}
+
+.result-nav-group-label {
+    margin: 0.55rem 0.65rem 0.1rem 0.65rem;
+    font-size: 0.78rem;
+    font-weight: 750;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--omiscera-rail-label);
+}
+.result-nav-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    padding-left: 0.4rem;
+    border-left: 2px solid var(--omiscera-rail-border);
+    margin-left: 0.65rem;
+}
+.result-nav-btn-nested { font-size: 0.89rem; font-weight: 600; padding: 0.4rem 0.6rem; }
+
+.result-pane { min-width: 0; }
+
+/* Pane header: the refactor moved section titles into the rail, which left the
+   content area starting cold (caption, buttons, chart - no title anywhere). */
+.result-pane-header {
+    border-bottom: 2px solid var(--omiscera-rail-accent);
+    padding-bottom: 0.4rem;
+    margin: 0 0 0.85rem 0;
+}
+.result-pane-title {
+    margin: 0;
+    color: #08285a;
+    font-size: 1.25rem;
+    font-weight: 800;
+    line-height: 1.2;
+}
+
+.ora-db-title {
+    color: #08285a;
+    font-size: 1.45rem;
+    font-weight: 800;
+    line-height: 1.15;
+    margin: 0 0 0.45rem 0;
+}
+
+.ora-db-caption {
+    max-width: 870px;
+    color: #425a80;
+    font-size: 0.94rem;
+    line-height: 1.45;
+    margin: 0 0 0.75rem 0;
+}
+
+.ora-iea-row {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    margin-top: 0.6rem;
+    font-size: 0.9rem;
+    color: #425a80;
+}
+.ora-iea-checkbox { accent-color: #1B639C; width: 1rem; height: 1rem; cursor: pointer; }
+
+/* Space the "Show/Hide result table" toggle away from the download button below it. */
+.ora-table-toggle-btn { margin-bottom: 1rem; }
+
+/* Custom (user-uploaded) gene-set database config block. */
+.ora-custom-db-widget { display: flex; flex-direction: column; gap: 0.6rem; }
+.ora-custom-idtype-row { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.ora-custom-summary { color: #1f6f43; font-weight: 600; }
+.ora-custom-help { color: #425a80; line-height: 1.45; }
+
+/* Per-database significance (FDR) threshold control, shown in the ORA config screen. */
+.ora-sig-threshold-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.6rem;
+    font-size: 0.9rem;
+    color: #425a80;
+}
+.ora-sig-threshold-input {
+    width: 5.5rem;
+    padding: 0.25rem 0.5rem;
+    border: 1px solid var(--omiscera-btn-border);
+    border-radius: 6px;
+    font-size: 0.9rem;
+}
+
+/* Per-database term-size (min/max genes) filter, shown in the ORA config screen. */
+.ora-term-size-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.6rem;
+    font-size: 0.9rem;
+    color: #425a80;
+    flex-wrap: wrap;
+}
+.ora-term-size-input {
+    width: 6.5rem;
+    padding: 0.25rem 0.5rem;
+    border: 1px solid var(--omiscera-btn-border);
+    border-radius: 6px;
+    font-size: 0.9rem;
+}
+.ora-term-size-dash { color: #6C7A89; }
+
+/* Per-database custom background (reference gene list) upload — GO/Reactome only.
+   Gated behind a checkbox (reuses .ora-iea-row/.ora-iea-checkbox styling); the
+   body below is only rendered when the checkbox is on, so it stays hidden/compact
+   by default. */
+.ora-background-widget {
+    margin-top: 0.6rem;
+    font-size: 0.9rem;
+    color: #425a80;
+}
+.ora-background-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+    margin-left: 1.5rem;
+}
+.ora-background-summary { color: #1f6f43; font-weight: 600; }
+.ora-background-help { color: #425a80; line-height: 1.45; }
+.ora-background-remove { align-self: flex-start; width: auto; }
+
+/* Inline "example file" link appended to a caption (background help caption,
+   burden-test upload caption, ...) — styled as plain text, not a button, so it
+   adds no extra visual space wherever it's used. */
+.ora-inline-example-link {
+    display: inline;
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    color: #1B639C;
+    text-decoration: underline;
+    cursor: pointer;
+}
+.ora-inline-example-link:hover { color: #0d4a7a; }
+
+/* Gene-set Burden Test: variant-score column picker shown after upload. */
+.ora-score-column-widget {
+    margin-top: 0.6rem;
+    padding: 0.6rem 0.8rem;
+    border: 1px solid var(--omiscera-btn-border);
+    border-radius: 8px;
+    background: #FAFCFE;
+}
+.ora-score-column-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-top: 0.4rem;
+}
+.ora-score-summary { color: #1f6f43; font-weight: 600; margin-top: 0.5rem; }
+
+/* Threshold note shown beside (not inside) an ORA chart, excluded from image export. */
+.ora-chart-threshold-note {
+    font-size: 0.85rem;
+    color: #6C7A89;
+    font-style: italic;
+    margin: 0.2rem 0 0.4rem 0;
+}
+
+.ora-species-widget {
+    position: relative;
+}
+
+.ora-species-widget::after {
+    content: "";
+    position: absolute;
+    top: 1.05rem;
+    right: 1.15rem;
+    width: 0.5rem;
+    height: 0.5rem;
+    border: solid #435b81;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+    pointer-events: none;
+}
+
+.ora-species-input,
+.ora-species-select {
+    min-height: 3rem;
+    padding: 0.72rem 3rem 0.72rem 0.95rem;
+    border: 1.5px solid #d4deed;
+    border-radius: 8px;
+    color: #244369;
+    font-size: 1rem;
+    background-color: rgba(255, 255, 255, 0.92);
+    box-shadow: inset 0 1px 0 rgba(8, 59, 107, 0.03);
+}
+
+.ora-species-input::placeholder {
+    color: #66799d;
+    opacity: 1;
+}
+
+.ora-species-input:focus,
+.ora-species-select:focus {
+    border-color: #7e99c7;
+    box-shadow: 0 0 0 3px rgba(8, 59, 107, 0.12);
+    outline: none;
+}
+
+.ora-selected-caption {
+    position: relative;
+    min-height: 1.25rem;
+    padding-left: 1.45rem;
+    color: #19356b;
+    font-size: 0.91rem;
+    font-weight: 650;
+    margin: 0.55rem 0 0 0;
+}
+
+.ora-selected-caption:not(:empty)::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0.08rem;
+    width: 0.82rem;
+    height: 0.82rem;
+    border-radius: 50%;
+    background: #42bd7f;
+}
+
+.ora-selected-caption:not(:empty)::after {
+    content: "";
+    position: absolute;
+    left: 0.27rem;
+    top: 0.25rem;
+    width: 0.28rem;
+    height: 0.46rem;
+    border: solid #ffffff;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+}
+
+.ora-config-actions {
+    margin-top: 0.95rem;
+}
+
+.ora-config-actions .ora-config-btn-row {
+    width: 35%;
+    min-width: 390px;
+    gap: 1.1rem;
+}
+
+.ora-back-btn,
+.ora-run-btn {
+    min-height: 3.25rem;
+    border-radius: 8px;
+    font-size: 1.08rem;
+    font-weight: 780;
+}
+
+.ora-back-btn {
+    background: rgba(255, 255, 255, 0.9);
+    border-color: #7e99c7;
+    color: #08285a;
+}
+
+.ora-back-btn:hover:not(:disabled) {
+    background: #f7fafd;
+    border-color: #08285a;
+}
+
+.ora-run-btn {
+    position: relative;
+    padding-right: 3rem;
+    background: linear-gradient(180deg, #063570 0%, #06285b 100%);
+    border-color: #06285b;
+    box-shadow: 0 10px 20px rgba(8, 59, 107, 0.22);
+}
+
+.ora-run-btn::after {
+    content: ">";
+    position: absolute;
+    right: 1.5rem;
+    top: 50%;
+    transform: translateY(-54%);
+    font-size: 1.5rem;
+    font-weight: 500;
+}
+
+.ora-run-btn:hover:not(:disabled) {
+    background: linear-gradient(180deg, #094787 0%, #07346b 100%);
+    border-color: #07346b;
+}
+
+@media (max-width: 760px) {
+    #app:has(.ora-config-screen) {
+        padding: 0 1rem 1.5rem 1rem;
+    }
+
+    #app:has(.ora-config-screen) .top-nav-bar {
+        width: 100%;
+        min-height: auto;
+        flex-wrap: wrap;
+    }
+
+    #app:has(.ora-config-screen) .nav-btn {
+        flex: 1 1 42%;
+        font-size: 1rem;
+    }
+
+    .ora-config-screen {
+        padding: 0;
+    }
+
+    .ora-config-screen .aa-header .title {
+        font-size: 2rem;
+    }
+
+    .ora-config-title {
+        font-size: 1.55rem;
+    }
+
+    .ora-db-pill {
+        flex: 1 1 100%;
+    }
+
+    .ora-db-card {
+        padding: 1.05rem 1rem;
+    }
+
+    .ora-config-actions .ora-config-btn-row {
+        width: 100%;
+        min-width: 0;
+    }
+}
+
+@media (max-width: 1100px) {
+    .result-nav-layout {
+        flex-direction: column-reverse;
+    }
+    .result-nav {
+        position: static;
+        flex-direction: row;
+        flex-wrap: wrap;
+        width: 100%;
+    }
+    .result-nav-group {
+        flex-direction: row;
+        flex-wrap: wrap;
+        border-left: none;
+        border-top: 2px solid var(--omiscera-card-border);
+        margin-left: 0;
+        padding-left: 0;
+        padding-top: 0.3rem;
+    }
+}

@@ -1,0 +1,10 @@
+p53_pathway	p53 / DNA-damage response	TP53	MDM2	CDKN1A	ATM	CHEK2	BRCA1	BRCA2	ATR	CHEK1
+cell_cycle	Cell cycle progression	CCND1	CDK4	CDK6	RB1	E2F1	CCNE1	CDK2
+apoptosis	Apoptosis	BAX	BCL2	CASP3	CASP9	APAF1	BID	BAK1
+pi3k_akt	PI3K-AKT signaling	PIK3CA	AKT1	PTEN	MTOR	GSK3B
+mapk_erk	MAPK / ERK signaling	KRAS	BRAF	MAP2K1	MAPK1	MAPK3	EGFR
+wnt_signaling	Wnt signaling	CTNNB1	APC	AXIN1	WNT1	FZD1	LRP6	TCF7
+autophagy	Autophagy	BECN1	ATG5	ATG7	MAP1LC3B	SQSTM1	ULK1
+dna_repair_mmr_ber	DNA repair (mismatch / base-excision)	MLH1	MSH2	MSH6	PMS2	XRCC1	PARP1	OGG1
+immune_inflammation	Immune / inflammatory response	TNF	IL6	IL1B	NFKB1	TLR4	STAT3	IFNG
+metabolism_glucose	Glucose / insulin metabolism	INS	INSR	GAPDH	PKM	HK2	PPARG	SLC2A4

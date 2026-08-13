@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# Omiscera .gitignore
+# ---------------------------------------------------------------------------
+
+# Downloaded reference data. ~1.2 GB and fully regenerable at runtime - every
+# fetcher re-downloads on a cache miss (STRING protein.links alone is 79 MB for
+# human; GO/Reactome/MSigDB/GWAS bulk files make up the rest). Committing this
+# would dwarf the source tree and go stale against the pinned upstream versions
+# the fetchers already guard (e.g. MSIGDB_VERSION, STRING_VERSION).
+cache/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Editor / OS / OneDrive noise
+.vscode/
+desktop.ini
+Thumbs.db
+.DS_Store
+
+# Local Claude Code settings (machine-specific permissions etc.)
+.claude/settings.local.json
+
+# Deliberately TRACKED, listed here so nobody "tidies" them away:
+#   Data/ Data2/ Data3/   bundled example inputs the test suite depends on
+#   Assets/               app logo and images
+#   info/                 the per-module README documentation
+#   tests/                the whole verification suite
