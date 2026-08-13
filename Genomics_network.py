@@ -42,6 +42,7 @@ development (not guessed from documentation alone).
 
 import os
 import time
+from collections import OrderedDict
 
 import numpy as np
 import pandas as pd
@@ -108,7 +109,22 @@ NETPROP_MODULE_COLUMNS = [
 # file (mirrors the retriever's in-memory BLAST_CACHE pattern; the raw
 # downloaded files are ALSO cached on disk via _ensure_string_file below, so
 # even a fresh process only re-downloads, never re-fetches from STRING).
-_GRAPH_CACHE: dict = {}
+# Bounded: a human graph is ~50-100 MB and this used to be an unbounded dict,
+# so a long-lived server that saw several organisms (or several confidence
+# cutoffs for one organism) grew without limit. Two entries is enough for the
+# realistic case - re-running the same organism, or comparing two confidence
+# settings - and eviction only costs a re-parse of already-downloaded files.
+_GRAPH_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_GRAPH_CACHE_MAX_ENTRIES = 2
+
+
+def _graph_cache_put(key: tuple, value: dict) -> None:
+    """Insert with LRU eviction. Kept tiny and separate so the eviction policy
+    is visible and testable rather than buried in build_string_network."""
+    _GRAPH_CACHE[key] = value
+    _GRAPH_CACHE.move_to_end(key)
+    while len(_GRAPH_CACHE) > _GRAPH_CACHE_MAX_ENTRIES:
+        _GRAPH_CACHE.popitem(last=False)
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +240,7 @@ def build_string_network(
     """
     cache_key = (str(taxon_id), int(confidence))
     if not force_refresh and cache_key in _GRAPH_CACHE:
+        _GRAPH_CACHE.move_to_end(cache_key)
         return _GRAPH_CACHE[cache_key]
     if sp is None:
         raise RuntimeError("scipy is required for network propagation")
@@ -236,7 +253,7 @@ def build_string_network(
     if verbose:
         print(f"[STRING] Parsing links for taxon {taxon_id} at confidence >= {confidence}...")
     result = _parse_string_network_files(links_path, info_path, aliases_path, confidence, taxon_id=taxon_id)
-    _GRAPH_CACHE[cache_key] = result
+    _graph_cache_put(cache_key, result)
     if verbose:
         print(f"[STRING] Built network: {result['n_proteins']} proteins (>= {confidence})")
     return result
@@ -363,6 +380,162 @@ def _welford_update(mean, m2, count, x):
     return mean, m2
 
 
+def _map_seeds_to_indices(id_map: dict, protein_index: dict, seed_scores: dict) -> tuple:
+    """Map external identifiers onto graph row indices.
+
+    id_map: {external id: string_protein_id}. Genomics passes
+    graph["uniprot_to_protein"]; the Transcriptomics network module passes a
+    gene-symbol (or Ensembl/Entrez) bridge instead. Extracting this is what
+    makes the numerical core below identifier-agnostic - nothing downstream of
+    here knows or cares which identifier space the caller used.
+
+    Two behaviours are load-bearing and preserved exactly:
+      - several external ids collapsing onto ONE protein have their scores
+        SUMMED, not overwritten;
+      - if any resulting weight is <= 0 the whole set is shifted positive by
+        |min| + 1, because RWR redistributes probability mass and needs
+        strictly positive seeds.
+
+    That shift is monotonic but NOT scale-preserving: propagate_rwr normalizes
+    the seed vector to sum 1, so only weight RATIOS survive, and shifting
+    changes them. A caller passing signed values (e.g. a signed ranking metric)
+    therefore silently gets a different analysis than it intended. Callers that
+    guarantee positive weights never reach the shift; the Transcriptomics module
+    guarantees exactly that, deliberately.
+
+    Returns (seed_idx_score {index: positive weight}, n_not_mapped).
+    """
+    seed_idx_score: dict = {}
+    n_not_mapped = 0
+    for ext_id, score in seed_scores.items():
+        pid = id_map.get(ext_id)
+        if pid is None or pid not in protein_index:
+            n_not_mapped += 1
+            continue
+        idx = protein_index[pid]
+        seed_idx_score[idx] = seed_idx_score.get(idx, 0.0) + float(score)
+
+    if seed_idx_score:
+        min_score = min(seed_idx_score.values())
+        if min_score <= 0:
+            shift = abs(min_score) + 1.0
+            seed_idx_score = {k: v + shift for k, v in seed_idx_score.items()}
+    return seed_idx_score, n_not_mapped
+
+
+def _propagation_core(
+    graph: dict,
+    seed_idx_score: dict,
+    restart_prob: float = DEFAULT_RESTART_PROB,
+    n_permutations: int = DEFAULT_N_PERMUTATIONS,
+    seed_rng: int = 42,
+    progress_callback=None,
+) -> dict:
+    """The numerical heart: observed RWR, degree-preserving permutation null,
+    z-scores, normal-tail p-values, BH-FDR. Works purely in index space and
+    contains NO identifier vocabulary, so both the Genomics (UniProt) and
+    Transcriptomics (gene symbol) modules share one implementation rather than
+    keeping two copies that could drift apart and give different answers to the
+    same scientific question.
+
+    Standardizing against a per-protein null (rather than counting how often a
+    random seed set exceeds the observed) is deliberate: on a dense PPI network
+    hubs soak up signal from ANY high-degree seeds, so a raw exceedance count is
+    far too conservative. Z-scoring each protein against its own null removes
+    that baseline. Welford's online mean/variance keeps memory O(n).
+
+    Returns observed/zscores/pvalues/fdrs plus two honesty diagnostics:
+    n_exceed (how many permutations actually met or beat the observed - the
+    empirical view the z-scores approximate) and null_skew_at_max (skewness of
+    the null at the top-scoring protein, since the p-values assume a normal
+    null that a permutation distribution is typically right-skewed against).
+    Neither is used as a p-value: at ~1000 permutations the empirical floor of
+    1/(n+1), after BH across ~20k proteins, would call nothing significant.
+    """
+    def _progress(current, total, label):
+        if progress_callback:
+            try:
+                progress_callback(current, total, label)
+            except Exception:
+                pass
+
+    adjacency = graph["adjacency"]
+    raw_adjacency = graph["raw_adjacency"]
+    n = graph["n_proteins"]
+
+    seed_vector = np.zeros(n, dtype=np.float64)
+    for idx, score in seed_idx_score.items():
+        seed_vector[idx] = score
+
+    _progress(0, n_permutations + 1, "Propagating seed signal...")
+    observed = propagate_rwr(adjacency, seed_vector, restart_prob=restart_prob)
+
+    bin_of, bins_map = _degree_bins(raw_adjacency)
+    seed_indices = list(seed_idx_score.keys())
+    seed_scores_list = [seed_idx_score[i] for i in seed_indices]
+
+    rng = np.random.default_rng(seed_rng)
+    null_mean = np.zeros(n, dtype=np.float64)
+    null_m2 = np.zeros(n, dtype=np.float64)
+    n_exceed = np.zeros(n, dtype=np.int64)
+    top_idx = int(np.argmax(observed))
+    top_null_samples = []
+    count = 0
+    for perm_i in range(n_permutations):
+        perm_vector = np.zeros(n, dtype=np.float64)
+        used: set = set()
+        for orig_idx, score in zip(seed_indices, seed_scores_list):
+            candidates = bins_map.get(int(bin_of[orig_idx]), list(range(n)))
+            cand = candidates[rng.integers(0, len(candidates))]
+            for _try in range(10):
+                if cand not in used:
+                    break
+                cand = candidates[rng.integers(0, len(candidates))]
+            used.add(cand)
+            perm_vector[cand] += score
+        perm_p = propagate_rwr(adjacency, perm_vector, restart_prob=restart_prob)
+        count += 1
+        null_mean, null_m2 = _welford_update(null_mean, null_m2, count, perm_p)
+        n_exceed += (perm_p >= observed)
+        top_null_samples.append(float(perm_p[top_idx]))
+        if (perm_i + 1) % max(1, n_permutations // 20) == 0:
+            _progress(perm_i + 1, n_permutations + 1, f"Permutation {perm_i + 1}/{n_permutations}")
+
+    null_std = np.sqrt(null_m2 / max(count - 1, 1))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        zscores = (observed - null_mean) / null_std
+    # Proteins with zero null variability (e.g. never reached by any random
+    # seed set) are treated as non-significant rather than +inf - a
+    # conservative default that avoids spurious hits from numerical edge cases.
+    zscores = np.where(null_std > 0, zscores, 0.0)
+    # One-sided upper-tail p-value from the standard normal (ndtr is the normal
+    # CDF; it's a vectorized special function, not a BLAS matmul, so it is not
+    # affected by the dense-BLAS issue noted in mcl_cluster).
+    from scipy.special import ndtr
+    pvalues = ndtr(-zscores)
+    fdrs = genomics_ora.benjamini_hochberg(list(pvalues))
+
+    skew = 0.0
+    if len(top_null_samples) > 2:
+        arr = np.asarray(top_null_samples, dtype=np.float64)
+        sd = arr.std(ddof=1)
+        if sd > 0:
+            skew = float((((arr - arr.mean()) / sd) ** 3).mean())
+
+    return {
+        "observed": observed,
+        "null_mean": null_mean,
+        "null_std": null_std,
+        "zscores": zscores,
+        "pvalues": pvalues,
+        "fdrs": fdrs,
+        "n_exceed": n_exceed,
+        "n_exceed_top": int(n_exceed[top_idx]),
+        "null_skew_at_max": skew,
+        "n_permutations": count,
+        "seed_idx_score": seed_idx_score,
+    }
+
 def run_propagation_with_significance(
     graph: dict,
     seed_uniprot_scores: dict,
@@ -397,8 +570,8 @@ def run_propagation_with_significance(
             except Exception:
                 pass
 
-    adjacency = graph["adjacency"]
-    raw_adjacency = graph["raw_adjacency"]
+    # adjacency / raw_adjacency are read inside _propagation_core now; this
+    # wrapper only handles identifier vocabulary and table assembly.
     protein_index = graph["protein_index"]
     index_protein = graph["index_protein"]
     uniprot_to_protein = graph["uniprot_to_protein"]
@@ -407,84 +580,20 @@ def run_propagation_with_significance(
 
     string_to_uniprot = {v: k for k, v in uniprot_to_protein.items()}
 
-    seed_idx_score: dict = {}
-    n_not_in_string = 0
-    for acc, score in seed_uniprot_scores.items():
-        pid = uniprot_to_protein.get(acc)
-        if pid is None or pid not in protein_index:
-            n_not_in_string += 1
-            continue
-        idx = protein_index[pid]
-        seed_idx_score[idx] = seed_idx_score.get(idx, 0.0) + float(score)
+    seed_idx_score, n_not_in_string = _map_seeds_to_indices(
+        uniprot_to_protein, protein_index, seed_uniprot_scores)
     n_seeds_mapped = len(seed_idx_score)
     if n_seeds_mapped == 0:
         raise ValueError("None of the input genes mapped to a STRING protein for this organism/confidence.")
 
-    # RWR needs strictly positive seed weights (they redistribute probability
-    # mass); a monotonic shift to positive preserves relative seed importance
-    # regardless of the caller's raw score range (e.g. negative-oriented
-    # "lower = more burden" scores).
-    min_score = min(seed_idx_score.values())
-    if min_score <= 0:
-        shift = abs(min_score) + 1.0
-        seed_idx_score = {k: v + shift for k, v in seed_idx_score.items()}
-
-    seed_vector = np.zeros(n, dtype=np.float64)
-    for idx, score in seed_idx_score.items():
-        seed_vector[idx] = score
-
-    _progress(0, n_permutations + 1, "Propagating seed signal...")
-    observed = propagate_rwr(adjacency, seed_vector, restart_prob=restart_prob)
-
-    bin_of, bins_map = _degree_bins(raw_adjacency)
-    seed_indices = list(seed_idx_score.keys())
-    seed_scores_list = [seed_idx_score[i] for i in seed_indices]
-
-    rng = np.random.default_rng(seed_rng)
-    # Standardize each protein's observed propagated score against its own
-    # degree-preserving permutation null via a z-score. A raw "how often does
-    # a random seed set exceed the observed" comparison is far too conservative
-    # on a dense PPI network - hub proteins soak up signal from ANY high-degree
-    # seeds, so their observed rarely beats the null. Z-scoring each protein by
-    # its own null mean/std removes that per-protein baseline (a hub with a high
-    # but highly-variable null needs a genuinely exceptional observed value to
-    # score high), which is the standard approach for node-level network-
-    # propagation significance. Welford's online mean/variance keeps this O(n)
-    # in memory (no need to store all permutation vectors).
-    null_mean = np.zeros(n, dtype=np.float64)
-    null_m2 = np.zeros(n, dtype=np.float64)
-    count = 0
-    for perm_i in range(n_permutations):
-        perm_vector = np.zeros(n, dtype=np.float64)
-        used: set = set()
-        for orig_idx, score in zip(seed_indices, seed_scores_list):
-            candidates = bins_map.get(int(bin_of[orig_idx]), list(range(n)))
-            cand = candidates[rng.integers(0, len(candidates))]
-            for _try in range(10):
-                if cand not in used:
-                    break
-                cand = candidates[rng.integers(0, len(candidates))]
-            used.add(cand)
-            perm_vector[cand] += score
-        perm_p = propagate_rwr(adjacency, perm_vector, restart_prob=restart_prob)
-        count += 1
-        null_mean, null_m2 = _welford_update(null_mean, null_m2, count, perm_p)
-        if (perm_i + 1) % max(1, n_permutations // 20) == 0:
-            _progress(perm_i + 1, n_permutations + 1, f"Permutation {perm_i + 1}/{n_permutations}")
-
-    null_std = np.sqrt(null_m2 / max(count - 1, 1))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        zscores = (observed - null_mean) / null_std
-    # Proteins with zero null variability (e.g. never reached by any random
-    # seed set) are treated as non-significant rather than +inf - a
-    # conservative default that avoids spurious hits from numerical edge cases.
-    zscores = np.where(null_std > 0, zscores, 0.0)
-    # One-sided upper-tail p-value from the standard normal (ndtr is the normal
-    # CDF; it's a vectorized special function, not a BLAS matmul, so it is not
-    # affected by the dense-BLAS issue noted in mcl_cluster).
-    from scipy.special import ndtr
-    pvalues = ndtr(-zscores)
-    fdrs = genomics_ora.benjamini_hochberg(list(pvalues))
+    core = _propagation_core(
+        graph, seed_idx_score, restart_prob=restart_prob, n_permutations=n_permutations,
+        seed_rng=seed_rng, progress_callback=progress_callback)
+    observed = core["observed"]
+    zscores = core["zscores"]
+    pvalues = core["pvalues"]
+    fdrs = core["fdrs"]
+    seed_idx_score = core["seed_idx_score"]
 
     rows = []
     for i in range(n):
@@ -517,6 +626,14 @@ def run_propagation_with_significance(
         "n_hits": n_hits,
         "n_recruited": n_recruited,
         "seed_string_ids": seed_string_ids,
+        # Diagnostics only, never p-values (see _propagation_core's docstring):
+        # how the normal-tail approximation held up against the actual
+        # permutation distribution.
+        "null_diagnostics": {
+            "n_exceed_top": core["n_exceed_top"],
+            "null_skew_at_max": core["null_skew_at_max"],
+            "n_permutations": core["n_permutations"],
+        },
     }
 
 
