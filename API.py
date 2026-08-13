@@ -52,6 +52,7 @@ import test_compound_resolver as resolver_module
 import Genomics_module_retriever as gene_resolver
 import Genomics_module as genomics_ora
 import Genomics_network as genomics_net
+import Transcriptomics_network as transcriptomics_network_engine
 import Genomics_annotation as genomics_annot
 import Transcriptomics_module_retriever as transcriptomics_retriever
 import Transcriptomics_module as transcriptomics_engine
@@ -558,6 +559,8 @@ def _fresh_transcriptomics_state() -> dict:
         "regulon_config": None,
         "regulon_enrichment_results": None,
         "regulon_activity_results": None,
+        "network_config": None,
+        "network_results": None,
     }
 
 
@@ -1647,17 +1650,197 @@ def _job_run_annotation(job_id: str, session: dict) -> dict:
     return payload
 
 
-def _netprop_subnetwork_edges(graph: dict, string_ids: list, max_nodes: int = 400) -> list:
+def _transcriptomics_network_param_bounds(config: dict) -> dict:
+    """Validate + clamp the network config. Mirrors _netprop_param_bounds's
+    idiom (a bad value falls back to the default rather than erroring), and
+    doubles as the reproducibility record shown on the "Parameters used" pane -
+    every value here is reported with the results and in the CSV downloads.
+
+    Choice-set parameters are REJECTED to the default rather than clamped: a
+    hostile n_permutations of 10**9 must become 500, never "the largest allowed
+    value", which would still be a denial-of-service.
+    """
+    txnet = transcriptomics_network_engine
+
+    def _choice(value, choices, default):
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return default
+        return v if v in choices else default
+
+    def _float(value, lo, hi, default):
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return default
+        return v if lo < v <= hi else default
+
+    def _int_min(value, minimum, default):
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return default
+        return v if v >= minimum else default
+
+    direction = str(config.get("direction") or "all")
+    if direction not in transcriptomics_engine.DIRECTIONS:
+        direction = "all"
+    weighting = str(config.get("weighting") or txnet.NETWORK_SEED_WEIGHT_DEFAULT)
+    if weighting not in txnet.NETWORK_SEED_WEIGHTINGS:
+        weighting = txnet.NETWORK_SEED_WEIGHT_DEFAULT
+    metric = str(config.get("metric") or transcriptomics_engine.GSEA_RANKING_METRIC_DEFAULT)
+    if metric not in transcriptomics_engine.GSEA_RANKING_METRICS:
+        metric = transcriptomics_engine.GSEA_RANKING_METRIC_DEFAULT
+    database = str(config.get("enrichment_database") or txnet.NETWORK_ENRICHMENT_DATABASE_DEFAULT)
+    if database not in txnet.NETWORK_ENRICHMENT_DATABASES:
+        database = txnet.NETWORK_ENRICHMENT_DATABASE_DEFAULT
+
+    msigdb_collections = list(dict.fromkeys(
+        k for k in (config.get("msigdb_collections") or [])
+        if k in transcriptomics_engine.MSIGDB_COLLECTIONS
+    ))
+
+    return {
+        "confidence": _choice(config.get("confidence"), genomics_net.CONFIDENCE_CHOICES,
+                              genomics_net.DEFAULT_CONFIDENCE),
+        "n_permutations": _choice(config.get("n_permutations"), txnet.NETWORK_N_PERMUTATIONS_CHOICES,
+                                  txnet.NETWORK_N_PERMUTATIONS_DEFAULT),
+        "fdr_alpha": _float(config.get("fdr_alpha"), 0.0, 1.0, genomics_net.DEFAULT_FDR_ALPHA),
+        "padj_cutoff": _float(config.get("padj_cutoff"), 0.0, 1.0,
+                              transcriptomics_engine.PADJ_CUTOFF_DEFAULT),
+        "lfc_cutoff": _float(config.get("lfc_cutoff"), -1e-9, 1e6,
+                             transcriptomics_engine.LFC_CUTOFF_DEFAULT),
+        "min_module_size": _int_min(config.get("min_module_size"), 2,
+                                    genomics_net.DEFAULT_MIN_MODULE_SIZE),
+        "max_hits_for_modules": _int_min(config.get("max_hits_for_modules"), 50,
+                                         txnet.DEFAULT_MAX_HITS_FOR_MODULES),
+        "direction": direction,
+        "weighting": weighting,
+        "metric": metric,
+        "enrichment_database": database,
+        "msigdb_collections": msigdb_collections,
+        "include_iea": bool(config.get("include_iea", True)),
+        "module_detection": bool(config.get("module_detection", True)),
+        # Fixed, reported for reproducibility (not user-editable).
+        "restart_prob": genomics_net.DEFAULT_RESTART_PROB,
+        "mcl_inflation": genomics_net.DEFAULT_MCL_INFLATION,
+        "permutation_type": "degree-preserving",
+        "string_version": genomics_net.STRING_VERSION,
+        "seed_rng": 42,
+    }
+
+
+def _job_run_transcriptomics_network(job_id: str, session: dict) -> dict:
+    """Run the Transcriptomics Network / Module Detection analysis."""
+    resolved_df = session["transcriptomics"]["resolved_df"]
+    config = session["transcriptomics"]["network_config"]
+    if resolved_df is None:
+        raise ValueError("No resolved differential-expression table available.")
+    if not config:
+        raise ValueError("Network analysis is not configured.")
+
+    params = _transcriptomics_network_param_bounds(config)
+    taxon_id = str(session["transcriptomics"].get("taxon_id") or "")
+    taxon_name = str(session["transcriptomics"].get("taxon_name") or "")
+
+    def _progress(frac, label):
+        update_job(job_id, progress=float(frac), message=str(label))
+
+    result = transcriptomics_network_engine.run_network_analysis(
+        resolved_df, taxon_id, taxon_name=taxon_name,
+        confidence=params["confidence"],
+        padj_cutoff=params["padj_cutoff"], lfc_cutoff=params["lfc_cutoff"],
+        direction=params["direction"], weighting=params["weighting"], metric=params["metric"],
+        restart_prob=params["restart_prob"], n_permutations=params["n_permutations"],
+        fdr_alpha=params["fdr_alpha"], module_detection=params["module_detection"],
+        min_module_size=params["min_module_size"], mcl_inflation=params["mcl_inflation"],
+        max_hits_for_modules=params["max_hits_for_modules"],
+        enrichment_database=params["enrichment_database"],
+        msigdb_collections=params["msigdb_collections"], include_iea=params["include_iea"],
+        seed=params["seed_rng"], progress_callback=_progress,
+    )
+
+    # The graph is a ~50-100 MB in-process object; it must never reach the
+    # session or the JSON response. Pop it here, use it for the edge list, drop it.
+    graph = result.pop("_graph", None)
+    hit_ids = result.pop("_hit_ids", [])
+    edges = []
+    if graph is not None and hit_ids:
+        # Rank by the SAME order the client figure draws (propagated score,
+        # strongest first) - see _netprop_subnetwork_edges' docstring.
+        ranked = result["propagation"]["table"].sort_values(
+            by="Propagated score", ascending=False, kind="stable")["STRING ID"].tolist()
+        edges = _netprop_subnetwork_edges(graph, hit_ids, rank_by=ranked)
+
+    # Keep the raw DataFrames in the session for CSV download; serialize copies
+    # for the client (same split the ORA/GSEA/regulon workers use).
+    session["transcriptomics"]["network_results"] = result
+
+    payload = {
+        "taxon_id": result["taxon_id"],
+        "taxon_name": result["taxon_name"],
+        "module_detection": result["module_detection"],
+        "parameters": result["parameters"],
+        "mapping": {**{k: v for k, v in result["mapping"].items() if k != "table"},
+                    "table": df_payload(result["mapping"]["table"].head(500))},
+        "seeds": result["seeds"],
+        "propagation": {**{k: v for k, v in result["propagation"].items() if k != "table"},
+                        "table": df_payload(result["propagation"]["table"].head(2000)),
+                        "edges": edges},
+        "modules": None,
+        "caveats": result["caveats"],
+    }
+    if result["modules"]:
+        mods = result["modules"]
+        payload["modules"] = {
+            "table": df_payload(mods["table"]),
+            "membership": mods["membership"],
+            "universe_size": mods["universe_size"],
+            "caveat": mods["caveat"],
+            "selection_caveat": mods["selection_caveat"],
+            "cap_info": mods["cap_info"],
+            "enrichment": {
+                mid: ({"namespace": e["namespace"],
+                       "table": df_payload(e["block"]["table"].head(50))} if e else None)
+                for mid, e in mods["enrichment"].items()
+            },
+        }
+    update_job(job_id, progress=1.0, message="Done")
+    return payload
+
+
+def _netprop_subnetwork_edges(graph: dict, string_ids: list, max_nodes: int = 400,
+                              rank_by: "list | None" = None) -> list:
     """Edges (with confidence weights) among a set of STRING proteins, for the
-    client network figure. Caps at max_nodes (keeps the top-degree ones) so an
-    unusually large hit set never ships a giant edge list to the browser."""
+    client network figure. Caps at max_nodes so an unusually large hit set never
+    ships a giant edge list to the browser.
+
+    rank_by: the caller's own preferred ordering of string_ids (strongest
+    first). When the cap bites, the kept nodes are taken from THIS order.
+    Passing None falls back to top-degree, the historical behaviour.
+
+    Why this parameter exists: the client figure draws the top-N nodes by
+    PROPAGATED SCORE (buildNetpropNetwork) and then keeps only nodes that have
+    a drawn edge. Selecting the shipped subnetwork by DEGREE instead meant the
+    two rankings could disagree - at genomics scale they mostly overlap, but a
+    transcriptomics hit set is an order of magnitude larger, where the
+    top-scoring nodes can be almost absent from a degree-selected 400, leaving
+    the figure empty or, worse, showing a degree-biased subgraph labelled as
+    "your top hits". Callers should pass the same ranking the figure uses.
+    """
     import numpy as _np
     protein_index = graph["protein_index"]
     raw_adj = graph["raw_adjacency"]
     ids = [s for s in string_ids if s in protein_index]
     if len(ids) > max_nodes:
-        deg = _np.asarray(raw_adj.sum(axis=0)).ravel()
-        ids = sorted(ids, key=lambda s: deg[protein_index[s]], reverse=True)[:max_nodes]
+        if rank_by:
+            order = {s: i for i, s in enumerate(rank_by)}
+            # Unranked ids sort last, preserving a deterministic result.
+            ids = sorted(ids, key=lambda s: order.get(s, len(order)))[:max_nodes]
+        else:
+            deg = _np.asarray(raw_adj.sum(axis=0)).ravel()
+            ids = sorted(ids, key=lambda s: deg[protein_index[s]], reverse=True)[:max_nodes]
     idx_of = {s: protein_index[s] for s in ids}
     id_set = set(ids)
     sub = raw_adj[_np.ix_([idx_of[s] for s in ids], [idx_of[s] for s in ids])].tocoo()
@@ -3193,6 +3376,99 @@ def transcriptomics_regulon_download_enrichment(key: str, x_session_id: Optional
         raise HTTPException(status_code=400, detail=f"Unknown result table: {key!r}")
     safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
     return df_to_csv_response(block["table"], f"transcriptomics_regulon_enrichment_{safe_name}.csv")
+
+
+# ---------------------------------------------------------------------------
+# Transcriptomics - Network / Module Detection
+# (shares the retriever + session keys resolved_df / taxon_id / taxon_name with
+# ORA, GSEA and TF/Regulon; defines no retrieval endpoints of its own)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/transcriptomics/network/configure")
+def transcriptomics_network_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["transcriptomics"]["resolved_df"] is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No resolved differential-expression table available. Complete retrieval first.")
+    # 4th call site. taxon_id drives STRING/GO/MSigDB while taxon_name drives
+    # Reactome, so a drifted session would silently mix two organisms.
+    _require_consistent_taxon(session)
+
+    taxon_id = str(session["transcriptomics"].get("taxon_id") or "").strip()
+    if not taxon_id:
+        raise HTTPException(status_code=400, detail="Select an organism first.")
+    # STRING covers ~12,500 species, far fewer than the UniProt taxonomy the
+    # transcriptomics organism selector searches. Refuse fast and by name here
+    # rather than after a long download.
+    try:
+        in_string = genomics_net.is_taxon_in_string(taxon_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach STRING to check organism coverage: {exc}")
+    if not in_string:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"STRING has no protein-interaction network for taxon {taxon_id} "
+                    f"({session['transcriptomics'].get('taxon_name') or 'this organism'}). "
+                    f"Network / Module Detection needs one. GO- and Reactome-based analyses "
+                    f"(Over-Representation Analysis, Gene Set Enrichment Analysis) still work for "
+                    f"this organism."))
+
+    config = _transcriptomics_network_param_bounds(payload or {})
+    if config["enrichment_database"] == "MSigDB" and not config["msigdb_collections"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Select at least one MSigDB collection to label modules with, or choose GO instead.")
+
+    session["transcriptomics"]["network_config"] = config
+    session["transcriptomics"]["network_results"] = None
+    return {"config": config}
+
+
+@app.post("/api/transcriptomics/network/run")
+def transcriptomics_network_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["transcriptomics"]["network_config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_run_transcriptomics_network, session)
+    return {"job_id": job_id}
+
+
+@app.get("/api/transcriptomics/network/download")
+def transcriptomics_network_download(which: str = "hits", key: str = "",
+                                     x_session_id: Optional[str] = Header(default=None)):
+    """CSV export. `which` selects the table; `key` names the module for
+    which="enrichment". Both are query params (module ids and table names are
+    not URL-path-safe), matching the ORA/GSEA/regulon download convention.
+    The FULL, uncapped tables are served here - the client only ever receives a
+    truncated copy for rendering."""
+    session = session_dep(x_session_id)
+    results = session["transcriptomics"]["network_results"]
+    if not results:
+        raise HTTPException(status_code=400, detail="No network results available.")
+
+    if which == "hits":
+        return df_to_csv_response(results["propagation"]["table"],
+                                  "transcriptomics_network_hits.csv")
+    if which == "mapping":
+        return df_to_csv_response(results["mapping"]["table"],
+                                  "transcriptomics_network_gene_mapping.csv")
+    if which == "modules":
+        if not results.get("modules"):
+            raise HTTPException(status_code=400, detail="This run did not include module detection.")
+        return df_to_csv_response(results["modules"]["table"],
+                                  "transcriptomics_network_modules.csv")
+    if which == "enrichment":
+        if not results.get("modules"):
+            raise HTTPException(status_code=400, detail="This run did not include module detection.")
+        entry = results["modules"]["enrichment"].get(key)
+        if entry is None:
+            raise HTTPException(status_code=400, detail=f"No enrichment for module {key!r}.")
+        safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
+        return df_to_csv_response(entry["block"]["table"],
+                                  f"transcriptomics_network_enrichment_{safe_name}.csv")
+
+    raise HTTPException(status_code=400, detail=f"Unknown table: {which!r}")
 
 
 @app.get("/api/transcriptomics/regulon/download-activity")
