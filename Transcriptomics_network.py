@@ -800,7 +800,9 @@ def run_network_analysis(
                 "Recruited": mod["size"] - n_seed,
                 "Up": sum(1 for v in finite if v > 0),
                 "Down": sum(1 for v in finite if v < 0),
-                "Mean log2FC": (sum(finite) / len(finite)) if finite else None,
+                # Rounded at source: this is a summary for reading, and 16
+                # significant digits of a mean is noise on screen and in the CSV.
+                "Mean log2FC": round(sum(finite) / len(finite), 4) if finite else None,
                 "Genes": ", ".join(names),
                 "Top enriched term": top_term,
                 "Top enriched FDR": top_fdr,

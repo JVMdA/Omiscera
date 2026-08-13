@@ -122,6 +122,13 @@ function freshTranscriptomicsState() {
         regulonResults: null,
         regulonRunLocked: false,
         regulonSigAlpha: 0.05,
+        // Network / Module Detection (fourth analysis tile). Also shares the
+        // retrieval above; seeds the STRING interaction network with the DEGs
+        // (server: Transcriptomics_network.py).
+        networkConfig: null,
+        networkResults: null,
+        networkRunLocked: false,
+        networkSigAlpha: 0.05,
     };
 }
 
@@ -145,6 +152,7 @@ function _clearTranscriptomicsResolutionDependentState() {
     tx.oraConfig = null; tx.oraResults = null; tx.oraRunLocked = false;
     tx.gseaConfig = null; tx.gseaResults = null; tx.gseaRunLocked = false;
     tx.regulonConfig = null; tx.regulonResults = null; tx.regulonRunLocked = false;
+    tx.networkConfig = null; tx.networkResults = null; tx.networkRunLocked = false;
     // Draft config (selected databases/collections/thresholds) is lazily
     // created per config screen (STATE.transcriptomics._oraDraft etc.) and
     // is organism-gated (e.g. MSigDB collection availability) - deleting it
@@ -153,6 +161,7 @@ function _clearTranscriptomicsResolutionDependentState() {
     delete tx._oraDraft;
     delete tx._gseaDraft;
     delete tx._regulonDraft;
+    delete tx._networkDraft;
 }
 
 // Coverage per regulon database (see Transcriptomics_regulon.py's module
@@ -1169,6 +1178,8 @@ function renderAnnotationAnalytics() {
     if (STATE.aaPage === "transcriptomics_gsea_results") return renderTranscriptomicsGseaResultsScreen();
     if (STATE.aaPage === "transcriptomics_regulon_config") return renderTranscriptomicsRegulonConfigScreen();
     if (STATE.aaPage === "transcriptomics_regulon_results") return renderTranscriptomicsRegulonResultsScreen();
+    if (STATE.aaPage === "transcriptomics_network_config") return renderTranscriptomicsNetworkConfigScreen();
+    if (STATE.aaPage === "transcriptomics_network_results") return renderTranscriptomicsNetworkResultsScreen();
 
     const wrap = el("div", {});
     wrap.appendChild(aaHeader());
@@ -1216,13 +1227,12 @@ function renderGenomicsAnnotationScreen() {
 }
 
 
-// Only ORA and GSEA are implemented so far; the remaining two tiles used to
-// be fully clickable and let a user complete a whole upload+resolve cycle
-// (burning a real mygene.info job) before finding out the analysis itself
-// doesn't exist yet. Disabling them here surfaces that up front instead.
-const TRANSCRIPTOMICS_TILES_NOT_YET_IMPLEMENTED = new Set([
-    "Enrichment",
-]);
+// All four Transcriptomics tiles are implemented, so this set is empty - kept
+// (rather than deleted) because it is the mechanism that stops a future fifth
+// tile being clickable before its engine exists. A tile listed here is
+// disabled up front, instead of letting a user complete a whole upload+resolve
+// cycle - burning a real mygene.info job - only to find the analysis missing.
+const TRANSCRIPTOMICS_TILES_NOT_YET_IMPLEMENTED = new Set([]);
 
 function renderTranscriptomicsScreen() {
     const wrap = el("div", {});
@@ -1233,7 +1243,7 @@ function renderTranscriptomicsScreen() {
         "Over-Representation Analysis",
         "Gene Set Enrichment Analysis",
         "Transcription Factor / Regulon",
-        "Enrichment",
+        "Network / Module Detection",
     ].forEach((name) => {
         const notYetImplemented = TRANSCRIPTOMICS_TILES_NOT_YET_IMPLEMENTED.has(name);
         const btn = el("button", {
@@ -1264,7 +1274,17 @@ function backToTranscriptomicsActions() {
 
 function renderTranscriptomicsOrganismSelector() {
     const wrap = el("div", {});
-    const input = el("input", { class: "text-input", type: "text", placeholder: "Species / organism (name or UniProt taxon ID)" });
+    // Network / Module Detection searches STRING's own species list instead of
+    // the whole UniProt taxonomy. Same NCBI taxon-ID space, so the resolved
+    // table, _require_consistent_taxon and meta["taxon"] are unaffected - but
+    // STRING covers ~12,500 organisms against UniProt's ~2.4M, and picking one
+    // STRING has no network for would only fail AFTER a full upload and a real
+    // mygene.info resolve. The other three tiles stay unrestricted, because GO
+    // and Reactome cover far more organisms than STRING does.
+    const isNetworkTile = STATE.transcriptomicsModuleName === "Network / Module Detection";
+    const input = el("input", { class: "text-input", type: "text",
+        placeholder: isNetworkTile ? "Species / organism in STRING (name or NCBI taxon ID)"
+                                   : "Species / organism (name or UniProt taxon ID)" });
     const resultsSelect = el("select", { class: "hidden" });
     const selectedCaption = el("div", { class: "caption" });
 
@@ -1289,15 +1309,22 @@ function renderTranscriptomicsOrganismSelector() {
             if (query === lastQuery) return;
             lastQuery = query;
             try {
-                const data = await apiJson("/api/contexts/search?database=" + encodeURIComponent("Rhea + UniProt") + "&query=" + encodeURIComponent(query) + "&limit=10");
+                const data = isNetworkTile
+                    ? await apiJson("/api/netprop/species?query=" + encodeURIComponent(query))
+                    : await apiJson("/api/contexts/search?database=" + encodeURIComponent("Rhea + UniProt") + "&query=" + encodeURIComponent(query) + "&limit=10");
                 resultsSelect.innerHTML = "";
                 resultsSelect.appendChild(el("option", { value: "" }, "Select organism"));
-                (data.results || []).forEach((rec, idx) => {
+                // The two endpoints name their fields differently; normalize to
+                // the {context_id, context_name} shape the change handler reads.
+                const records = (data.results || []).map((rec) => (
+                    isNetworkTile ? { context_id: String(rec.taxon_id || ""), context_name: String(rec.name || "") } : rec
+                ));
+                records.forEach((rec, idx) => {
                     const label = rec.context_id && rec.context_name ? rec.context_id + " | " + rec.context_name : (rec.context_name || rec.context_id || "");
                     resultsSelect.appendChild(el("option", { value: String(idx) }, label));
                 });
-                resultsSelect._records = data.results || [];
-                resultsSelect.classList.toggle("hidden", (data.results || []).length === 0);
+                resultsSelect._records = records;
+                resultsSelect.classList.toggle("hidden", records.length === 0);
             } catch (err) { /* keep prior dropdown contents on transient search errors */ }
         }, 350);
     });
@@ -1524,9 +1551,21 @@ function renderTranscriptomicsResults() {
             render();
         });
         wrap.appendChild(continueBtn);
+    } else if (STATE.transcriptomicsModuleName === "Network / Module Detection") {
+        const continueBtn = el("button", { class: "btn btn-primary", style: { marginTop: "0.8rem" } }, "Continue to Network / Module Detection");
+        continueBtn.addEventListener("click", () => {
+            STATE.transcriptomics.networkConfig = null;
+            STATE.transcriptomics.networkResults = null;
+            STATE.transcriptomics.networkRunLocked = false;
+            STATE.aaPage = "transcriptomics_network_config";
+            render();
+        });
+        wrap.appendChild(continueBtn);
     } else {
+        // Defensive: every tile in the grid above now has a branch, so this is
+        // only reachable if a new tile is added without one.
         wrap.appendChild(el("div", { class: "caption" },
-            "This analysis engine (Enrichment) is coming next."));
+            "This analysis module is not available yet."));
     }
     return wrap;
 }
@@ -4559,6 +4598,491 @@ function buildRegulonCoherenceBars(div, row, detail, geneLog2FC, tf) {
         legend: { orientation: "h", y: -0.3 },
     };
     _newOraPlot(div, traces, layout, "regulon_detail", tf, "coherence", "Coherence bars");
+}
+
+
+
+// ---------------------------------------------------------------------------
+// Transcriptomics — Network / Module Detection (fourth analysis tile)
+// Seeds the STRING interaction network with the DE genes, propagates, then
+// clusters the significant hits into modules. Reuses the Genomics netprop
+// figures (buildNetpropNetwork / buildNetpropHistogram) unchanged - the server
+// payload is deliberately the same shape - and the ORA dot/bar builders for
+// per-module enrichment via the shared RESULT_COLUMNS contract.
+// ---------------------------------------------------------------------------
+
+const TX_NETWORK_PERMUTATION_CHOICES = [["200", "200"], ["500", "500"], ["1000", "1000"], ["2000", "2000"]];
+const TX_NETWORK_DIRECTIONS = [["All DE genes", "all"], ["Up-regulated only", "up"], ["Down-regulated only", "down"]];
+const TX_NETWORK_WEIGHTINGS = [
+    ["Equal weight (recommended)", "equal"],
+    ["Weighted by |ranking metric|", "abs_metric"],
+];
+const TX_NETWORK_ENRICHMENT_DBS = [["GO", "GO"], ["MSigDB", "MSigDB"]];
+
+// Rough wall-clock guide so a user isn't surprised by a multi-minute run.
+// Anchored on a measured point: 200 permutations over the human network took
+// ~60 s on the development machine, and cost is very close to linear in the
+// permutation count.
+function _txNetworkRuntimeHint(nPermutations) {
+    const seconds = Math.round((Number(nPermutations) || 500) * 0.3);
+    if (seconds < 90) return "about " + seconds + " seconds";
+    return "about " + Math.round(seconds / 60) + " minute(s)";
+}
+
+function renderTranscriptomicsNetworkConfigScreen() {
+    const wrap = el("div", { class: "ora-config-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" },
+        "Transcriptomics — Network / Module Detection: setup"));
+
+    const locked = STATE.transcriptomics.networkRunLocked;
+    if (locked) {
+        wrap.appendChild(alertBox("info", "Configuration is locked for the in-progress/completed run. Use \"Start new run\" on the results screen to change settings."));
+    }
+
+    if (!STATE.transcriptomics._networkDraft) {
+        STATE.transcriptomics._networkDraft = {
+            confidence: 700,
+            direction: "all",
+            weighting: "equal",
+            metric: "signed_log_pvalue",
+            padjCutoff: 0.05,
+            lfcCutoff: 1.0,
+            fdrAlpha: 0.05,
+            nPermutations: 500,
+            moduleDetection: true,
+            minModuleSize: 3,
+            maxHitsForModules: 600,
+            enrichmentDatabase: "GO",
+            msigdbCollections: [],
+            includeIea: true,
+        };
+    }
+    const draft = STATE.transcriptomics._networkDraft;
+    const taxonId = STATE.transcriptomics.taxonId;
+
+    wrap.appendChild(el("div", { class: "caption" },
+        "Organism: " + (STATE.transcriptomics.taxonName || "?") + " (STRING taxon " + (taxonId || "?") + "). " +
+        "This analysis spreads your differential-expression signal through the STRING protein-interaction " +
+        "network, so it can surface genes you did NOT upload but that sit at the centre of the response."));
+
+    // --- seeding ---
+    wrap.appendChild(el("div", { class: "section-label" }, "Seed genes"));
+    const seedBox = el("div", { class: "rank-card ora-db-card" });
+
+    function selectRow(box, label, choices, current, onChange) {
+        const row = el("div", { class: "ora-term-size-row" });
+        row.appendChild(el("span", { class: "chart-option-label" }, label));
+        const sel = el("select", { class: "chart-option-select" });
+        choices.forEach(([lbl, val]) => sel.appendChild(el("option", { value: val }, lbl)));
+        sel.value = String(current);
+        sel.disabled = locked;
+        sel.addEventListener("change", () => onChange(sel.value));
+        row.appendChild(sel);
+        box.appendChild(row);
+        return sel;
+    }
+    function numberRow(box, label, value, step, min, onChange) {
+        const row = el("div", { class: "ora-term-size-row" });
+        row.appendChild(el("span", { class: "chart-option-label" }, label));
+        const inp = el("input", { type: "number", class: "ora-term-size-input", step: String(step), min: String(min) });
+        inp.value = value;
+        inp.disabled = locked;
+        inp.addEventListener("change", () => onChange(inp.value));
+        row.appendChild(inp);
+        box.appendChild(row);
+        return inp;
+    }
+
+    numberRow(seedBox, "Adjusted p-value cutoff (padj <=)", draft.padjCutoff, 0.001, 0, (v) => {
+        const x = parseFloat(v); draft.padjCutoff = (isFinite(x) && x > 0 && x <= 1) ? x : 0.05;
+    });
+    numberRow(seedBox, "Minimum |log2 fold-change|", draft.lfcCutoff, 0.1, 0, (v) => {
+        const x = parseFloat(v); draft.lfcCutoff = (isFinite(x) && x >= 0) ? x : 1.0;
+    });
+    selectRow(seedBox, "Direction", TX_NETWORK_DIRECTIONS, draft.direction, (v) => { draft.direction = v; });
+    const metricRow = el("div", {});
+    selectRow(seedBox, "Seed weighting", TX_NETWORK_WEIGHTINGS, draft.weighting, (v) => {
+        draft.weighting = v;
+        metricRow.classList.toggle("hidden", v !== "abs_metric");
+    });
+    selectRow(metricRow, "Ranking metric", Object.keys(GSEA_RANKING_METRIC_LABELS).map(
+        (k) => [GSEA_RANKING_METRIC_LABELS[k], k]), draft.metric, (v) => { draft.metric = v; });
+    metricRow.classList.toggle("hidden", draft.weighting !== "abs_metric");
+    seedBox.appendChild(metricRow);
+    seedBox.appendChild(el("div", { class: "caption ora-custom-help" },
+        "Only genes passing BOTH cutoffs seed the network. \"Equal weight\" is recommended: the cutoffs have " +
+        "already made the evidence call, so re-weighting by the same p-values counts it twice. Direction is " +
+        "applied by choosing WHICH genes seed - never as a positive/negative weight, because the random walk " +
+        "spreads an unsigned quantity and a signed weight would silently bias the whole run."));
+    wrap.appendChild(seedBox);
+
+    // --- network + significance ---
+    wrap.appendChild(el("div", { class: "section-label" }, "Network and significance"));
+    const netBox = el("div", { class: "rank-card ora-db-card" });
+    // Read at call time, not module load: this const is declared later in the file.
+    selectRow(netBox, "STRING confidence cutoff", NETPROP_CONFIDENCE_CHOICES, draft.confidence,
+        (v) => { draft.confidence = Number(v); });
+    numberRow(netBox, "Significance threshold (FDR <)", draft.fdrAlpha, 0.001, 0, (v) => {
+        const x = parseFloat(v); draft.fdrAlpha = (isFinite(x) && x > 0 && x <= 1) ? x : 0.05;
+    });
+    const runtimeCaption = el("div", { class: "caption ora-custom-help" },
+        "Estimated run time: " + _txNetworkRuntimeHint(draft.nPermutations) + ".");
+    selectRow(netBox, "Number of permutations", TX_NETWORK_PERMUTATION_CHOICES, draft.nPermutations, (v) => {
+        draft.nPermutations = Number(v);
+        runtimeCaption.textContent = "Estimated run time: " + _txNetworkRuntimeHint(draft.nPermutations) + ".";
+    });
+    netBox.appendChild(runtimeCaption);
+    netBox.appendChild(el("div", { class: "caption ora-custom-help" },
+        "STRING's combined score folds in text-mining and cross-organism transfer as well as experiments, so " +
+        "it is not purely experimental evidence and leans toward well-studied genes - which is why 0.7 (high) " +
+        "is the default. Each permutation re-runs the whole propagation, so the count drives the run time."));
+    wrap.appendChild(netBox);
+
+    // --- modules ---
+    wrap.appendChild(el("div", { class: "section-label" }, "Modules"));
+    const modBox = el("div", { class: "rank-card ora-db-card" });
+    const modRow = el("div", { class: "ora-iea-row" });
+    const modCb = el("input", { type: "checkbox", class: "ora-iea-checkbox" });
+    modCb.checked = !!draft.moduleDetection;
+    modCb.disabled = locked;
+    const modOptions = el("div", {});
+    modCb.addEventListener("change", () => {
+        draft.moduleDetection = modCb.checked;
+        modOptions.classList.toggle("hidden", !modCb.checked);
+    });
+    modRow.appendChild(modCb);
+    modRow.appendChild(document.createTextNode(" Detect modules and label each by functional enrichment"));
+    modBox.appendChild(modRow);
+
+    numberRow(modOptions, "Minimum module size", draft.minModuleSize, 1, 2, (v) => {
+        const x = parseInt(v, 10); draft.minModuleSize = (isFinite(x) && x >= 2) ? x : 3;
+    });
+    numberRow(modOptions, "Maximum hits used for clustering", draft.maxHitsForModules, 50, 50, (v) => {
+        const x = parseInt(v, 10); draft.maxHitsForModules = (isFinite(x) && x >= 50) ? x : 600;
+    });
+    const msigRow = el("div", {});
+    selectRow(modOptions, "Label modules using", TX_NETWORK_ENRICHMENT_DBS, draft.enrichmentDatabase, (v) => {
+        draft.enrichmentDatabase = v;
+        msigRow.classList.toggle("hidden", v !== "MSigDB");
+        renderRunBtn();
+    });
+    // Same helper (and same draft.msigdbCollections field name) ORA and GSEA
+    // use, so the collection list and its per-organism gating stay identical
+    // across all three without a second implementation.
+    msigRow.appendChild(renderMsigdbCollectionSelector(locked, draft, taxonId, () => renderRunBtn()));
+    msigRow.classList.toggle("hidden", draft.enrichmentDatabase !== "MSigDB");
+    modOptions.appendChild(msigRow);
+    modOptions.appendChild(el("div", { class: "caption ora-custom-help" },
+        "Modules are labelled against the whole network's genes, not just the genes you uploaded - otherwise " +
+        "every recruited gene would silently vanish from its own module's label. Clustering uses the strongest " +
+        "hits by Z-score up to the cap, which keeps the grouping stable: on a very large hit set the algorithm " +
+        "can otherwise collapse everything into one giant, uninformative \"module\". " +
+        "Reactome is not offered here because its identifier bridge is built from your uploaded table, so " +
+        "recruited genes would be dropped entirely."));
+    modOptions.classList.toggle("hidden", !draft.moduleDetection);
+    modBox.appendChild(modOptions);
+    wrap.appendChild(modBox);
+
+    // --- actions ---
+    const actions = el("div", { class: "right-actions ora-config-actions" });
+    const btnRow = el("div", { class: "btn-row ora-config-btn-row" });
+    const backBtn = el("button", { class: "btn ora-back-btn" }, "Back");
+    backBtn.addEventListener("click", () => { STATE.aaPage = "transcriptomics_module"; render(); });
+    btnRow.appendChild(backBtn);
+    const runWrap = el("div", { class: "col" });
+    btnRow.appendChild(runWrap);
+    actions.appendChild(btnRow);
+
+    function renderRunBtn() {
+        runWrap.innerHTML = "";
+        const runBtn = el("button", { class: "btn btn-primary ora-run-btn" }, "Run");
+        const needsCollection = draft.enrichmentDatabase === "MSigDB" && draft.moduleDetection
+            && (draft.msigdbCollections || []).length === 0;
+        runBtn.disabled = locked || !taxonId || needsCollection;
+        runBtn.addEventListener("click", () => startTranscriptomicsNetworkRun(draft));
+        runWrap.appendChild(runBtn);
+    }
+    renderRunBtn();
+    wrap.appendChild(actions);
+
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToTranscriptomicsActions());
+    return wrap;
+}
+
+function startTranscriptomicsNetworkRun(draft) {
+    const payload = {
+        confidence: draft.confidence,
+        direction: draft.direction,
+        weighting: draft.weighting,
+        metric: draft.metric,
+        padj_cutoff: draft.padjCutoff,
+        lfc_cutoff: draft.lfcCutoff,
+        fdr_alpha: draft.fdrAlpha,
+        n_permutations: draft.nPermutations,
+        module_detection: !!draft.moduleDetection,
+        min_module_size: draft.minModuleSize,
+        max_hits_for_modules: draft.maxHitsForModules,
+        enrichment_database: draft.enrichmentDatabase,
+        msigdb_collections: draft.msigdbCollections || [],
+        include_iea: !!draft.includeIea,
+    };
+    apiPostJson("/api/transcriptomics/network/configure", payload).then(() => {
+        STATE.transcriptomics.networkConfig = payload;
+        STATE.transcriptomics.networkRunLocked = true;
+        STATE.transcriptomics.networkResults = null;
+        // Navigate BEFORE starting the run so the progress bar divs exist by
+        // the time pollJob's first tick arrives.
+        STATE.aaPage = "transcriptomics_network_results";
+        render();
+        return apiPostJson("/api/transcriptomics/network/run", {});
+    }).then(({ job_id }) => {
+        pollJob(job_id, {
+            onProgress: (job) => {
+                const bar = document.getElementById("transcriptomics-network-progress-inner");
+                const label = document.getElementById("transcriptomics-network-progress-label");
+                if (bar) bar.style.width = Math.round((job.progress || 0) * 100) + "%";
+                if (label) label.textContent = job.message || "";
+            },
+            onDone: (result) => { STATE.transcriptomics.networkResults = result; render(); },
+            onError: (err) => {
+                alert("Network / Module Detection run failed: " + err);
+                STATE.transcriptomics.networkRunLocked = false;
+                render();
+            },
+        });
+    }).catch((err) => {
+        alert(err.message);
+        STATE.transcriptomics.networkRunLocked = false;
+        render();
+    });
+}
+
+function renderTranscriptomicsNetworkResultsScreen() {
+    const wrap = el("div", { class: "ora-config-screen ora-results-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" },
+        "Transcriptomics — Network / Module Detection: results"));
+
+    const payload = STATE.transcriptomics.networkResults;
+    if (!payload) {
+        wrap.appendChild(alertBox("info", "Running analysis... (downloading the STRING network and running the permutation test can take a few minutes)"));
+        const progressWrap = el("div", { class: "progress-wrap" });
+        const progressInner = el("div", { id: "transcriptomics-network-progress-inner", class: "progress-bar-inner", style: { width: "0%" } });
+        progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, progressInner));
+        progressWrap.appendChild(el("div", { id: "transcriptomics-network-progress-label", class: "progress-label" }, ""));
+        wrap.appendChild(progressWrap);
+        return wrap;
+    }
+
+    const prop = payload.propagation || {};
+    const mapping = payload.mapping || {};
+    const seeds = payload.seeds || {};
+    const params = payload.parameters || {};
+    const DB = "transcriptomics_network";   // keeps chart ids/filenames distinct from the Genomics tile
+
+    (payload.caveats || []).forEach((c) => wrap.appendChild(alertBox("warning", c)));
+
+    const card = el("div", { class: "rank-card ora-db-card ora-result-card" });
+    wrap.appendChild(card);
+    const navHost = el("div", {});
+    card.appendChild(navHost);
+    const nav = makeResultNav(navHost, { stateKey: "transcriptomics_network" });
+
+    // ----- Overview -----
+    const overview = nav.pane("Overview");
+    overview.appendChild(metricCards([
+        ["Genes seeded", seeds.n_seeds || 0],
+        ["Significant", prop.n_hits || 0],
+        ["Recruited", prop.n_recruited || 0],
+        ["Modules", (payload.modules && (payload.modules.table.rows || []).length) || 0],
+        ["Network proteins", prop.n_proteins || 0],
+    ], 5));
+    overview.appendChild(el("div", { class: "caption" },
+        "\"Recruited\" genes are proteins you did NOT upload that the network places at the centre of your " +
+        "response - the information this analysis adds over Over-Representation Analysis and GSEA. A seed " +
+        "scoring significantly is largely expected: it receives signal directly and is compared against " +
+        "permutations in which it is usually not a seed, so read the recruited set as the discovery."));
+    const nd = prop.null_diagnostics || {};
+    overview.appendChild(el("div", { class: "caption" },
+        "Significance comes from " + (nd.n_permutations || params.n_permutations || "?") + " degree-preserving " +
+        "permutations. p-values assume a normal null; the measured null skewness at the top protein was " +
+        (nd.null_skew_at_max !== undefined && nd.null_skew_at_max !== null ? Number(nd.null_skew_at_max).toFixed(2) : "n/a") +
+        " (0 = perfectly normal), so treat the ranking as more reliable than the exact FDR values."));
+
+    // ----- Gene mapping -----
+    const mapPane = nav.pane("Gene mapping");
+    mapPane.appendChild(metricCards([
+        ["Uploaded genes", mapping.n_input || 0],
+        ["Matched to STRING", mapping.n_mapped || 0],
+        ["Not matched", mapping.n_unmapped || 0],
+        ["Coverage", ((mapping.fraction_mapped || 0) * 100).toFixed(1) + "%"],
+    ], 4));
+    const tiers = mapping.n_by_tier || {};
+    mapPane.appendChild(el("div", { class: "caption" },
+        "Matched by gene symbol: " + (tiers.gene_symbol || 0) + ", by Ensembl ID: " + (tiers.ensembl_id || 0) +
+        ", by Entrez ID: " + (tiers.entrez_id || 0) + ". " +
+        (mapping.n_collisions_used ? mapping.n_collisions_used + " identifier(s) matched more than one protein; " +
+            "the best-connected protein was used. " : "") +
+        "STRING names proteins using each organism's own nomenclature, so coverage varies by species."));
+    if (mapping.table) mapPane.appendChild(buildTable(mapping.table, { maxHeight: 420 }));
+    const mapDl = el("button", { class: "btn" }, "Download gene mapping (CSV)");
+    mapDl.addEventListener("click", () => downloadFile(
+        "/api/transcriptomics/network/download?which=mapping", "transcriptomics_network_gene_mapping.csv"));
+    mapPane.appendChild(mapDl);
+
+    // ----- Hit table -----
+    const hitPane = nav.pane("Hit table");
+    hitPane.appendChild(el("div", { class: "caption" },
+        "Every protein in the network, ranked by FDR. \"Seed\" marks genes you uploaded that passed the " +
+        "cutoffs; rows with no log2FC/padj were never in your table at all - those are the recruited ones."));
+    if (prop.table) {
+        hitPane.appendChild(buildTable(prop.table, {
+            maxHeight: 520,
+            rowClassFn: (row) => (row["FDR"] !== null && Number(row["FDR"]) < (params.fdr_alpha || 0.05)) ? "row-significant" : "",
+        }));
+    }
+    const hitDl = el("button", { class: "btn" }, "Download hit table (CSV)");
+    hitDl.addEventListener("click", () => downloadFile(
+        "/api/transcriptomics/network/download?which=hits", "transcriptomics_network_hits.csv"));
+    hitPane.appendChild(hitDl);
+
+    // ----- Figures -----
+    const figPane = nav.pane("Figures");
+    const figState = { nodesShown: 50, fontSize: 12, colorScaleName: ORA_DOT_COLOR_SCALES[0][1], minEdgeConfidence: 0 };
+    const figToggles = [];
+    const figControls = el("div", { class: "chart-toggle-row" });
+    function figOption(label, choices, current, onChange) {
+        const w = el("div", { class: "chart-option-control" });
+        w.appendChild(el("span", { class: "chart-option-label" }, label));
+        const sel = el("select", { class: "chart-option-select" });
+        choices.forEach(([lbl, val]) => sel.appendChild(el("option", { value: String(val) }, lbl)));
+        sel.value = String(current);
+        sel.addEventListener("change", () => { onChange(sel.value); figToggles.forEach((t) => t.redraw()); });
+        w.appendChild(sel);
+        figControls.appendChild(w);
+    }
+    figOption("Nodes shown", [["25", 25], ["50", 50], ["100", 100], ["200", 200]], figState.nodesShown,
+        (v) => { figState.nodesShown = Number(v); });
+    figOption("Font size", [["10", 10], ["12", 12], ["14", 14]], figState.fontSize,
+        (v) => { figState.fontSize = Number(v); });
+    figOption("Colour scale", ORA_DOT_COLOR_SCALES, figState.colorScaleName,
+        (v) => { figState.colorScaleName = v; });
+    figOption("Min edge confidence", [["any", 0], ["0.7", 0.7], ["0.9", 0.9]], figState.minEdgeConfidence,
+        (v) => { figState.minEdgeConfidence = Number(v); });
+    figPane.appendChild(figControls);
+
+    const netToggle = _netpropChartToggle("Show network figure", "propnet",
+        (d) => buildNetpropNetwork(d, payload, "score", { ...figState, dbName: DB }),
+        _oraChartId("propnet", DB, "score"), DB);
+    const histToggle = _netpropChartToggle("Show null distribution", "histogram",
+        (d) => buildNetpropHistogram(d, payload, { fontSize: figState.fontSize, dbName: DB }),
+        _oraChartId("histogram", DB, "null"), DB);
+    figToggles.push(netToggle, histToggle);
+    figPane.appendChild(netToggle.el);
+    figPane.appendChild(histToggle.el);
+
+    // ----- Modules -----
+    if (payload.modules && (payload.modules.table.rows || []).length) {
+        const mods = payload.modules;
+        const modPane = nav.pane("Modules");
+        modPane.appendChild(el("div", { class: "caption" },
+            "Densely-connected groups among the significant genes. \"Up\"/\"Down\" count how many members " +
+            "moved in each direction in YOUR data, so a module mixing both is not a coherently regulated " +
+            "unit. Recruited members have no direction, since they were not in your table."));
+        if (mods.cap_info && mods.cap_info.capped) {
+            modPane.appendChild(alertBox("info",
+                "Clustering used the " + mods.cap_info.n_used_for_modules + " strongest of " +
+                mods.cap_info.n_hits + " significant genes."));
+        }
+        modPane.appendChild(buildTable(mods.table, { maxHeight: 460 }));
+        const modDl = el("button", { class: "btn" }, "Download modules (CSV)");
+        modDl.addEventListener("click", () => downloadFile(
+            "/api/transcriptomics/network/download?which=modules", "transcriptomics_network_modules.csv"));
+        modPane.appendChild(modDl);
+
+        const modNetToggle = _netpropChartToggle("Show module-coloured network", "modulenet",
+            (d) => buildNetpropNetwork(d, payload, "module", { ...figState, dbName: DB }),
+            _oraChartId("modulenet", DB, "module"), DB);
+        modPane.appendChild(modNetToggle.el);
+
+        // ----- Per-module enrichment -----
+        const withEnr = (mods.table.rows || [])
+            .map((r) => r["Module ID"])
+            .filter((mid) => mods.enrichment && mods.enrichment[mid] && (mods.enrichment[mid].table.rows || []).length);
+        if (withEnr.length) {
+            const enrPane = nav.pane("Module enrichment");
+            enrPane.appendChild(el("div", { class: "caption" },
+                mods.selection_caveat || ""));
+            const sel = el("select", { class: "text-input" });
+            withEnr.forEach((mid) => sel.appendChild(el("option", { value: mid }, mid)));
+            enrPane.appendChild(el("div", { class: "row" }, el("div", { class: "col" }, sel)));
+            const host = el("div", {});
+            enrPane.appendChild(host);
+            function renderEnr(mid) {
+                host.innerHTML = "";
+                const e = mods.enrichment[mid];
+                if (!e) return;
+                host.appendChild(el("div", { class: "caption" }, "Annotation source: " + e.namespace));
+                host.appendChild(buildTable(e.table, { maxHeight: 380 }));
+                const dl = el("button", { class: "btn" }, "Download this module's enrichment (CSV)");
+                dl.addEventListener("click", () => downloadFile(
+                    "/api/transcriptomics/network/download?which=enrichment&key=" + encodeURIComponent(mid),
+                    "transcriptomics_network_enrichment_" + mid.toLowerCase() + ".csv"));
+                host.appendChild(dl);
+                const dot = _netpropChartToggle("Show dot plot", "dot",
+                    (d) => buildDotPlot(d, e.table, DB, "enrichment", ORA_DOT_COLOR_SCALES[0][1], { topN: 20, fontSize: 12 }),
+                    _oraChartId("dot", DB, "enrichment"), DB);
+                const bar = _netpropChartToggle("Show bar plot", "bar",
+                    (d) => buildBarPlot(d, e.table, DB, "enrichment", ORA_BAR_COLORS[0][1], { topN: 20, fontSize: 12 }),
+                    _oraChartId("bar", DB, "enrichment"), DB);
+                host.appendChild(dot.el);
+                host.appendChild(bar.el);
+            }
+            sel.addEventListener("change", () => renderEnr(sel.value));
+            renderEnr(withEnr[0]);
+        }
+    }
+
+    // ----- Parameters -----
+    const paramPane = nav.pane("Parameters used");
+    const paramBox = el("div", { class: "rank-card ora-db-card" });
+    [
+        ["STRING version", params.string_version],
+        ["Confidence cutoff", params.confidence],
+        ["Seed selection", "padj <= " + params.padj_cutoff + ", |log2FC| >= " + params.lfc_cutoff + ", " + params.direction],
+        ["Seed weighting", params.weighting + (params.ranking_metric ? " (" + params.ranking_metric + ")" : "")],
+        ["Restart probability", params.restart_prob],
+        ["Permutations", params.n_permutations + " (" + params.permutation_type + ", seed " + params.seed_rng + ")"],
+        ["Significance", "FDR < " + params.fdr_alpha],
+        ["MCL inflation", params.mcl_inflation],
+        ["Min module size", params.min_module_size],
+        ["Max hits clustered", params.max_hits_for_modules],
+        ["Module labels", params.enrichment_database + ((params.msigdb_collections || []).length ? " (" + params.msigdb_collections.join(", ") + ")" : "")],
+    ].forEach(([k, v]) => paramBox.appendChild(el("div", { class: "caption" }, "- " + k + ": " + v)));
+    paramPane.appendChild(paramBox);
+    paramPane.appendChild(el("div", { class: "caption" },
+        "STRING's combined score includes text-mining and cross-organism transfer as well as experimental " +
+        "evidence, so modules lean toward well-studied genes. Module labels are descriptive: modules are " +
+        "chosen for being connected and carrying signal and only then tested, so their FDR is not a " +
+        "hypothesis test."));
+
+    nav.finish();
+
+    const newRunBtn = el("button", { class: "btn", style: { marginTop: "0.8rem" } }, "Start new run");
+    newRunBtn.addEventListener("click", () => {
+        STATE.transcriptomics.networkConfig = null;
+        STATE.transcriptomics.networkResults = null;
+        STATE.transcriptomics.networkRunLocked = false;
+        STATE.transcriptomics._networkDraft = null;
+        STATE.aaPage = "transcriptomics_network_config";
+        render();
+    });
+    wrap.appendChild(newRunBtn);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToTranscriptomicsActions());
+    return wrap;
 }
 
 
@@ -9056,7 +9580,7 @@ function buildNetpropNetwork(div, payload, colorMode, opts) {
 
     const kind = colorMode === "module" ? "modulenet" : "propnet";
     const label = colorMode === "module" ? "Module network" : "Propagation network";
-    _plotNetwork(div, [edgeTrace, nodeTrace], {}, "netprop", colorMode, kind, label,
+    _plotNetwork(div, [edgeTrace, nodeTrace], {}, (opts.dbName || "netprop"), colorMode, kind, label,
         () => _makeNetworkDraggable(div, [{ traceIndex: 1, nodeIds }], pos, 0, edges));
 }
 
@@ -9088,7 +9612,7 @@ function buildNetpropHistogram(div, payload, opts) {
         layout.shapes = [{ type: "line", x0: boundary, x1: boundary, yref: "paper", y0: 0, y1: 1, line: { color: "#c0392b", width: 1.5, dash: "dash" } }];
         layout.annotations = [{ x: boundary, yref: "paper", y: 1, text: "FDR < " + alpha, showarrow: false, font: { size: Math.max(9, fontSize - 2), color: "#c0392b" }, xanchor: "left" }];
     }
-    _newOraPlot(div, [trace], layout, "netprop", "null", "histogram", "Null distribution");
+    _newOraPlot(div, [trace], layout, (opts.dbName || "netprop"), "null", "histogram", "Null distribution");
 }
 
 function renderNetpropAnalysisResultsScreen() {
@@ -9340,7 +9864,7 @@ function renderNetpropAnalysisResultsScreen() {
 // Returns { el, redraw }: redraw() rebuilds the figure (reading current shared
 // control state via buildFn's closure) only if it is currently shown - mirrors
 // ORA's addChartToggle so the controls row can re-render on option change.
-function _netpropChartToggle(label, kind, buildFn, explicitId) {
+function _netpropChartToggle(label, kind, buildFn, explicitId, dbName) {
     const holder = el("div", {});
     const isNetwork = kind === "propnet" || kind === "modulenet";
     const nsById = { histogram: "null", modulenet: "module", propnet: "score" };
@@ -9349,7 +9873,7 @@ function _netpropChartToggle(label, kind, buildFn, explicitId) {
     // `kind` that already matches; buildDotPlot/buildBarPlot hardcode kind
     // "dot"/"bar" internally, so the enrichment toggles MUST pass an explicitId
     // of _oraChartId("dot"|"bar", ...) or the modebar export can't find them.
-    const chartDiv = el("div", { id: explicitId || _oraChartId(kind, "netprop", nsById[kind] || kind), class: "chart-container" + (isNetwork ? " chart-network" : ""), style: { display: "none" } });
+    const chartDiv = el("div", { id: explicitId || _oraChartId(kind, dbName || "netprop", nsById[kind] || kind), class: "chart-container" + (isNetwork ? " chart-network" : ""), style: { display: "none" } });
     let shown = false, built = false;
     const btn = el("button", { class: "btn chart-toggle-btn" }, label);
     function renderChart() { buildFn(chartDiv); built = true; }
