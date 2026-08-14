@@ -1,5 +1,6 @@
 ===========================================================================
-OMISCERA TEST SUITE - Transcriptomics (TF / Regulon, ORA, GSEA, MSigDB)
+OMISCERA TEST SUITE - Transcriptomics (TF / Regulon, ORA, GSEA, MSigDB,
+Network / Module Detection)
 ===========================================================================
 
 These scripts were written while building and auditing the Transcription
@@ -101,7 +102,7 @@ test_table_long_list_rendering.py  10 checks. A real, user-reported bug in
                                 measuring the same input with the clamp
                                 withheld.
 
-test_organism_consistency.py    19 checks. Two pre-existing organism-state
+test_organism_consistency.py    24 checks. Two pre-existing organism-state
                                 bugs, older and more dangerous than anything
                                 MSigDB introduced, found by a post-
                                 implementation audit: taxon_name used to
@@ -120,11 +121,105 @@ test_organism_consistency.py    19 checks. Two pre-existing organism-state
                                 sensitivity check proving a failed resolve
                                 under the OLD ordering really did leave them
                                 disagreeing; and that the guard is actually
-                                WIRED into all three configure endpoints
-                                (ORA/GSEA/regulon), not just implemented in
-                                isolation - each checked by temporarily
-                                removing it from one endpoint and confirming
-                                that endpoint's own test goes red.
+                                WIRED into every transcriptomics configure
+                                endpoint - ORA/GSEA/regulon/network, DISCOVERED
+                                from API.py's own "@app.post(.../configure)"
+                                decorators rather than hand-listed, so a future
+                                5th module's route is covered automatically
+                                the day it exists. The network route's
+                                consistent-session check stubs
+                                genomics_net.is_taxon_in_string so this file
+                                keeps its "no live server, no network" promise
+                                - the drifted-session branch never reaches
+                                that call for any route, since the guard fires
+                                first.
+
+test_network_engine_core.py     45 checks. Characterization tests for the
+                                SHARED numerical engine in Genomics_network.py
+                                (STRING parsing, random-walk-with-restart, the
+                                degree-preserving permutation null, MCL) -
+                                until this file, ZERO unit coverage existed
+                                for any of it, discovered while building the
+                                Transcriptomics Network / Module Detection
+                                module directly on top of it. Hand-built
+                                gzipped STRING fixture files (no real
+                                downloads): the confidence-cutoff boundary
+                                (>=, not >, proven with two real calls at 700
+                                vs 701), propagate_rwr against a closed-form
+                                sparse solve, the permutation null's
+                                determinism AND degree preservation (a spy
+                                intercepts every permuted seed vector and
+                                compares its degree-bin composition against
+                                the real seeds'), a CHARACTERIZED limitation
+                                (a graph under ~20 proteins makes every degree
+                                bin hold exactly one candidate, so the null
+                                can never move and nothing can ever be
+                                significant - asserted so this can't silently
+                                change), FDR calibration under a TRUE null (5
+                                repeats, random graphs, no planted signal,
+                                worst call rate 1.7%), POWER and SPECIFICITY
+                                together on a planted two-cluster fixture
+                                (seeded cluster's satellites significantly
+                                out-score an unseeded, degree-MATCHED control
+                                cluster's satellites), mcl_cluster/
+                                detect_modules, and a GOLDEN hit table the
+                                Transcriptomics engine's extraction had to
+                                reproduce byte-identically.
+
+test_transcriptomics_network.py 37 checks. Unit tests for
+                                Transcriptomics_network.py, which had ZERO
+                                unit coverage of its own (the shared engine
+                                above is not retested here). The single
+                                highest-value check: enrich_modules_by_symbol
+                                uses the NETWORK's own gene symbols as its
+                                enrichment universe, not the DE table's tested
+                                genes - asserts a RECRUITED gene (absent from
+                                the DE table by definition) is counted in k
+                                and listed in "Overlapping Genes", with a
+                                sensitivity check re-running the identical
+                                real engine call against the DE-table-only
+                                universe and watching the recruited gene
+                                silently vanish (k drops 3 -> 2) - then
+                                confirming the production code itself goes
+                                red the same way when temporarily swapped to
+                                match, and restored. Also: build_string_id_
+                                index's collision resolution (best-connected
+                                protein wins) against a naive dict(zip(...))
+                                last-wins run on the SAME graph;
+                                map_de_table_to_string's tiering (a true
+                                partition, symbol beats a coincidentally-
+                                matching Ensembl id) and its <10%
+                                refusal / 10-50% warning gates;
+                                build_seed_weights' equal weighting (two DEG
+                                rows on one protein SUM rather than
+                                deduplicating - a real, documented behaviour),
+                                abs_metric's sign-symmetry with a sensitivity
+                                check using the real shift-positive branch to
+                                show what breaks without it, and its
+                                winsorization ratio (exactly 20, by
+                                construction); the giant-module warning; and
+                                the small-graph guard.
+
+test_transcriptomics_client_state.py  49 checks. Generic, source-level
+                                invariants over static/app.js's Transcriptomics
+                                wiring - same text-parsing technique as
+                                test_organism_consistency.py, client-side. The
+                                module list (ora/gsea/regulon/network) is
+                                DISCOVERED from freshTranscriptomicsState()
+                                itself, so a future 5th tile is covered here
+                                automatically: every module's Config/Results/
+                                RunLocked is genuinely cleared (plus its
+                                _<mod>Draft deleted) on an organism change or
+                                new upload, with a sensitivity check on an
+                                in-memory copy missing one real line; every
+                                module's router page routes to a function that
+                                is actually DEFINED elsewhere in the file, not
+                                just referenced; and every tile in the grid
+                                array has either a not-yet-implemented flag or
+                                a Continue-chain branch, with a sensitivity
+                                check confirming a hypothetical unlisted tile
+                                genuinely fails the same coverage check the 4
+                                real tiles pass.
 
 test_msigdb_fetcher.py          52 checks. The MSigDB fetcher added to
                                 Transcriptomics_module.py: the availability
@@ -215,6 +310,59 @@ regression_ora_gsea.py          22 checks. The pre-existing GO-only ORA/GSEA
                                 test_msigdb_fetcher.py (direct function
                                 calls) or playwright_regulon.py (browser).
 
+live_e2e_transcriptomics_network.py  23 checks. Full real HTTP round trip
+                                for Transcriptomics Network / Module
+                                Detection - upload -> resolve -> configure ->
+                                run -> download x3 -> guards - against the
+                                bundled human example. Real mygene.info/
+                                STRING/QuickGO calls. Confirms mapping 97.2%,
+                                552 seeds, 571 significant proteins (534
+                                seed, 37 recruited), transcriptomics-shaped
+                                hit columns (no "UniProt ID"), a real
+                                subnetwork edge list, 27 modules, direction-
+                                composition columns, both the post-selection
+                                and seed-circularity caveats present, full
+                                reproducibility parameters, and each of the 3
+                                CSV downloads working; guards an unknown table
+                                name, a missing resolved table, and MSigDB
+                                labelling with no collection selected.
+
+live_exercise_transcriptomics_network_branches.py  18 checks. Exercises
+                                branches of the Network module that existed
+                                but had never actually RUN even once: a real
+                                abs_metric-weighted run (a real winsorization
+                                quantile, weight_ratio<=20), real
+                                direction=up/down runs (each a genuine SUBSET
+                                of the direction=all seed count, proving
+                                direction restricts selection rather than
+                                relabelling it), a real MSigDB-labelled
+                                module run, the enrichment CSV download
+                                (called here for the first time) plus its
+                                unknown-module-id guard, and the Ensembl/
+                                Entrez identifier fallback tiers - TP53 and
+                                MYC's REAL STRING protein ids/aliases, read
+                                directly from the already-cached human
+                                aliases file, paired with gene_symbol values
+                                STRING can never recognise, confirming
+                                map_de_table_to_string resolves them ONLY
+                                through the alias tiers and lands on the
+                                correct protein.
+
+live_e2e_transcriptomics_network_mouse.py  12 checks. A full real run on a
+                                SECOND organism (mouse, taxon 10090), kept in
+                                its own file so a mouse STRING download
+                                failure is diagnosable on its own rather than
+                                aborting the human-only suite - the first
+                                real, non-human exercise of this module end
+                                to end. Data3/example_transcriptomics_
+                                mouse_test.csv (30 well-known mouse genes,
+                                real symbols, synthetic log2FC/p-values).
+                                Confirms taxon 10090 actually drives the run
+                                (not a leftover human session), a real
+                                ~16,000-protein mouse network gets built,
+                                29/30 genes map, and hits/modules are
+                                produced.
+
 live_msigdb_urls.py             49 checks. LIVE network test: every pinned
                                 MSigDB URL (14 available collection/organism
                                 pairs) actually resolves, and its gene-set
@@ -293,6 +441,35 @@ playwright_genomics_results_cards.py  13 checks. The FIRST browser coverage
                                 synthetic STATE injection, which would risk
                                 silently drifting from the real payload shape
                                 and giving false confidence).
+playwright_transcriptomics_network.py  42 checks. The FIRST real-browser
+                                coverage of the Transcriptomics Network /
+                                Module Detection tile - the fourth
+                                Transcriptomics analysis, replacing the
+                                disabled "Enrichment (coming soon)"
+                                placeholder. Drives the real flow (tile ->
+                                organism selector scoped to STRING, not the
+                                whole UniProt taxonomy -> resolve -> config ->
+                                run -> results) and asserts actual CONTENT,
+                                not just that panes exist: transcriptomics-
+                                shaped hit columns, recruited genes present,
+                                every module row internally consistent
+                                (Seeds + Recruited == Size), both figures
+                                rendering, and the seed-circularity caveat
+                                reaching the screen. Also covers three
+                                evaluation fixes verified on this SAME real
+                                run: (3a) a genuinely underflowed FDR (the run
+                                really does produce one) renders "< 1e-300" on
+                                screen, never the pre-fix "0.000e+0", while
+                                the CSV download keeps full precision; (3b)
+                                the "recruited only" Hit table toggle defaults
+                                ON with recruited genes present, shows EXACTLY
+                                the recruited rows with zero seed leakage when
+                                checked, the full network when unchecked, and
+                                never affects the CSV; (3c) the on-screen
+                                caveat's own parsed numbers (534/571/37) match
+                                the payload's n_hits_seed/n_hits/n_recruited
+                                exactly, confirming the 3b toggle never
+                                touches the underlying counts.
 test_organism_allowlist_mirror.py  7 checks. Guards a drift risk found while
                                 auditing organism generality: several
                                 per-database organism allowlists are
@@ -401,9 +578,11 @@ playwright_msigdb.py            68 checks. Same real-browser approach for
                                 multi-collection run produced a pile of
                                 indistinguishable "... (1).csv" files).
 
-These three make real network calls (mygene.info, TRRUST, ChEA3, MSigDB,
-UniProt, STRING, GO/QuickGO) and are not mocked, so they need internet and
-take a few minutes. test_msigdb_summary_figure.py, test_gsea_null_histogram_range.py,
+These four (playwright_regulon.py, playwright_genomics_results_cards.py,
+playwright_msigdb.py, playwright_transcriptomics_network.py) make real
+network calls (mygene.info, TRRUST, ChEA3, MSigDB, UniProt, STRING,
+GO/QuickGO) and are not mocked, so they need internet and take a few
+minutes. test_msigdb_summary_figure.py, test_gsea_null_histogram_range.py,
 and test_organism_allowlist_mirror.py are the exceptions - all three need
 the server only to load app.js, and make no external calls.
 
@@ -417,8 +596,8 @@ in one never hides another. From the repo root, with the server up:
     Get-ChildItem tests\*.py | ForEach-Object { python $_.FullName }
 
 Expected totals as of the last full run, in file-listing order: 117, 22, 16,
-4, 15, 5, 16, 10, 19, 52, 8, 21, 15, 12, 12, 22, 49, 90, 13, 7, 4, 15, 68 -
-all passing (612 checks across 23 files).
+4, 15, 5, 16, 10, 24, 45, 37, 49, 52, 8, 21, 15, 12, 12, 22, 23, 18, 12, 49,
+90, 13, 42, 7, 4, 15, 68 - all passing (843 checks across 30 files).
 
 A NOTE ON WRITING NEW CHECKS HERE. Prefer assertions that can actually fail
 for the reason you care about. A concrete example lives in
