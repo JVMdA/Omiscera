@@ -4931,27 +4931,64 @@ function renderTranscriptomicsNetworkResultsScreen() {
     hitPane.appendChild(el("div", { class: "caption" },
         "Every protein in the network, ranked by FDR. \"Seed\" marks genes you uploaded that passed the " +
         "cutoffs; rows with no log2FC/padj were never in your table at all - those are the recruited ones."));
-    if (prop.table) {
-        hitPane.appendChild(buildTable(prop.table, {
+    const hitAlpha = params.fdr_alpha || 0.05;
+    const hitCellFormatFn = (col, val) => {
+        if (col === "p-value" || col === "FDR" || col === "padj") return _fmtSci(val, 3);
+        if (col === "Propagated score") {
+            if (val === "") return "";
+            const num = Number(val);
+            return isFinite(num) ? num.toExponential(2) : val;
+        }
+        if (col === "Z-score") return _fmtFixed(val, 2);
+        if (col === "log2FC" || col === "Seed score") return _fmtFixed(val, 3);
+        return val;
+    };
+    // A seed clearing FDR is largely CIRCULAR (see the caveat above): it
+    // receives restart mass directly and is compared against permutations in
+    // which it is usually not a seed. Defaulting this ON when there IS a
+    // recruited set puts the 37-ish genes that are the actual discovery in
+    // front of the reader, instead of buried under hundreds of expected seed
+    // rows - the full table (seeds included) is always one click away, and
+    // the CSV download always carries everything regardless of this toggle.
+    let hitShowRecruitedOnly = (prop.n_recruited || 0) > 0;
+    const hitFilterRow = el("div", { class: "row", style: { alignItems: "center", margin: "0.5rem 0" } });
+    const hitFilterLabel = el("label", { style: { display: "flex", alignItems: "center", gap: "0.4rem" } });
+    const hitFilterCheckbox = el("input", { type: "checkbox" });
+    hitFilterCheckbox.checked = hitShowRecruitedOnly;
+    hitFilterLabel.appendChild(hitFilterCheckbox);
+    hitFilterLabel.appendChild(document.createTextNode(
+        " Show RECRUITED genes only (" + (prop.n_recruited || 0) + " of " + (prop.n_hits || 0) +
+        " significant proteins - genes you never uploaded)"));
+    hitFilterRow.appendChild(hitFilterLabel);
+    hitPane.appendChild(hitFilterRow);
+    const hitTableHost = el("div", {});
+    hitPane.appendChild(hitTableHost);
+    function renderHitTable() {
+        hitTableHost.innerHTML = "";
+        if (!prop.table) return;
+        let tablePayload = prop.table;
+        if (hitShowRecruitedOnly) {
+            const rows = (prop.table.rows || []).filter(
+                (row) => row["Seed"] === false && row["FDR"] !== null && Number(row["FDR"]) < hitAlpha);
+            tablePayload = { columns: prop.table.columns, rows };
+        }
+        hitTableHost.appendChild(buildTable(tablePayload, {
             maxHeight: 520,
-            rowClassFn: (row) => (row["FDR"] !== null && Number(row["FDR"]) < (params.fdr_alpha || 0.05)) ? "row-significant" : "",
-            cellFormatFn: (col, val) => {
-                if (col === "p-value" || col === "FDR" || col === "padj") return _fmtSci(val, 3);
-                if (col === "Propagated score") {
-                    if (val === "") return "";
-                    const num = Number(val);
-                    return isFinite(num) ? num.toExponential(2) : val;
-                }
-                if (col === "Z-score") return _fmtFixed(val, 2);
-                if (col === "log2FC" || col === "Seed score") return _fmtFixed(val, 3);
-                return val;
-            },
+            rowClassFn: (row) => (row["FDR"] !== null && Number(row["FDR"]) < hitAlpha) ? "row-significant" : "",
+            cellFormatFn: hitCellFormatFn,
         }));
     }
+    hitFilterCheckbox.addEventListener("change", () => {
+        hitShowRecruitedOnly = hitFilterCheckbox.checked;
+        renderHitTable();
+    });
+    renderHitTable();
     const hitDl = el("button", { class: "btn" }, "Download hit table (CSV)");
     hitDl.addEventListener("click", () => downloadFile(
         "/api/transcriptomics/network/download?which=hits", "transcriptomics_network_hits.csv"));
     hitPane.appendChild(hitDl);
+    hitPane.appendChild(el("div", { class: "caption" },
+        "The download always includes every protein, seeds and recruited alike, regardless of this toggle."));
 
     // ----- Figures -----
     const figPane = nav.pane("Figures");

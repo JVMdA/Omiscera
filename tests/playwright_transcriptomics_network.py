@@ -8,6 +8,7 @@ table carries the transcriptomics columns, recruited genes are present, module
 rows are internally consistent, and the honesty caveats reach the screen.
 """
 import os
+import re
 import sys
 
 from playwright.sync_api import sync_playwright
@@ -116,6 +117,21 @@ with sync_playwright() as p:
     check(any("seeds" in c for c in caveats),
           "the seed-circularity caveat is shown on screen, not buried in the payload")
 
+    print("=== evaluation Part 3c: the on-screen caveat's counts stay honest ===")
+    seed_caveat = next((c for c in caveats if "supplied as seeds" in c), None)
+    check(seed_caveat is not None, "the seed-circularity caveat text is findable for parsing")
+    if seed_caveat:
+        m = re.search(r"(\d+) of the (\d+) significant proteins are genes you supplied as seeds", seed_caveat)
+        m2 = re.search(r"The (\d+) RECRUITED protein", seed_caveat)
+        check(bool(m and m2), f"the caveat text still matches the expected pattern (got: {seed_caveat!r})")
+        if m and m2:
+            check(int(m.group(1)) == stats["seedHits"] and int(m.group(2)) == stats["hits"]
+                  and int(m2.group(1)) == stats["recruited"],
+                  f"the caveat's own numbers (seed={m.group(1)}, total={m.group(2)}, recruited={m2.group(1)}) "
+                  f"match the payload's n_hits_seed/n_hits/n_recruited exactly (payload: "
+                  f"{stats['seedHits']}/{stats['hits']}/{stats['recruited']}) - the Part 3b toggle only "
+                  f"filters the Hit table's DISPLAY, it never touches these counts")
+
     print("=== evaluation Part 3a: the shared FDR-underflow formatter is wired in, on real data ===")
     fmt = page.evaluate("""() => ({
         zero: _fmtSci(0, 3), empty: _fmtSci("", 3), nullVal: _fmtSci(null, 3),
@@ -148,6 +164,58 @@ with sync_playwright() as p:
     }""")
     check("< 1e-300" not in csv,
           "the CSV download keeps full numeric precision - it never contains the display-only '< 1e-300' text")
+
+    print("=== evaluation Part 3b: the 'recruited only' Hit table toggle ===")
+    toggle_state = page.evaluate("""() => {
+        const cb = [...document.querySelectorAll('input[type=checkbox]')]
+            .find(c => c.parentElement.textContent.includes('RECRUITED genes only'));
+        return cb ? cb.checked : null;
+    }""")
+    check(toggle_state is True,
+          "with real recruited genes present, the toggle defaults to ON - the discovery is shown, not buried")
+    def _hit_pane_row_count():
+        return page.evaluate("""() => {
+            const sections = [...document.querySelectorAll('.result-pane')];
+            const hitSection = sections.find(
+                s => s.querySelector('.result-pane-title') && s.querySelector('.result-pane-title').textContent === 'Hit table');
+            return hitSection ? hitSection.querySelectorAll('.data-table tbody tr').length : -1;
+        }""")
+
+    n_recruited = page.evaluate("STATE.transcriptomics.networkResults.propagation.n_recruited")
+    rows_checked = _hit_pane_row_count()
+    check(rows_checked == n_recruited,
+          f"checked, the table shows EXACTLY the {n_recruited} recruited rows, not the full {stats['hits']}-row "
+          f"significant set (got {rows_checked} rows)")
+    checked_seed_cells = page.evaluate("""() => {
+        const sections = [...document.querySelectorAll('.result-pane')];
+        const hitSection = sections.find(
+            s => s.querySelector('.result-pane-title') && s.querySelector('.result-pane-title').textContent === 'Hit table');
+        const rows = [...hitSection.querySelectorAll('.data-table tbody tr')];
+        return rows.some(tr => tr.textContent.includes('true'));
+    }""")
+    check(not checked_seed_cells, "no seed row leaks into the recruited-only view")
+
+    page.evaluate("""() => {
+        const cb = [...document.querySelectorAll('input[type=checkbox]')]
+            .find(c => c.parentElement.textContent.includes('RECRUITED genes only'));
+        cb.checked = false;
+        cb.dispatchEvent(new Event('change'));
+    }""")
+    page.wait_for_timeout(200)
+    rows_unchecked = _hit_pane_row_count()
+    check(rows_unchecked > rows_checked,
+          f"unchecked, the SAME table now shows the full network ({rows_unchecked} rows, up from {rows_checked}) - "
+          f"the toggle only filters the view, it does not refetch or discard data")
+
+    dl_csv_after_toggle = page.evaluate("""async () => {
+        const r = await fetch('/api/transcriptomics/network/download?which=hits',
+                              { headers: { 'X-Session-Id': getSessionId() } });
+        const t = await r.text();
+        return t.split('\\n').length - 1;
+    }""")
+    check(dl_csv_after_toggle > rows_unchecked,
+          f"the CSV download still carries EVERY protein in the network ({dl_csv_after_toggle} rows), regardless "
+          f"of the on-screen toggle's state")
 
     print("=== figures render ===")
     page.locator(".result-nav-btn", has_text="Figures").first.click()
