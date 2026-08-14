@@ -116,6 +116,39 @@ with sync_playwright() as p:
     check(any("seeds" in c for c in caveats),
           "the seed-circularity caveat is shown on screen, not buried in the payload")
 
+    print("=== evaluation Part 3a: the shared FDR-underflow formatter is wired in, on real data ===")
+    fmt = page.evaluate("""() => ({
+        zero: _fmtSci(0, 3), empty: _fmtSci("", 3), nullVal: _fmtSci(null, 3),
+        normal: _fmtSci(0.001234, 3), fixedEmpty: _fmtFixed("", 3), fixedNormal: _fmtFixed(2.71828, 3),
+    })""")
+    check(fmt["zero"] == "< 1e-300", f"_fmtSci(0) renders '< 1e-300', not the pre-fix '0.000e+0' (got {fmt['zero']!r})")
+    check(fmt["empty"] == "" and fmt["nullVal"] == "",
+          f"a MISSING value (a recruited gene's blank padj) stays blank, not '< 1e-300' (got {fmt['empty']!r}, {fmt['nullVal']!r})")
+    check(fmt["normal"] == "1.234e-3", f"a normal p-value still formats in scientific notation (got {fmt['normal']!r})")
+    check(fmt["fixedEmpty"] == "" and fmt["fixedNormal"] == "2.718",
+          f"_fmtFixed also blanks missing values and rounds normal ones (got {fmt['fixedEmpty']!r}, {fmt['fixedNormal']!r})")
+
+    real_underflow = page.evaluate("""() => {
+        const rows = STATE.transcriptomics.networkResults.propagation.table.rows || [];
+        return rows.some(r => r["FDR"] === 0);
+    }""")
+    check(real_underflow, "this real run genuinely produced an FDR of exactly 0.0 (not simulated) - "
+                          "the case the fix above exists for")
+    page.locator(".result-nav-btn", has_text="Hit table").first.click()
+    page.wait_for_timeout(300)
+    cell_texts = page.evaluate("[...document.querySelectorAll('.data-table td')].map(td => td.textContent)")
+    check("< 1e-300" in cell_texts, "and the on-screen Hit table actually renders it as '< 1e-300'")
+    check(not any(t.startswith("0.000e") for t in cell_texts),
+          "and no cell anywhere in the Hit table shows the broken '0.000e+0'")
+
+    csv = page.evaluate("""async () => {
+        const r = await fetch('/api/transcriptomics/network/download?which=hits',
+                              { headers: { 'X-Session-Id': getSessionId() } });
+        return await r.text();
+    }""")
+    check("< 1e-300" not in csv,
+          "the CSV download keeps full numeric precision - it never contains the display-only '< 1e-300' text")
+
     print("=== figures render ===")
     page.locator(".result-nav-btn", has_text="Figures").first.click()
     page.wait_for_timeout(300)

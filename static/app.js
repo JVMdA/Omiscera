@@ -403,6 +403,30 @@ function fileInputWidget(opts) {
 // hold unexpectedly long content.
 const TABLE_LONG_LIST_COLUMNS = new Set(["Overlapping Genes", "Leading Edge Genes", "Genes"]);
 
+// scipy p-values/FDRs (hypergeom.sf, a normal-tail p, BH correction on either)
+// can genuinely underflow to a literal 0.0 for an astronomically significant
+// result - too small for float64 to represent (below ~1e-308). Naively
+// formatting that as toExponential(N) renders "0.000e+0", which reads exactly
+// like a computation bug rather than what it is. Shared by every p-value/FDR
+// column in the app (ORA, GSEA, Regulon enrichment + activity, Network hits +
+// modules) so the fix can't drift out of sync between tables. buildTable
+// already turns a null/undefined cell into "" before calling cellFormatFn, so
+// that (not null) is the guard needed here - without it Number("") is 0,
+// which is finite, and every blank cell (e.g. a recruited gene's padj) would
+// wrongly render as "< 1e-300" instead of staying blank.
+function _fmtSci(val, digits) {
+    if (val === "" || val === null || val === undefined) return "";
+    const num = Number(val);
+    if (!isFinite(num)) return val;
+    if (num === 0) return "< 1e-300";
+    return num.toExponential(digits === undefined ? 3 : digits);
+}
+function _fmtFixed(val, digits) {
+    if (val === "" || val === null || val === undefined) return "";
+    const num = Number(val);
+    return isFinite(num) ? num.toFixed(digits) : val;
+}
+
 function buildTable(payload, opts) {
     opts = opts || {};
     const wrap = el("div", { class: "table-wrap" });
@@ -1736,16 +1760,10 @@ function _buildMsigdbCollectionSummaryCore(div, families, alpha, slug, opts) {
     });
     const _fin = (v) => v !== null && typeof v === "number" && isFinite(v);
     const fmt = (v, digits) => _fin(v) ? v.toFixed(digits) : "n/a";
-    // scipy's hypergeom.sf() (Transcriptomics_module.hypergeometric_pvalue)
-    // can genuinely underflow to a literal 0.0 for an astronomically
-    // significant term - too small for float64 to represent (below
-    // ~1e-308) - and BH correction then carries that exact 0.0 through as
-    // the family's FDR. "0.00e+0" reads exactly like a computation bug
-    // rather than what it is: real, just off the scale double precision can
-    // show. "< 1e-300" matches this app's own underflow-floor convention
-    // (Transcriptomics_module.GSEA_MIN_P) used for the same reason on the
-    // GSEA side.
-    const fmtExp = (v) => _fin(v) ? (v === 0 ? "< 1e-300" : v.toExponential(2)) : "n/a";
+    // See _fmtSci's own comment for why "0" is shown as "< 1e-300" rather
+    // than "0.00e+0". _fin() already excludes null/non-finite, so the only
+    // difference from _fmtSci here is the "n/a" fallback text.
+    const fmtExp = (v) => _fin(v) ? _fmtSci(v, 2) : "n/a";
     const trace = {
         x: counts, y: labels, type: "bar", orientation: "h",
         marker: { color: colors },
@@ -2463,14 +2481,8 @@ function renderTranscriptomicsOraResultsScreen() {
                 return (fdr !== "" && fdr !== null && isFinite(Number(fdr)) && Number(fdr) < alpha) ? "row-significant" : null;
             },
             cellFormatFn: (col, val) => {
-                if (col === "p-value" || col === "FDR" || col === "Bonferroni") {
-                    const num = Number(val);
-                    return isFinite(num) ? num.toExponential(3) : val;
-                }
-                if (col === "Fold Enrichment") {
-                    const num = Number(val);
-                    return isFinite(num) ? num.toFixed(2) : val;
-                }
+                if (col === "p-value" || col === "FDR" || col === "Bonferroni") return _fmtSci(val, 3);
+                if (col === "Fold Enrichment") return _fmtFixed(val, 2);
                 return val;
             },
         }));
@@ -3065,14 +3077,8 @@ function renderTranscriptomicsGseaResultsScreen() {
                 return (fdr !== "" && fdr !== null && isFinite(Number(fdr)) && Number(fdr) < alpha) ? "row-significant" : null;
             },
             cellFormatFn: (col, val) => {
-                if (col === "p-value" || col === "FDR q-value" || col === "FDR (BH)") {
-                    const num = Number(val);
-                    return isFinite(num) ? num.toExponential(3) : val;
-                }
-                if (col === "ES" || col === "NES" || col === "Leading Edge Fraction") {
-                    const num = Number(val);
-                    return isFinite(num) ? num.toFixed(3) : val;
-                }
+                if (col === "p-value" || col === "FDR q-value" || col === "FDR (BH)") return _fmtSci(val, 3);
+                if (col === "ES" || col === "NES" || col === "Leading Edge Fraction") return _fmtFixed(val, 3);
                 return val;
             },
         }));
@@ -3814,14 +3820,8 @@ function renderTranscriptomicsRegulonResultsScreen() {
                     cellFormatFn: (col, val) => {
                         if (col === "p-value (parametric)" || col === "FDR (parametric)" ||
                             col === "p-value (permutation)" || col === "FDR (permutation)" ||
-                            col === "p-value (calibrated)" || col === "FDR (calibrated)") {
-                            const num = Number(val);
-                            return isFinite(num) ? num.toExponential(3) : val;
-                        }
-                        if (col === "Activity Score" || col === "Calibrated Score (z)") {
-                            const num = Number(val);
-                            return isFinite(num) ? num.toFixed(3) : val;
-                        }
+                            col === "p-value (calibrated)" || col === "FDR (calibrated)") return _fmtSci(val, 3);
+                        if (col === "Activity Score" || col === "Calibrated Score (z)") return _fmtFixed(val, 3);
                         return val;
                     },
                 });
@@ -4056,14 +4056,8 @@ function renderTranscriptomicsRegulonResultsScreen() {
                         return (fdr !== "" && fdr !== null && isFinite(Number(fdr)) && Number(fdr) < alpha) ? "row-significant" : null;
                     },
                     cellFormatFn: (col, val) => {
-                        if (col === "p-value" || col === "FDR" || col === "Bonferroni") {
-                            const num = Number(val);
-                            return isFinite(num) ? num.toExponential(3) : val;
-                        }
-                        if (col === "Fold Enrichment") {
-                            const num = Number(val);
-                            return isFinite(num) ? num.toFixed(2) : val;
-                        }
+                        if (col === "p-value" || col === "FDR" || col === "Bonferroni") return _fmtSci(val, 3);
+                        if (col === "Fold Enrichment") return _fmtFixed(val, 2);
                         return val;
                     },
                 });
@@ -4941,6 +4935,17 @@ function renderTranscriptomicsNetworkResultsScreen() {
         hitPane.appendChild(buildTable(prop.table, {
             maxHeight: 520,
             rowClassFn: (row) => (row["FDR"] !== null && Number(row["FDR"]) < (params.fdr_alpha || 0.05)) ? "row-significant" : "",
+            cellFormatFn: (col, val) => {
+                if (col === "p-value" || col === "FDR" || col === "padj") return _fmtSci(val, 3);
+                if (col === "Propagated score") {
+                    if (val === "") return "";
+                    const num = Number(val);
+                    return isFinite(num) ? num.toExponential(2) : val;
+                }
+                if (col === "Z-score") return _fmtFixed(val, 2);
+                if (col === "log2FC" || col === "Seed score") return _fmtFixed(val, 3);
+                return val;
+            },
         }));
     }
     const hitDl = el("button", { class: "btn" }, "Download hit table (CSV)");
@@ -4996,7 +5001,14 @@ function renderTranscriptomicsNetworkResultsScreen() {
                 "Clustering used the " + mods.cap_info.n_used_for_modules + " strongest of " +
                 mods.cap_info.n_hits + " significant genes."));
         }
-        modPane.appendChild(buildTable(mods.table, { maxHeight: 460 }));
+        modPane.appendChild(buildTable(mods.table, {
+            maxHeight: 460,
+            cellFormatFn: (col, val) => {
+                if (col === "Top enriched FDR") return _fmtSci(val, 3);
+                if (col === "Mean log2FC") return _fmtFixed(val, 3);
+                return val;
+            },
+        }));
         const modDl = el("button", { class: "btn" }, "Download modules (CSV)");
         modDl.addEventListener("click", () => downloadFile(
             "/api/transcriptomics/network/download?which=modules", "transcriptomics_network_modules.csv"));
@@ -5025,7 +5037,14 @@ function renderTranscriptomicsNetworkResultsScreen() {
                 const e = mods.enrichment[mid];
                 if (!e) return;
                 host.appendChild(el("div", { class: "caption" }, "Annotation source: " + e.namespace));
-                host.appendChild(buildTable(e.table, { maxHeight: 380 }));
+                host.appendChild(buildTable(e.table, {
+                    maxHeight: 380,
+                    cellFormatFn: (col, val) => {
+                        if (col === "p-value" || col === "FDR" || col === "Bonferroni") return _fmtSci(val, 3);
+                        if (col === "Fold Enrichment") return _fmtFixed(val, 2);
+                        return val;
+                    },
+                }));
                 const dl = el("button", { class: "btn" }, "Download this module's enrichment (CSV)");
                 dl.addEventListener("click", () => downloadFile(
                     "/api/transcriptomics/network/download?which=enrichment&key=" + encodeURIComponent(mid),
