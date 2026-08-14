@@ -59,6 +59,14 @@ noisier) connections. Genes with no counterpart in the network for your
 organism are reported separately ("seeds not found in network") — they
 simply can't participate.
 
+STRING'S DATA SOURCE AND LICENCE
+-------------------------------------
+STRING (v12.0, as used by this app) is freely available under a Creative
+Commons Attribution 4.0 (CC BY 4.0) licence, which requires giving STRING
+appropriate credit and disclosing any changes made to the data. If you use
+results from this module, cite STRING itself alongside Omiscera — see
+string-db.org for the current recommended citation.
+
 HOW PROPAGATION WORKS
 --------------------------
 Each of your genes starts as a "seed" holding some signal (1.0 by default,
