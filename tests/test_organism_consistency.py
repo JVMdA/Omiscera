@@ -37,6 +37,7 @@ The fix has three layers, each tested separately below:
      can drive the real UI; not duplicated here.
 """
 import os
+import re
 import sys
 
 import pandas as pd
@@ -218,7 +219,20 @@ check(broken_drifted,
 # 3. Every configure endpoint refuses a drifted session (wiring, not just
 #    the guard function in isolation)
 # =============================================================================
-print("=== _require_consistent_taxon is actually wired into all three configure endpoints ===")
+print("=== _require_consistent_taxon is actually wired into EVERY transcriptomics configure endpoint ===")
+
+# Discovered from API.py's own source, not hand-maintained: a future 5th
+# Transcriptomics module (its own tile, its own /configure route) is covered
+# here automatically, with no risk of someone adding the route but forgetting
+# to add it to this test. This is the SAME "read the real routes, don't hand-
+# list them" idiom the plan asked for here.
+with open(API.__file__, "r", encoding="utf-8") as fh:
+    _api_src = fh.read()
+CONFIGURE_ROUTES = re.findall(
+    r'@app\.post\("(/api/transcriptomics/[a-z_]+/configure)"\)\s*\ndef (\w+)\(', _api_src)
+check(len(CONFIGURE_ROUTES) >= 4,
+      f"discovered at least the 4 known transcriptomics configure routes (got {len(CONFIGURE_ROUTES)}: "
+      f"{[r for r, _ in CONFIGURE_ROUTES]})")
 
 
 def _drifted_session(session_id):
@@ -239,44 +253,38 @@ def _consistent_session(session_id):
     return session_id
 
 
-ora_sid = _drifted_session("test-organism-consistency-ora")
-try:
-    API.transcriptomics_ora_configure({"databases": ["GO"]}, ora_sid)
-    check(False, "ORA configure should have refused a drifted session")
-except API.HTTPException as exc:
-    check(exc.status_code == 400 and "Organism mismatch" in exc.detail,
-          f"ORA /configure refuses a drifted session (got {exc.status_code}: {exc.detail!r})")
-
-gsea_sid = _drifted_session("test-organism-consistency-gsea")
-try:
-    API.transcriptomics_gsea_configure({"databases": ["GO"]}, gsea_sid)
-    check(False, "GSEA configure should have refused a drifted session")
-except API.HTTPException as exc:
-    check(exc.status_code == 400 and "Organism mismatch" in exc.detail,
-          f"GSEA /configure refuses a drifted session (got {exc.status_code}: {exc.detail!r})")
-
-regulon_sid = _drifted_session("test-organism-consistency-regulon")
-try:
-    # "analyses" omitted deliberately - the endpoint defaults it to
-    # TRANSCRIPTOMICS_REGULON_ANALYSES, and the organism guard fires before
-    # any of that validation runs, so a minimal payload is enough here.
-    API.transcriptomics_regulon_configure({"databases": ["TRRUST"]}, regulon_sid)
-    check(False, "Regulon configure should have refused a drifted session")
-except API.HTTPException as exc:
-    check(exc.status_code == 400 and "Organism mismatch" in exc.detail,
-          f"Regulon /configure refuses a drifted session (got {exc.status_code}: {exc.detail!r})")
+for route, funcname in CONFIGURE_ROUTES:
+    fn = getattr(API, funcname)
+    sid = _drifted_session(f"test-organism-consistency-{funcname}")
+    try:
+        fn({}, sid)
+        check(False, f"{route} should have refused a drifted session")
+    except API.HTTPException as exc:
+        check(exc.status_code == 400 and "Organism mismatch" in exc.detail,
+              f"{route} refuses a drifted session (got {exc.status_code}: {exc.detail!r})")
 
 # And a CONSISTENT session must NOT be refused by the guard - confirms the
-# three checks above are catching the drift specifically, not e.g. missing
-# required payload fields that would 400 either way.
-ok_ora_sid = _consistent_session("test-organism-consistency-ora-ok")
+# checks above are catching the drift specifically, not e.g. missing required
+# payload fields that would 400 either way. The network route's consistent
+# path also does a REAL STRING coverage check AFTER the guard
+# (genomics_net.is_taxon_in_string) - stubbed here so this file keeps its own
+# "no live server, no network" promise; the drifted-session loop above never
+# reaches that check for any route, since the guard fires first.
+_real_is_taxon_in_string = API.genomics_net.is_taxon_in_string
+API.genomics_net.is_taxon_in_string = lambda *a, **kw: True
 try:
-    API.transcriptomics_ora_configure({"databases": ["GO"]}, ok_ora_sid)
-    check(True, "ORA /configure accepts a CONSISTENT session (got past the guard)")
-except API.HTTPException as exc:
-    check("Organism mismatch" not in exc.detail,
-          f"a consistent session must not fail on the ORGANISM guard specifically "
-          f"(got a different, acceptable 400: {exc.detail!r})")
+    for route, funcname in CONFIGURE_ROUTES:
+        fn = getattr(API, funcname)
+        sid = _consistent_session(f"test-organism-consistency-{funcname}-ok")
+        try:
+            fn({}, sid)
+            check(True, f"{route} accepts a CONSISTENT session (got past the guard)")
+        except API.HTTPException as exc:
+            check("Organism mismatch" not in exc.detail,
+                  f"{route}: a consistent session must not fail on the ORGANISM guard specifically "
+                  f"(got a different, acceptable {exc.status_code}: {exc.detail!r})")
+finally:
+    API.genomics_net.is_taxon_in_string = _real_is_taxon_in_string
 
 print("\nTOTAL: %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
