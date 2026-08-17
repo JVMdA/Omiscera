@@ -41,6 +41,7 @@ development (not guessed from documentation alone).
 """
 
 import os
+import threading
 import time
 from collections import OrderedDict
 
@@ -116,15 +117,42 @@ NETPROP_MODULE_COLUMNS = [
 # settings - and eviction only costs a re-parse of already-downloaded files.
 _GRAPH_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
 _GRAPH_CACHE_MAX_ENTRIES = 2
+# API.py's EXECUTOR runs 4 worker threads, and build_string_network is called
+# from inside a job on one of them - so two requests for the same (or
+# different) organism can genuinely overlap. An OrderedDict is not
+# thread-safe: one thread's move_to_end on a key another thread just evicted
+# via popitem raises KeyError, and a read racing an eviction can return a
+# half-updated dict. Guarded by a single RLock (reentrant so a cache hit
+# inside a lock-held call - there are none today, but a future one wouldn't
+# deadlock silently).
+_GRAPH_CACHE_LOCK = threading.RLock()
+
+
+def _graph_cache_get(key: tuple):
+    """Thread-safe cache read that also marks the entry recently-used."""
+    with _GRAPH_CACHE_LOCK:
+        if key not in _GRAPH_CACHE:
+            return None
+        _GRAPH_CACHE.move_to_end(key)
+        return _GRAPH_CACHE[key]
 
 
 def _graph_cache_put(key: tuple, value: dict) -> None:
     """Insert with LRU eviction. Kept tiny and separate so the eviction policy
-    is visible and testable rather than buried in build_string_network."""
-    _GRAPH_CACHE[key] = value
-    _GRAPH_CACHE.move_to_end(key)
-    while len(_GRAPH_CACHE) > _GRAPH_CACHE_MAX_ENTRIES:
-        _GRAPH_CACHE.popitem(last=False)
+    is visible and testable rather than buried in build_string_network.
+
+    Deliberately does NOT hold the lock across the (multi-hundred-MB, seconds-
+    long) parse that produces `value` - only this dict mutation is locked. The
+    accepted cost: two threads racing a cold miss on the SAME key can both
+    parse and both insert (the second insert wins, the first parse's result is
+    simply discarded) - wasteful, never wrong. Serializing every graph build
+    behind one lock to avoid that would be a worse trade.
+    """
+    with _GRAPH_CACHE_LOCK:
+        _GRAPH_CACHE[key] = value
+        _GRAPH_CACHE.move_to_end(key)
+        while len(_GRAPH_CACHE) > _GRAPH_CACHE_MAX_ENTRIES:
+            _GRAPH_CACHE.popitem(last=False)
 
 
 # ---------------------------------------------------------------------------
@@ -239,9 +267,10 @@ def build_string_network(
       "n_proteins":         int.
     """
     cache_key = (str(taxon_id), int(confidence))
-    if not force_refresh and cache_key in _GRAPH_CACHE:
-        _GRAPH_CACHE.move_to_end(cache_key)
-        return _GRAPH_CACHE[cache_key]
+    if not force_refresh:
+        cached = _graph_cache_get(cache_key)
+        if cached is not None:
+            return cached
     if sp is None:
         raise RuntimeError("scipy is required for network propagation")
 

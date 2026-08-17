@@ -477,6 +477,90 @@ try:
 except ValueError:
     check(True, "a run where NOTHING maps raises ValueError rather than returning noise")
 
+# =============================================================================
+print("=== _GRAPH_CACHE is thread-safe (API.py's EXECUTOR has 4 worker threads) ===")
+# =============================================================================
+import threading
+import time as _time
+
+# 1. The SAME lock object actually serializes _graph_cache_put calls, not just
+# "a lock exists somewhere in the file". A background thread holds the real
+# lock for 300ms; a concurrent put() must block until it releases.
+hold_started = threading.Event()
+release_at = [None]
+
+
+def _hold_lock():
+    with gnet._GRAPH_CACHE_LOCK:
+        hold_started.set()
+        _time.sleep(0.3)
+        release_at[0] = _time.monotonic()
+
+
+holder = threading.Thread(target=_hold_lock)
+holder.start()
+hold_started.wait(timeout=2)
+t0 = _time.monotonic()
+gnet._graph_cache_put(("lock-race-test", 1), {"n_proteins": 0})
+put_finished_at = _time.monotonic()
+holder.join()
+check(release_at[0] is not None and put_finished_at >= release_at[0],
+      f"_graph_cache_put genuinely blocked until the holder released the SAME lock "
+      f"(put finished at {put_finished_at - t0:.3f}s, holder released at "
+      f"{release_at[0] - t0:.3f}s)")
+gnet._GRAPH_CACHE.pop(("lock-race-test", 1), None)
+
+# 2. Many threads hammering build_string_network across more distinct keys
+# than the cache holds, with the real STRING download/parse stubbed out so
+# this stays fast and network-free. A pre-fix OrderedDict here would
+# occasionally KeyError on move_to_end racing another thread's popitem.
+_orig_ensure_file = gnet._ensure_string_file
+_orig_parse = gnet._parse_string_network_files
+_call_errors = []
+_call_lock = threading.Lock()
+
+
+def _stub_ensure_file(url, local_path, refresh_days=None, verbose=False):
+    return local_path  # never touches disk or network
+
+
+def _stub_parse(links_path, info_path, aliases_path, confidence, taxon_id=""):
+    _time.sleep(0.005)  # widen the window for a real interleaving
+    return {"n_proteins": int(taxon_id) if taxon_id.isdigit() else -1, "tag": taxon_id}
+
+
+gnet._ensure_string_file = _stub_ensure_file
+gnet._parse_string_network_files = _stub_parse
+try:
+    gnet._GRAPH_CACHE.clear()
+    taxa = [str(100 + (i % 5)) for i in range(40)]  # 5 distinct keys, cache holds 2
+
+    def _worker(tax):
+        try:
+            g = gnet.build_string_network(tax, confidence=700, verbose=False)
+            if g.get("n_proteins") != int(tax):
+                with _call_lock:
+                    _call_errors.append(f"wrong graph returned for taxon {tax}: {g}")
+        except Exception as exc:
+            with _call_lock:
+                _call_errors.append(f"{tax}: {exc!r}")
+
+    threads = [threading.Thread(target=_worker, args=(t,)) for t in taxa]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=10)
+finally:
+    gnet._ensure_string_file = _orig_ensure_file
+    gnet._parse_string_network_files = _orig_parse
+
+check(_call_errors == [], f"40 concurrent build_string_network calls across 5 keys, 0 errors "
+                          f"(got {len(_call_errors)}: {_call_errors[:3]})")
+check(len(gnet._GRAPH_CACHE) <= gnet._GRAPH_CACHE_MAX_ENTRIES,
+      f"the cache never exceeded its {gnet._GRAPH_CACHE_MAX_ENTRIES}-entry bound under concurrent "
+      f"access (got {len(gnet._GRAPH_CACHE)})")
+gnet._GRAPH_CACHE.clear()
+
 TMP.cleanup()
 print("\nTOTAL: %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
