@@ -4938,7 +4938,8 @@ function renderTranscriptomicsNetworkResultsScreen() {
         "cutoffs; rows with no log2FC/padj were never in your table at all - those are the recruited ones."));
     const hitAlpha = params.fdr_alpha || 0.05;
     const hitCellFormatFn = (col, val) => {
-        if (col === "p-value" || col === "Empirical p-value" || col === "FDR" || col === "padj") return _fmtSci(val, 3);
+        if (col === "p-value" || col === "Empirical p-value" || col === "FDR"
+            || col === "FDR (recruited family)" || col === "padj") return _fmtSci(val, 3);
         if (col === "Propagated score") {
             if (val === "") return "";
             const num = Number(val);
@@ -4973,13 +4974,22 @@ function renderTranscriptomicsNetworkResultsScreen() {
         if (!prop.table) return;
         let tablePayload = prop.table;
         if (hitShowRecruitedOnly) {
+            // Filters on the RECRUITED-FAMILY FDR (a seed-free BH family),
+            // not the all-protein "FDR" column - a seed clearing the
+            // all-protein family threshold is not what this view means by
+            // "recruited"; see the caveat banner for why the two families
+            // can disagree.
             const rows = (prop.table.rows || []).filter(
-                (row) => row["Seed"] === false && row["FDR"] !== null && Number(row["FDR"]) < hitAlpha);
+                (row) => row["Seed"] === false && row["FDR (recruited family)"] !== null
+                    && Number(row["FDR (recruited family)"]) < hitAlpha);
             tablePayload = { columns: prop.table.columns, rows };
         }
         hitTableHost.appendChild(buildTable(tablePayload, {
             maxHeight: 520,
-            rowClassFn: (row) => (row["FDR"] !== null && Number(row["FDR"]) < hitAlpha) ? "row-significant" : "",
+            rowClassFn: (row) => {
+                const col = hitShowRecruitedOnly ? "FDR (recruited family)" : "FDR";
+                return (row[col] !== null && Number(row[col]) < hitAlpha) ? "row-significant" : "";
+            },
             cellFormatFn: hitCellFormatFn,
         }));
     }
@@ -9721,7 +9731,8 @@ function renderNetpropAnalysisResultsScreen() {
         rowClassFn: (row) => (Number(row["FDR"]) < ((payload.parameters && payload.parameters.fdr_alpha) || 0.05) ? "row-significant" : null),
         maxHeight: 480,
         cellFormatFn: (col, val) => {
-            if (col === "p-value" || col === "Empirical p-value" || col === "FDR") return _fmtSci(val, 3);
+            if (col === "p-value" || col === "Empirical p-value" || col === "FDR"
+                || col === "FDR (recruited family)") return _fmtSci(val, 3);
             if (col === "Propagated score") {
                 if (val === "") return "";
                 const num = Number(val);

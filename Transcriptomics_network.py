@@ -109,7 +109,8 @@ NETWORK_ENRICHMENT_DATABASE_DEFAULT = "GO"
 
 HIT_COLUMNS = [
     "STRING ID", "Gene Symbol", "Mapped via", "log2FC", "padj",
-    "Propagated score", "Z-score", "p-value", "Empirical p-value", "FDR", "Seed", "Seed score",
+    "Propagated score", "Z-score", "p-value", "Empirical p-value", "FDR",
+    "FDR (recruited family)", "Seed", "Seed score",
 ]
 MODULE_COLUMNS = [
     "Module ID", "Size", "Seeds", "Recruited", "Up", "Down", "Mean log2FC",
@@ -669,6 +670,7 @@ def run_network_analysis(
             "p-value": float(core["pvalues"][i]),
             "Empirical p-value": float(core["pvalues_empirical"][i]),
             "FDR": float(core["fdrs"][i]),
+            "FDR (recruited family)": None if is_seed else float(core["fdrs_recruited_family"][i]),
             "Seed": bool(is_seed),
             "Seed score": float(seed_idx_score[i]) if is_seed else None,
         })
@@ -678,24 +680,41 @@ def run_network_analysis(
     hits_mask = table["FDR"] < fdr_alpha
     hit_table = table[hits_mask]
     n_hits = int(hits_mask.sum())
-    n_recruited = int((hits_mask & ~table["Seed"]).sum())
-    n_hits_seed = n_hits - n_recruited
+    # n_recruited_all_family: non-seed rows passing the ALL-protein FDR family
+    # - what a naive count would report, and what n_hits_seed is defined
+    # against so n_hits_seed + n_recruited_all_family == n_hits always holds.
+    # n_recruited (the HEADLINE number): significant against a family
+    # containing ONLY non-seed proteins - honest, since hundreds of near-
+    # guaranteed seed p-values in the SAME family shift the rejection
+    # boundary for everyone (measured: on the bundled human example, several
+    # of the all-family "recruited" hits did not survive this stricter test).
+    n_recruited_all_family = int((hits_mask & ~table["Seed"]).sum())
+    n_hits_seed = n_hits - n_recruited_all_family
+    recruited_mask_strict = (table["FDR (recruited family)"] < fdr_alpha) & ~table["Seed"]
+    n_recruited = int(recruited_mask_strict.sum())
 
     # A seed clearing the FDR threshold is largely CIRCULAR and must not be
     # presented as a finding. A seed receives restart mass directly, while its
     # null is built from permutations in which it is usually NOT a seed (here:
     # ~3% of the time), so the comparison is structurally rigged in its favour.
-    # Measured on the bundled example: 536 of 563 "significant" proteins were
-    # the user's own input. The genuinely new information is the RECRUITED set.
     # The Genomics module shares this property and never said so.
     if n_hits_seed:
         caveats.append(
             f"{n_hits_seed} of the {n_hits} significant proteins are genes you supplied as seeds. Seeds "
             f"receive signal directly, and are compared against permutations in which they are usually "
-            f"not seeds, so their significance is largely expected rather than a discovery. The "
-            f"{n_recruited} RECRUITED protein(s) - significant but never seeded - are the new information "
-            f"this analysis adds."
+            f"not seeds, so their significance is largely expected rather than a discovery."
         )
+    if n_recruited_all_family:
+        recruited_note = (
+            f"{n_recruited} protein(s) that were never seeds are significant against a family containing "
+            f"ONLY non-seed proteins - a stricter, more honest test than sharing a family with hundreds of "
+            f"near-guaranteed seed p-values. Read this as the discovery."
+        )
+        if n_recruited != n_recruited_all_family:
+            recruited_note += (
+                f" ({n_recruited_all_family} would pass the looser all-protein family alone.)"
+            )
+        caveats.append(recruited_note)
     skew = core["null_skew_at_max"]
     if abs(skew) > 1.0:
         if core["n_gamma_tail"] > 0:
@@ -771,6 +790,7 @@ def run_network_analysis(
             "n_hits": n_hits,
             "n_hits_seed": n_hits_seed,
             "n_recruited": n_recruited,
+            "n_recruited_all_family": n_recruited_all_family,
             "n_proteins": graph["n_proteins"],
             "null_diagnostics": {
                 "n_exceed_top": core["n_exceed_top"],

@@ -471,6 +471,45 @@ check(log_err_skew < log_err_normal,
       f"here, not just in theory")
 
 # =============================================================================
+print("=== Fix 2: fdrs_recruited_family is a real, independent BH family over non-seed p-values ===")
+# =============================================================================
+seed_positions = np.fromiter(seed_idx_score_pg.keys(), dtype=int)
+non_seed_positions = np.setdiff1d(np.arange(pg["n_proteins"]), seed_positions)
+fdrs_rf = core_pg["fdrs_recruited_family"]
+check(np.all(np.isnan(fdrs_rf[seed_positions])),
+      f"every SEED position is NaN in fdrs_recruited_family - it is not a question for a seed "
+      f"(got {np.sum(~np.isnan(fdrs_rf[seed_positions]))} non-NaN seed entries, expected 0)")
+check(not np.any(np.isnan(fdrs_rf[non_seed_positions])),
+      "every NON-seed position has a real value")
+
+manual_bh = np.asarray(gnet.genomics_ora.benjamini_hochberg(
+    [float(core_pg["pvalues"][i]) for i in non_seed_positions]))
+check(np.allclose(fdrs_rf[non_seed_positions], manual_bh, atol=1e-12),
+      "fdrs_recruited_family matches BH benjamini_hochberg recomputed independently over just the "
+      "SAME non-seed p-values (max abs diff %.2e)" % np.max(np.abs(fdrs_rf[non_seed_positions] - manual_bh)))
+
+# SENSITIVITY: prove the recruited-only family is not merely an alias for the
+# all-protein "fdrs" column read for non-seed rows - it must differ, since
+# removing every seed's (structurally tiny) p-value from the correction
+# changes the family size AND the rank of every remaining candidate.
+all_family_for_non_seed = np.asarray(core_pg["fdrs"])[non_seed_positions]
+check(not np.allclose(fdrs_rf[non_seed_positions], all_family_for_non_seed, atol=1e-9),
+      f"the recruited-only family FDR genuinely differs from the all-protein family FDR for the SAME "
+      f"non-seed proteins (max abs diff {np.max(np.abs(fdrs_rf[non_seed_positions] - all_family_for_non_seed)):.3e}) "
+      f"- confirming this is a real second computation, not a relabelled copy of the first")
+
+print("=== SENSITIVITY: the fdrs_recruited_family check above is not vacuous ===")
+# Break it for real: compute the "recruited family" from ALL p-values (the
+# bug this fix replaces - a naive read of the shared "fdrs" column) instead
+# of the non-seed subset, and confirm the match-to-manual-BH check fails.
+broken_fdrs_rf = np.asarray(gnet.genomics_ora.benjamini_hochberg(list(core_pg["pvalues"])))[non_seed_positions]
+check(not np.allclose(broken_fdrs_rf, manual_bh, atol=1e-12),
+      f"the PRE-FIX approach (BH over ALL p-values, not just non-seed) does NOT match the independent "
+      f"non-seed-only BH recomputation (max abs diff "
+      f"{np.max(np.abs(broken_fdrs_rf - manual_bh)):.3e}) - proving the match check above is discriminating, "
+      f"not accidentally always true")
+
+# =============================================================================
 print("=== mcl_cluster / detect_modules ===")
 # =============================================================================
 # Back to the small hand-built file fixture: module detection is pure graph

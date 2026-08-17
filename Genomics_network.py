@@ -104,7 +104,7 @@ DEGREE_BIN_COUNT = 10             # for degree-preserving permutation seed resam
 
 NETPROP_HIT_COLUMNS = [
     "STRING ID", "Gene Symbol", "UniProt ID", "Propagated score",
-    "Z-score", "p-value", "Empirical p-value", "FDR", "Seed", "Seed score",
+    "Z-score", "p-value", "Empirical p-value", "FDR", "FDR (recruited family)", "Seed", "Seed score",
 ]
 NETPROP_MODULE_COLUMNS = [
     "Module ID", "Size", "Genes", "Top enriched term", "Top enriched FDR", "Enrichment database",
@@ -607,6 +607,27 @@ def _propagation_core(
     fdrs = genomics_ora.benjamini_hochberg(list(pvalues))
     pvalues_empirical = (1.0 + n_exceed) / (count + 1.0)
 
+    # A SECOND FDR family, over non-seed proteins only. A seed's p-value is
+    # largely structural (it receives restart mass directly - see this
+    # function's own docstring on the shift branch it exists to avoid, and
+    # Transcriptomics_network's module docstring on seed circularity), so
+    # hundreds of near-guaranteed-tiny seed p-values sitting in the SAME BH
+    # family as the recruited candidates shifts the rejection boundary for
+    # everyone. Recomputing BH within the non-seed subset alone answers "is
+    # this RECRUITED protein significant on its own terms" rather than
+    # "significant in a family dominated by its own seeds" - measured on real
+    # data to matter: of 10 proteins significant in the all-protein family,
+    # several recruited ones did not survive this stricter, honest family.
+    # NaN at every seed position (not a p-value question for a seed).
+    seed_mask = np.zeros(n, dtype=bool)
+    for idx in seed_idx_score:
+        seed_mask[idx] = True
+    non_seed_idx = np.flatnonzero(~seed_mask)
+    fdrs_recruited_family = np.full(n, np.nan)
+    if len(non_seed_idx):
+        non_seed_fdrs = genomics_ora.benjamini_hochberg([float(pvalues[i]) for i in non_seed_idx])
+        fdrs_recruited_family[non_seed_idx] = non_seed_fdrs
+
     return {
         "observed": observed,
         "null_mean": null_mean,
@@ -616,6 +637,7 @@ def _propagation_core(
         "pvalues": pvalues,
         "pvalues_empirical": pvalues_empirical,
         "fdrs": fdrs,
+        "fdrs_recruited_family": fdrs_recruited_family,
         "n_exceed": n_exceed,
         "n_exceed_top": int(n_exceed[top_idx]),
         "null_skew_at_max": float(null_skew[top_idx]),
@@ -682,12 +704,14 @@ def run_propagation_with_significance(
     pvalues = core["pvalues"]
     pvalues_empirical = core["pvalues_empirical"]
     fdrs = core["fdrs"]
+    fdrs_recruited_family = core["fdrs_recruited_family"]
     seed_idx_score = core["seed_idx_score"]
 
     rows = []
     for i in range(n):
         pid = index_protein[i]
         is_seed = i in seed_idx_score
+        fdr_rf = fdrs_recruited_family[i]
         rows.append({
             "STRING ID": pid,
             "Gene Symbol": protein_gene.get(pid, ""),
@@ -697,6 +721,7 @@ def run_propagation_with_significance(
             "p-value": float(pvalues[i]),
             "Empirical p-value": float(pvalues_empirical[i]),
             "FDR": float(fdrs[i]),
+            "FDR (recruited family)": None if is_seed else float(fdr_rf),
             "Seed": bool(is_seed),
             "Seed score": float(seed_idx_score[i]) if is_seed else None,
         })
@@ -705,7 +730,15 @@ def run_propagation_with_significance(
 
     hits_mask = table["FDR"] < fdr_alpha
     n_hits = int(hits_mask.sum())
-    n_recruited = int((hits_mask & ~table["Seed"]).sum())
+    # HEADLINE recruited count: significant against the RECRUITED-ONLY BH
+    # family (honest - not sharing a family with hundreds of near-guaranteed
+    # seed p-values). n_recruited_all_family is kept for reference/comparison
+    # - it is what a naive "non-seed rows passing the all-protein FDR" count
+    # would report, and is usually >= n_recruited.
+    recruited_mask_all_family = hits_mask & ~table["Seed"]
+    n_recruited_all_family = int(recruited_mask_all_family.sum())
+    recruited_mask_strict = (table["FDR (recruited family)"] < fdr_alpha) & ~table["Seed"]
+    n_recruited = int(recruited_mask_strict.sum())
     seed_string_ids = {index_protein[i] for i in seed_idx_score}
 
     _progress(n_permutations + 1, n_permutations + 1, "Done")
@@ -715,6 +748,7 @@ def run_propagation_with_significance(
         "n_seeds_not_in_string": n_not_in_string,
         "n_hits": n_hits,
         "n_recruited": n_recruited,
+        "n_recruited_all_family": n_recruited_all_family,
         "seed_string_ids": seed_string_ids,
         # Diagnostics only, never p-values (see _propagation_core's docstring):
         # how the empirical exceedance count and measured skewness compare to

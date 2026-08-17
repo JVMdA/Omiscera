@@ -118,19 +118,31 @@ with sync_playwright() as p:
           "the seed-circularity caveat is shown on screen, not buried in the payload")
 
     print("=== evaluation Part 3c: the on-screen caveat's counts stay honest ===")
+    # Fix 2 split this into two SEPARATE caveats: the seed-circularity one
+    # (seed/total counts, from the all-protein family) and a recruited-count
+    # one (from the stricter, seed-free family) - parse each independently.
+    n_hits_seed = page.evaluate("STATE.transcriptomics.networkResults.propagation.n_hits_seed")
+
     seed_caveat = next((c for c in caveats if "supplied as seeds" in c), None)
     check(seed_caveat is not None, "the seed-circularity caveat text is findable for parsing")
     if seed_caveat:
         m = re.search(r"(\d+) of the (\d+) significant proteins are genes you supplied as seeds", seed_caveat)
-        m2 = re.search(r"The (\d+) RECRUITED protein", seed_caveat)
-        check(bool(m and m2), f"the caveat text still matches the expected pattern (got: {seed_caveat!r})")
-        if m and m2:
-            check(int(m.group(1)) == stats["seedHits"] and int(m.group(2)) == stats["hits"]
-                  and int(m2.group(1)) == stats["recruited"],
-                  f"the caveat's own numbers (seed={m.group(1)}, total={m.group(2)}, recruited={m2.group(1)}) "
-                  f"match the payload's n_hits_seed/n_hits/n_recruited exactly (payload: "
-                  f"{stats['seedHits']}/{stats['hits']}/{stats['recruited']}) - the Part 3b toggle only "
-                  f"filters the Hit table's DISPLAY, it never touches these counts")
+        check(bool(m), f"the seed-circularity caveat text still matches the expected pattern (got: {seed_caveat!r})")
+        if m:
+            check(int(m.group(1)) == n_hits_seed and int(m.group(2)) == stats["hits"],
+                  f"the seed-circularity caveat's own numbers (seed={m.group(1)}, total={m.group(2)}) match "
+                  f"the payload's n_hits_seed/n_hits exactly (payload: {n_hits_seed}/{stats['hits']})")
+
+    recruited_caveat = next((c for c in caveats if "protein(s) that were never seeds" in c), None)
+    check(recruited_caveat is not None, "the recruited-family caveat text is findable for parsing")
+    if recruited_caveat:
+        m2 = re.search(r"^(\d+) protein\(s\) that were never seeds", recruited_caveat)
+        check(bool(m2), f"the recruited caveat text matches the expected pattern (got: {recruited_caveat!r})")
+        if m2:
+            check(int(m2.group(1)) == stats["recruited"],
+                  f"the recruited caveat's own number ({m2.group(1)}) matches the payload's n_recruited "
+                  f"exactly ({stats['recruited']}) - the Part 3b toggle only filters the Hit table's "
+                  f"DISPLAY, it never touches these counts")
 
     print("=== evaluation Part 3a: the shared FDR-underflow formatter is wired in, on real data ===")
     fmt = page.evaluate("""() => ({
