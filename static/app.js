@@ -4919,6 +4919,9 @@ function renderTranscriptomicsNetworkResultsScreen() {
         ", by Entrez ID: " + (tiers.entrez_id || 0) + ". " +
         (mapping.n_collisions_used ? mapping.n_collisions_used + " identifier(s) matched more than one protein; " +
             "the best-connected protein was used. " : "") +
+        (seeds.n_multi_row_proteins ? seeds.n_multi_row_proteins + " seed protein(s) were mapped by MORE THAN " +
+            "ONE row of your table (e.g. duplicate probes/transcripts for one gene); each still counts as a " +
+            "single seed, weighted by its strongest evidence, not summed across rows. " : "") +
         "STRING names proteins using each organism's own nomenclature, so coverage varies by species."));
     if (mapping.table) mapPane.appendChild(buildTable(mapping.table, { maxHeight: 420 }));
     const mapDl = el("button", { class: "btn" }, "Download gene mapping (CSV)");

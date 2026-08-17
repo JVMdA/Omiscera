@@ -307,16 +307,28 @@ def build_seed_weights(resolved_df: pd.DataFrame, mapping: dict,
     sign in the weight - see this module's docstring for why a signed weight
     silently biases the whole run.
 
-    weighting="equal" (default): every seed weighs exactly 1.0. The padj/lfc
-    cutoffs already made the evidence call; re-weighting by the same p-values
-    double-counts it, and it makes the null test cleanly "which genes are
-    seeds", which is the claim a thresholded DEG list actually supports.
+    weighting="equal" (default): every seed weighs EXACTLY 1.0, always - even
+    when more than one DE-table row (duplicate probes/transcripts for one
+    gene) maps to the same STRING protein. The padj/lfc cutoffs already made
+    the evidence call; re-weighting by the same p-values double-counts it,
+    and it makes the null test cleanly "which genes are seeds", which is the
+    claim a thresholded DEG list actually supports. Letting a protein's
+    weight scale with how many rows happened to map to it would make that
+    claim depend on identifier-mapping accidents, not biology.
 
     weighting="abs_metric": |ranking metric|, winsorized at the seed set's 99th
     percentile and floored at SEED_WEIGHT_FLOOR, giving a max/min ratio of
     exactly 20. Unbounded weights are not viable: with tx.GSEA_MIN_P = 1e-300,
     -log10(p) spans 1.3 to 300, so one gene would own the propagation and every
-    "module" would be its neighbourhood.
+    "module" would be its neighbourhood. A protein hit by more than one row
+    takes the MAX of their |metric| values, not the sum - a protein is as
+    strong as its single strongest piece of supporting evidence; summing
+    would let two mediocre rows silently outweigh one loud one for no
+    biological reason, the same identifier-mapping-accident problem "equal"
+    avoids above.
+
+    n_multi_row_proteins (returned) counts how many seed proteins this
+    collapse actually affected, so it is visible rather than silent.
 
     Every returned weight is strictly positive by construction.
     """
@@ -324,6 +336,7 @@ def build_seed_weights(resolved_df: pd.DataFrame, mapping: dict,
     string_by_row = mapping["string_by_row"]
 
     raw: dict = {}
+    row_counts: dict = {}
     n_degs = len(degs)
     n_not_in_string = 0
     for _, r in degs.iterrows():
@@ -331,6 +344,7 @@ def build_seed_weights(resolved_df: pd.DataFrame, mapping: dict,
         if pid is None:
             n_not_in_string += 1
             continue
+        row_counts[pid] = row_counts.get(pid, 0) + 1
         if weighting == "abs_metric":
             lfc = float(r.get("log2FC") or 0.0)
             p = float(r.get("pvalue") if pd.notna(r.get("pvalue")) else 1.0)
@@ -345,9 +359,11 @@ def build_seed_weights(resolved_df: pd.DataFrame, mapping: dict,
                 m = abs(np.log10(padj))
             else:  # signed_log_pvalue (default)
                 m = abs(np.log10(p))
+            raw[pid] = max(raw.get(pid, 0.0), float(m))
         else:
-            m = 1.0
-        raw[pid] = raw.get(pid, 0.0) + float(m)   # two DEGs on one protein sum once
+            raw[pid] = 1.0
+
+    n_multi_row_proteins = sum(1 for c in row_counts.values() if c > 1)
 
     winsor_q = None
     n_winsorized = 0
@@ -383,6 +399,7 @@ def build_seed_weights(resolved_df: pd.DataFrame, mapping: dict,
         "winsor_q": winsor_q,
         "n_winsorized": n_winsorized,
         "weight_ratio": ratio,
+        "n_multi_row_proteins": n_multi_row_proteins,
     }
 
 
@@ -735,7 +752,7 @@ def run_network_analysis(
         },
         "seeds": {k: seeds[k] for k in
                   ("n_degs", "n_seeds", "n_degs_not_in_string", "direction", "weighting",
-                   "metric", "winsor_q", "n_winsorized", "weight_ratio")},
+                   "metric", "winsor_q", "n_winsorized", "weight_ratio", "n_multi_row_proteins")},
         "propagation": {
             "table": table,
             "n_seeds_mapped": len(seed_idx_score),

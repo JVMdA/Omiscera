@@ -209,11 +209,34 @@ for direction in ("all", "up", "down"):
 w_all = txnet.build_seed_weights(seed_df, seed_map, direction="all", weighting="equal")
 check(w_all["n_degs"] == 3 and w_all["n_seeds"] == 2,
       f"3 DEG rows collapse onto 2 STRING proteins (n_degs={w_all['n_degs']}, n_seeds={w_all['n_seeds']})")
-check(abs(w_all["weights"]["9998.W1"] - 2.0) < 1e-9,
-      f"SENSITIVITY (documents actual behaviour): two DEG rows mapping to ONE protein are SUMMED "
-      f"(1.0+1.0), not deduplicated to 1.0 - 'equal' weighting is per-DEG-row, not per-protein "
-      f"(got {w_all['weights']['9998.W1']})")
-check(abs(w_all["weights"]["9998.W2"] - 1.0) < 1e-9, "a protein with a single DEG row weighs exactly 1.0")
+check(abs(w_all["weights"]["9998.W1"] - 1.0) < 1e-9 and abs(w_all["weights"]["9998.W2"] - 1.0) < 1e-9,
+      f"'equal' weighting is GENUINELY equal: a protein hit by two DE-table rows (r1, r2 -> W1) still "
+      f"weighs exactly 1.0, the same as a protein hit by one row (W2) - not the sum of however many "
+      f"rows an identifier-mapping accident happened to produce (got W1={w_all['weights']['9998.W1']}, "
+      f"W2={w_all['weights']['9998.W2']})")
+check(w_all["n_multi_row_proteins"] == 1,
+      f"the collapse is reported, not silent: exactly 1 seed protein (W1) was mapped by more than one row "
+      f"(got {w_all['n_multi_row_proteins']})")
+
+# abs_metric: the SAME multi-row protein takes the MAX of its rows' |metric|
+# values (log2FC 2.0 and 2.5 -> 2.5), never the sum (4.5) - summing would let
+# two mediocre rows silently outweigh one loud one. The final weight is still
+# passed through winsorization (raw/q), so compare against the SAME transform
+# applied by hand to both the max- and sum- hypotheses, rather than the raw
+# pre-winsorization value.
+w_max = txnet.build_seed_weights(seed_df, seed_map, direction="all", weighting="abs_metric", metric="log2fc")
+raw_if_max = {"W1": 2.5, "W2": 3.0}   # |log2FC|: max(2.0, 2.5)=2.5 for W1; 3.0 for W2
+raw_if_sum = {"W1": 4.5, "W2": 3.0}   # the wrong hypothesis: 2.0 + 2.5 = 4.5 for W1
+q_if_max = float(np.quantile(list(raw_if_max.values()), txnet.SEED_WEIGHT_WINSOR_QUANTILE))
+q_if_sum = float(np.quantile(list(raw_if_sum.values()), txnet.SEED_WEIGHT_WINSOR_QUANTILE))
+expected_if_max = max(min(raw_if_max["W1"], q_if_max) / q_if_max, txnet.SEED_WEIGHT_FLOOR)
+expected_if_sum = max(min(raw_if_sum["W1"], q_if_sum) / q_if_sum, txnet.SEED_WEIGHT_FLOOR)
+check(abs(expected_if_max - expected_if_sum) > 0.1,
+      f"the max- and sum-hypothesis winsorized weights are far enough apart to actually discriminate "
+      f"({expected_if_max:.4f} vs {expected_if_sum:.4f}) - otherwise the check below would be vacuous")
+check(abs(w_max["weights"]["9998.W1"] - expected_if_max) < 1e-9,
+      f"SENSITIVITY: the real weight matches the MAX hypothesis ({expected_if_max:.4f}), not the SUM "
+      f"hypothesis ({expected_if_sum:.4f}) (got {w_max['weights']['9998.W1']:.4f})")
 
 # =============================================================================
 print("=== build_seed_weights: abs_metric is strictly positive, and SYMMETRIC in sign ===")
