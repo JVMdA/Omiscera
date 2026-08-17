@@ -84,7 +84,7 @@ check(job["status"] == "done", f"resolve finished ({job['status']}, {job.get('er
 # =============================================================================
 print("=== abs_metric seed weighting: never run before, now for real ===")
 # =============================================================================
-job, resp = configure_and_run({"confidence": 700, "n_permutations": 100, "module_detection": False,
+job, resp = configure_and_run({"confidence": 700, "n_permutations": 500, "module_detection": False,
                                "direction": "all", "weighting": "abs_metric", "metric": "pi_value"})
 check(job is not None and job["status"] == "done",
       f"abs_metric run completed ({resp.status_code if job is None else job['status']})")
@@ -99,9 +99,9 @@ if job:
 # =============================================================================
 print("=== direction=up / direction=down: never run before, now for real ===")
 # =============================================================================
-up_job, _ = configure_and_run({"confidence": 700, "n_permutations": 100, "module_detection": False,
+up_job, _ = configure_and_run({"confidence": 700, "n_permutations": 500, "module_detection": False,
                                "direction": "up", "weighting": "equal"})
-down_job, _ = configure_and_run({"confidence": 700, "n_permutations": 100, "module_detection": False,
+down_job, _ = configure_and_run({"confidence": 700, "n_permutations": 500, "module_detection": False,
                                  "direction": "down", "weighting": "equal"})
 check(up_job is not None and up_job["status"] == "done", "direction=up run completed")
 check(down_job is not None and down_job["status"] == "done", "direction=down run completed")
@@ -119,7 +119,7 @@ if up_job and down_job:
 print("=== MSigDB module labelling: never run before, now for real ===")
 # =============================================================================
 msig_job, msig_resp = configure_and_run({
-    "confidence": 700, "n_permutations": 100, "module_detection": True,
+    "confidence": 700, "n_permutations": 500, "module_detection": True,
     "min_module_size": 3, "direction": "all", "weighting": "equal",
     "enrichment_database": "MSigDB", "msigdb_collections": ["hallmark"],
 })

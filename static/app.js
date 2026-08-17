@@ -4605,7 +4605,11 @@ function buildRegulonCoherenceBars(div, row, detail, geneLog2FC, tf) {
 // per-module enrichment via the shared RESULT_COLUMNS contract.
 // ---------------------------------------------------------------------------
 
-const TX_NETWORK_PERMUTATION_CHOICES = [["200", "200"], ["500", "500"], ["1000", "1000"], ["2000", "2000"]];
+// Mirrors Transcriptomics_network.NETWORK_N_PERMUTATIONS_CHOICES - 200 is
+// deliberately NOT offered (see that constant's own comment: measured to
+// underestimate the null variance badly enough to report false extreme
+// significance on real data).
+const TX_NETWORK_PERMUTATION_CHOICES = [["500", "500"], ["1000", "1000"], ["2000", "2000"]];
 const TX_NETWORK_DIRECTIONS = [["All DE genes", "all"], ["Up-regulated only", "up"], ["Down-regulated only", "down"]];
 const TX_NETWORK_WEIGHTINGS = [
     ["Equal weight (recommended)", "equal"],
@@ -4614,11 +4618,12 @@ const TX_NETWORK_WEIGHTINGS = [
 const TX_NETWORK_ENRICHMENT_DBS = [["GO", "GO"], ["MSigDB", "MSigDB"]];
 
 // Rough wall-clock guide so a user isn't surprised by a multi-minute run.
-// Anchored on a measured point: 200 permutations over the human network took
-// ~60 s on the development machine, and cost is very close to linear in the
-// permutation count.
+// Anchored on measurements across the full offered range (500/1000/2000
+// permutations over the human network took ~154/301/582 s - see
+// tests/calibration_network_production_scale.py, Part B): cost is very
+// close to linear in the permutation count, ~0.3 s/permutation.
 function _txNetworkRuntimeHint(nPermutations) {
-    const seconds = Math.round((Number(nPermutations) || 500) * 0.3);
+    const seconds = Math.round((Number(nPermutations) || 1000) * 0.3);
     if (seconds < 90) return "about " + seconds + " seconds";
     return "about " + Math.round(seconds / 60) + " minute(s)";
 }
@@ -4643,7 +4648,7 @@ function renderTranscriptomicsNetworkConfigScreen() {
             padjCutoff: 0.05,
             lfcCutoff: 1.0,
             fdrAlpha: 0.05,
-            nPermutations: 500,
+            nPermutations: 1000,
             moduleDetection: true,
             minModuleSize: 3,
             maxHitsForModules: 600,

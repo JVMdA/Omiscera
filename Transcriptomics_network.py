@@ -69,9 +69,25 @@ import Transcriptomics_module as tx
 # Deliberately smaller than Genomics' (500..10000): every permutation is a full
 # RWR over the whole organism graph, and API.py's EXECUTOR has 4 workers, so one
 # 10,000-permutation job would hold a quarter of the server's capacity for a
-# long time. 500 is ample for z-scoring against a per-protein null.
-NETWORK_N_PERMUTATIONS_CHOICES = (200, 500, 1000, 2000)
-NETWORK_N_PERMUTATIONS_DEFAULT = 500
+# long time.
+#
+# 200 is NOT offered, on measured evidence (tests/calibration_network_
+# production_scale.py, Part B), not a guess: the permutation null this engine
+# estimates is heavy-tailed enough that a low permutation count can badly
+# UNDERESTIMATE a protein's null variance by missing a rare, high-leverage
+# outlier permutation. Measured directly, same real seeds, same protein: at
+# 200 permutations one protein's null_std was 4.07e-6, giving Z=224 and an
+# astronomically small p-value; at 500 permutations (which happened to
+# sample the outlier) the SAME protein's null_std was 4.07e-5 - TEN TIMES
+# LARGER - correctly dropping it out of significance entirely (FDR 0.41).
+# On the bundled human example, 500/1000/2000 permutations agree with each
+# other (0 hits, measured null skewness at the top-scoring protein converging
+# to ~2.0), while 200 alone reported 10 "significant" proteins that do not
+# survive a properly-sampled null. 500 is the floor this evidence supports;
+# 1000 is the default, a middle ground between that floor and the slower
+# 2000, which is offered for a final/publication run.
+NETWORK_N_PERMUTATIONS_CHOICES = (500, 1000, 2000)
+NETWORK_N_PERMUTATIONS_DEFAULT = 1000
 
 NETWORK_SEED_WEIGHTINGS = {
     "equal": "Equal weight (recommended)",
