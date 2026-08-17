@@ -76,17 +76,24 @@ string-db.org for the current recommended citation.
 SEED WEIGHTING
 -------------------
 Two choices, both producing STRICTLY POSITIVE weights only:
-  - EQUAL (default) — every seed weighs 1.0 (or a small integer multiple,
-    if more than one row of your table mapped to the same protein — this
-    happens with duplicate probes/transcripts for one gene, and their
-    contributions are summed rather than kept separate). The padj/log2FC
-    cutoffs already made the evidence call; re-weighting by the same
-    statistics again would double-count it.
+  - EQUAL (default) — every seed weighs EXACTLY 1.0, including a protein
+    that more than one row of your table happened to map onto (duplicate
+    probes/transcripts for one gene are common). Earlier versions of this
+    module summed those rows' contributions, so a duplicate-mapped gene
+    quietly got 2.0 or more — double propagation mass from an identifier
+    artifact, not from any biological signal. That is fixed: EQUAL means
+    equal, for every seed, regardless of how many rows mapped to it. The
+    Gene mapping pane reports how many proteins received more than one row
+    (n_multi_row_proteins), so the collapse stays visible even though it no
+    longer changes the weight.
   - WEIGHTED BY |RANKING METRIC| — seeds are weighted by the ABSOLUTE value
     of whichever ranking metric GSEA uses (|log2FC|, |π-value|, or
     |-log10(p)|/|-log10(padj)|), winsorized at the 99th percentile among
     your seeds and floored, bounding the strongest seed's weight at exactly
-    20x the weakest.
+    20x the weakest. A protein backed by more than one row takes the MAX
+    magnitude among them, not the sum — a protein is as strong as its
+    strongest supporting evidence, not as strong as how many rows happened
+    to reference it.
 
 WHY ABSOLUTE VALUE, NEVER A SIGNED WEIGHT. The shared propagation engine's
 seed-mapping step will shift any non-positive weight set upward by
@@ -104,11 +111,28 @@ THE PERMUTATION NULL
 -------------------------
 Identical method to Genomics: a degree-preserving permutation null (each
 seed is repeatedly swapped for a random protein of similar network degree,
-many times), converted to a Z-score and a normal-tail p-value per protein,
-then Benjamini-Hochberg FDR-corrected across the whole network. Permutation
-count is adjustable (200/500/1000/2000; default 500) — deliberately capped
-lower than Genomics' range, since every permutation here is a full walk over
-the whole organism's network and this server runs several jobs concurrently.
+many times). The null is measurably right-skewed (skewness ~2.0-2.5 on real
+human runs), so each protein's p-value comes from a Pearson III (shifted-
+gamma) fit to its OWN null by method of moments, falling back to the normal
+tail only where the fit isn't meaningful (little null variability, or too
+little measured skew to fit reliably) — see the Genomics module's own
+README for the full derivation; the two modules share one engine. An
+EMPIRICAL p-value (how many permutations actually met or beat the observed
+score) is also reported for transparency, but never used for FDR — its
+floor cannot survive correction across a whole network at realistic
+permutation counts.
+
+Permutation count is adjustable (500/1000/2000; default 1000). 500 is a
+MEASURED floor, not a guess: at 200 permutations (no longer offered), a
+production-scale check found that a single missed high-leverage permutation
+can understate a protein's null spread by 10x, manufacturing a spurious
+extreme Z-score rather than merely a noisy one — a genuine artifact, not
+just imprecision. 500+ permutations agree with each other on the bundled
+human example; 200 alone did not. Higher counts (1000, 2000) trade runtime
+for stability on borderline results; every permutation here is a full walk
+over the whole organism's network, so this is deliberately capped lower
+than Genomics' upper range (10,000) since this server runs several jobs
+concurrently.
 
 A network below ~20 proteins at your chosen confidence is refused outright,
 with an explanation: below that size, every "degree bin" the permutation
@@ -116,28 +140,53 @@ draws replacement seeds from holds only one candidate, so a permuted seed set
 is IDENTICAL to the real one every time — the null could never move, and
 every result would silently and uninformatively read as "not significant."
 
+Propagation p-values are Benjamini-Hochberg FDR-corrected TWICE: once across
+every protein in the network (the "FDR" column), and independently a SECOND
+time across only the non-seed proteins (the "FDR (recruited family)"
+column) — see "seed circularity" below for why the second family exists and
+which one is the headline.
+
 SEED CIRCULARITY — READ THIS BEFORE TRUSTING A "SIGNIFICANT SEED"
 ------------------------------------------------------------------------
 A seed receives propagation signal DIRECTLY, every step, by construction. Its
 null, meanwhile, is built from permutations in which it is usually NOT a
 seed (only reselected occasionally, by chance, from its degree bin). That
 comparison is structurally tilted in the seed's favour — a seed clearing the
-significance threshold is therefore mostly EXPECTED, not a discovery.
-Measured directly on this app's bundled human example (default settings,
-500 permutations): of all seeds, roughly 97% clear FDR < 0.05 purely from
-receiving their own signal, while under 0.1% of NON-seed proteins ever do —
-and in one full run through the actual upload-to-results pipeline, 534 of the
-571 significant proteins (93.5%) were the user's own seeds, and only 37 were
-proteins never uploaded at all. Seed Z-scores can run into the hundreds.
+significance threshold is therefore mostly EXPECTED, not a discovery, and
+its exact FDR should not be read as evidence of anything.
+
+Seeds sharing the same Benjamini-Hochberg family as candidate RECRUITED
+genes compounds this: hundreds of near-guaranteed-tiny seed p-values occupy
+the top ranks and push the rejection boundary outward, carrying marginal
+recruited genes through with them. Measured directly on this app's mouse
+example (13 significant proteins, 1000 permutations): recomputing BH within
+the non-seed family alone dropped the recruited count from what the
+all-protein family would have called recruited to a stricter, independently-
+verified 12 — this module now reports THAT number, "FDR (recruited family),"
+as the headline "recruited" count and metric everywhere on screen; the
+all-protein-family count is still available in the payload
+(n_recruited_all_family) so the correction is never silent.
 
 The genuinely new information this module adds is the RECRUITED set —
-significant proteins that were never seeds. The Hit table defaults to
-showing RECRUITED genes only whenever a run produced any, specifically so
-this small, actually-informative set is not buried under hundreds of
-structurally-expected seed rows; a toggle switches to the full table (every
-protein, seeds included), and the CSV download always contains everything
-regardless of that toggle's state. This changes what the interface shows
-first; it changes NOTHING about the underlying ranking, Z-scores or FDR.
+significant proteins that were never seeds, judged by their OWN, seed-free
+FDR family. The Hit table defaults to showing RECRUITED genes only whenever
+a run produced any, specifically so this small, actually-informative set is
+not buried under hundreds of structurally-expected seed rows; a toggle
+switches to the full table (every protein, seeds included), and the CSV
+download always contains everything regardless of that toggle's state. This
+changes what the interface shows first; it changes NOTHING about the
+underlying ranking, Z-scores or either FDR family.
+
+A properly-calibrated result CAN legitimately be zero hits. On the app's
+bundled HUMAN example specifically, at any permutation count of 500 or
+above, the corrected engine currently finds no protein — seed or recruited
+— clearing FDR < 0.05: the differential-expression signal in that example
+is not concentrated enough on the STRING network to survive honest
+correction. That is not a bug and not a regression; it is what "no longer
+silently over-calling significance" looks like on a dataset that does not
+actually support a network-level finding. The bundled MOUSE example is the
+one to look at for a demonstrated positive result under the exact same,
+fully-corrected statistics (13 hits, 12 recruited at time of writing).
 
 MODULE DETECTION
 ---------------------
@@ -173,13 +222,21 @@ exactly that same problem.
 MULTIPLE-TESTING CORRECTION
 -------------------------------
 Propagation p-values are Benjamini-Hochberg FDR-corrected across every
-protein in the network (default significance FDR < 0.05, adjustable without
-re-running). Module labels are POST-SELECTION: modules are chosen for being
-densely connected and carrying propagated signal, and only THEN tested for
-enrichment — their FDR describes what a module contains, it is not a
-hypothesis test, and it is not corrected for having compared multiple
-annotation sources (GO's three namespaces, or several MSigDB collections)
-per module.
+protein in the network, and independently again across the non-seed
+proteins only (default significance FDR < 0.05, adjustable without
+re-running) — see "seed circularity" above. Module labels are
+POST-SELECTION: modules are chosen for being densely connected and carrying
+propagated signal, and only THEN tested for enrichment — their FDR
+describes what a module contains, it is not a hypothesis test. It IS
+corrected for having compared multiple annotation sources per module: the
+"Top enriched FDR" shown is the best within-namespace FDR multiplied by how
+many namespaces (GO's up to three, or however many MSigDB collections) were
+actually tested for that module, capped at 1.0 — picking the best of several
+independent tests is itself a selection, and reporting the raw, uncorrected
+minimum would be optimistically biased. The raw, single-namespace value is
+still shown alongside it as "Top enriched FDR (raw, uncorrected)" for
+comparison. When only one namespace returned results for a module, the two
+numbers are identical.
 
 RESULTS AND VISUALIZATION
 -----------------------------
@@ -191,20 +248,22 @@ RESULTS AND VISUALIZATION
     Downloadable as CSV.
   - Hit table — every protein in the network, ranked by FDR: ID, gene
     symbol, log2FC/padj (blank for a recruited gene — it was never in your
-    table), propagated score, Z-score, p-value, FDR, and whether it was a
-    seed. Defaults to RECRUITED ONLY when the run produced any (see "seed
-    circularity" above); the full table and the CSV download always contain
-    every protein regardless. p-values/FDRs that genuinely underflow float64
-    precision display as "< 1e-300" rather than a misleading "0.000e+0" —
-    the CSV keeps full numeric precision either way.
+    table), propagated score, Z-score, p-value, empirical p-value, FDR,
+    FDR (recruited family), whether it was a seed, and seed score. Defaults
+    to RECRUITED ONLY (by the recruited-family FDR) when the run produced
+    any (see "seed circularity" above); the full table and the CSV download
+    always contain every protein regardless. p-values/FDRs that genuinely
+    underflow float64 precision display as "< 1e-300" rather than a
+    misleading "0.000e+0" — the CSV keeps full numeric precision either way.
   - Figures — the same interactive network and null-distribution figures as
     Genomics: node colour carries propagated score or module membership;
     node size only marks seeds apart from recruited proteins, it is not a
     measurement. Both exportable as SVG/PNG/TIFF.
   - Modules (when module detection ran) — one row per module: size, seed/
     recruited/up/down composition, mean log2FC among members with data, and
-    top enriched term. Downloadable as CSV, alongside a module-coloured
-    network figure.
+    top enriched term with both its corrected and raw FDR (see "multiple-
+    testing correction" above). Downloadable as CSV, alongside a
+    module-coloured network figure.
   - Module enrichment — pick any module and see its full enrichment result
     (dot or bar plot, downloadable as its own CSV), not just the single top
     term used as the module's label.
@@ -214,14 +273,23 @@ RESULTS AND VISUALIZATION
 THINGS TO KEEP IN MIND
 ---------------------------
   - Seed circularity (above) is the most important caveat in this module: a
-    "significant" seed is mostly expected, not discovered. Read the
-    RECRUITED set as the finding.
-  - p-values assume a normal null; the actual permutation null is measurably
-    right-skewed (skewness around 2.0-2.5, measured on the bundled human
-    example) — a caveat banner states the EXACT value for your run when it
-    exceeds 1.0. Treat the RANKING as more trustworthy than the exact FDR.
+    "significant" seed is mostly expected, not discovered, and seeds sharing
+    a BH family with recruited genes can carry marginal recruited genes
+    through with them. Read the RECRUITED-FAMILY set as the finding, not the
+    all-protein FDR.
+  - A properly-calibrated run CAN legitimately find zero significant
+    proteins — that is not a bug, it means the signal was not concentrated
+    enough on the network to survive honest correction.
+  - p-values are NOT a plain normal-tail approximation; the actual
+    permutation null is measurably right-skewed (skewness around 2.0-2.5 on
+    real runs) and each protein's p-value comes from a Pearson III fit to
+    its own null, falling back to normal only where that fit isn't
+    meaningful — a caveat states how many proteins used which path for your
+    run. Treat the RANKING as more trustworthy than any single exact FDR.
   - Module labels are post-selection (see above) — a descriptive summary of
-    what a module contains, not a hypothesis test of whether it should exist.
+    what a module contains, not a hypothesis test of whether it should
+    exist — but the namespace-selection bias from comparing several
+    annotation sources per module IS corrected in the headline FDR shown.
   - STRING's combined confidence score folds in text-mining and cross-
     organism evidence transfer alongside direct experimental evidence, so
     the network — and therefore this module's results — leans toward well-

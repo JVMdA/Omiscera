@@ -85,16 +85,38 @@ because they sit near many things — not because they're biologically
 related to your genes. To tell these apart, the tool builds a null
 distribution by re-running propagation many times with random seed sets
 matched in network connectivity, then converts each protein's real score
-into a Z-score and p-value against that null, and finally corrects for
+into a Z-score and, from that null, a p-value, and finally corrects for
 multiple testing (FDR) across the whole network. The number of
 permutations is adjustable (500 to 10,000; default 1000). More
-permutations give a more precise, stable result; 500 is fine for a quick
-exploratory look, 2000+ for a final run or if borderline results look
+permutations give a more precise, stable result; 500 is the measured floor
+below which the null's variance itself becomes unreliable to estimate — on
+a real STRING-scale network, too few permutations can occasionally miss a
+rare, high-leverage permutation and understate a protein's null spread,
+manufacturing a spurious extreme Z-score rather than merely a noisy one.
+2000+ is recommended for a final run or if borderline results look
 unstable.
+
+THE P-VALUE IS NOT A PLAIN NORMAL-TAIL APPROXIMATION. The permutation null
+is measurably right-skewed (real human runs: skewness ~2-2.5), and a plain
+normal approximation is wrong there by orders of magnitude in exactly the
+tail where every hit is called. Each protein's p-value instead comes from a
+Pearson III (shifted-gamma) fit to that protein's own null, by method of
+moments, falling back to the normal tail only where the fit isn't
+meaningful (little or no null variability, or too little measured skew to
+fit reliably). An EMPIRICAL p-value (how many permutations actually met or
+beat the observed score) is also reported for transparency, though it is
+never itself used for FDR — at realistic permutation counts its floor
+cannot survive correction across a whole network.
 
 Proteins passing your significance threshold (default FDR < 0.05,
 adjustable) are the "hits" — almost always including your original seeds,
-plus any recruited proteins.
+plus any recruited proteins. A SEED clearing that threshold is largely
+CIRCULAR: it receives propagated signal directly, while its null is built
+from permutations in which it is usually not a seed, so the comparison is
+structurally tilted in its favour. The Hit table therefore also reports a
+second, stricter FDR computed within a family containing ONLY non-seed
+proteins — the honest number for "is this recruited protein significant on
+its own terms," not "significant in a family dominated by its own seeds."
 
 MODULE DETECTION
 ---------------------
@@ -110,6 +132,15 @@ structure, not GO membership. Overly generic terms (annotated to more than
 2000 genes) are excluded from labeling so the label stays specific and
 useful.
 
+The reported "Top enriched FDR" is CORRECTED for comparing multiple GO
+namespaces (Biological Process, Molecular Function, Cellular Component) per
+module: picking the smallest FDR out of several independently-tested
+namespaces is itself a selection, and an uncorrected "best of N" reads more
+significant than it is. The correction is min(raw FDR x namespaces actually
+tested for that module, 1.0); the uncorrected, within-namespace value is
+also shown for reference. Neither number is a hypothesis test — see
+"Things to keep in mind" below.
+
 RESULTS AND VISUALIZATION
 -----------------------------
 PROPAGATION (always shown):
@@ -118,10 +149,12 @@ PROPAGATION (always shown):
     first: if many of your genes never made it into the network, every
     result below is based on less input than you think.
   - Hit table — every protein tested, with its ID, propagated score,
-    Z-score, p-value, FDR, and whether it was one of your seeds.
-    Downloadable as CSV. Sort by FDR and look for rows where "Seed" is
-    false: those are the recruited proteins, the genuinely new candidates
-    this analysis exists to find.
+    Z-score, p-value, an empirical p-value, FDR, a second RECRUITED-FAMILY
+    FDR (blank for seeds — see above), and whether it was one of your
+    seeds. Downloadable as CSV, full precision. Sort by FDR and look for
+    rows where "Seed" is false: those are the recruited proteins, the
+    genuinely new candidates this analysis exists to find — filter on the
+    recruited-family FDR specifically for the honest version of that list.
   - Propagation network figure — the significant hit subnetwork, coloured
     by propagated score, with seeds outlined more heavily than recruited
     proteins. A recruited protein sitting in the middle of a dense cluster
@@ -165,6 +198,10 @@ reference to check or screenshot for a methods section.
 
 THINGS TO KEEP IN MIND
 ---------------------------
+  - Seed circularity: a seed clearing the (all-protein) significance
+    threshold is largely expected, not discovered — see "Why a permutation
+    test" above. Read the recruited-family FDR, and the recruited proteins
+    it flags, as the actual finding.
   - The network reflects functional-association evidence, not causality or
     direction — an edge means two proteins are associated, not that one
     regulates the other.
@@ -172,6 +209,10 @@ THINGS TO KEEP IN MIND
     a "worth investigating" suggestion, not proven biology.
   - Hub bias is corrected for, but not perfectly — if results near the
     significance boundary look surprising, try more permutations.
+  - Module labels are POST-SELECTION: modules are chosen for connectivity
+    and signal, and only then tested for enrichment, so "Top enriched FDR"
+    is not a hypothesis test even after the multi-namespace correction
+    above.
   - Module detection only works on propagation's hit set — a real module
     that propagation didn't flag as significant won't appear. Loosening
     the confidence cutoff or FDR threshold gives module detection more to

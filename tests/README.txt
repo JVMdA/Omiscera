@@ -77,6 +77,37 @@ calibration_regulon_activity.py with the truncated-normal MLE, and the
                                 assertions were promoted into
                                 test_regulon_engine.py section 12b.
 
+calibration_network_production_scale.py  Feasibility/calibration evidence
+                                for the network engine's skew-aware p-value
+                                and permutation-count defaults, same
+                                provenance-script precedent as the group
+                                above (prints tables, no PASS/FAIL
+                                bookkeeping, real runtime ~35 min - not part
+                                of the routine suite). Part A: true-null
+                                calibration at PRODUCTION scale (16,201
+                                proteins, the real cached human STRING graph,
+                                not the 60-node random graphs
+                                test_network_engine_core.py's own calibration
+                                uses) - 5 repeats of random, structure-free
+                                seeds, so every FDR<0.05 call is by
+                                construction a false positive. Measured: the
+                                skew-aware p-value calls ZERO false positives
+                                across all 5 repeats; the pre-fix normal-tail
+                                approximation, recomputed from the same null
+                                moments (no second permutation run needed),
+                                calls ~3.4% (~551/16,201) significant in
+                                EVERY repeat - several hundred false positives
+                                on a genuinely null input, every single run.
+                                Part B: the 200/500/1000/2000 permutation-
+                                count sweep on the bundled human example that
+                                justified dropping 200 and raising the
+                                default to 1000 - see both network READMEs
+                                and the Fix 3 commit message for the full
+                                finding (a specific protein's null_std jumped
+                                10x between 200 and 500 permutations, a real
+                                null-variance-underestimation artifact, not
+                                imprecision).
+
 generate_full_examples.py       Regenerates the bundled Data3 example DE
                                 files. Not a test - run only to rebuild them.
 
@@ -134,7 +165,7 @@ test_organism_consistency.py    24 checks. Two pre-existing organism-state
                                 that call for any route, since the guard fires
                                 first.
 
-test_network_engine_core.py     45 checks. Characterization tests for the
+test_network_engine_core.py     58 checks. Characterization tests for the
                                 SHARED numerical engine in Genomics_network.py
                                 (STRING parsing, random-walk-with-restart, the
                                 degree-preserving permutation null, MCL) -
@@ -164,9 +195,34 @@ test_network_engine_core.py     45 checks. Characterization tests for the
                                 cluster's satellites), mcl_cluster/
                                 detect_modules, and a GOLDEN hit table the
                                 Transcriptomics engine's extraction had to
-                                reproduce byte-identically.
+                                reproduce byte-identically. Also covers three
+                                evaluation-driven fixes: _GRAPH_CACHE is
+                                thread-safe under a 40-thread hammering of
+                                build_string_network across 5 keys (0 errors,
+                                cache never exceeds its max size), with a
+                                sensitivity check proving the new RLock is
+                                actually held during mutation, not just
+                                assumed thread-safe by luck; _welford_update's
+                                extension to a third central moment (Pébay's
+                                streaming skewness) matches a batch numpy
+                                computation over genuinely right-skewed gamma
+                                samples, and the resulting Pearson III p-value
+                                tracks a planted fixture's own empirical
+                                exceedance rate materially better than the
+                                pre-fix normal-only p-value did, for the
+                                highest-skew protein, with a sensitivity check
+                                forcing pure-normal fallback (SKEW_GAMMA_
+                                THRESHOLD=1e9) and confirming exactly the
+                                Fix-1-specific checks go red; and a second,
+                                independent recruited-only BH-FDR family
+                                (fdrs_recruited_family) is NaN at every seed
+                                position, matches an independent recomputation
+                                to 1e-12, and genuinely differs from the
+                                all-protein family's FDR for the same
+                                proteins - confirmed to NOT match what BH over
+                                all p-values (the pre-fix approach) would give.
 
-test_transcriptomics_network.py 37 checks. Unit tests for
+test_transcriptomics_network.py 44 checks. Unit tests for
                                 Transcriptomics_network.py, which had ZERO
                                 unit coverage of its own (the shared engine
                                 above is not retested here). The single
@@ -191,14 +247,27 @@ test_transcriptomics_network.py 37 checks. Unit tests for
                                 matching Ensembl id) and its <10%
                                 refusal / 10-50% warning gates;
                                 build_seed_weights' equal weighting (two DEG
-                                rows on one protein SUM rather than
-                                deduplicating - a real, documented behaviour),
-                                abs_metric's sign-symmetry with a sensitivity
-                                check using the real shift-positive branch to
-                                show what breaks without it, and its
-                                winsorization ratio (exactly 20, by
-                                construction); the giant-module warning; and
-                                the small-graph guard.
+                                rows on one protein now genuinely weigh
+                                exactly 1.0, not the old summed 2.0 - a real
+                                fix, with a sensitivity check reverting the
+                                production code to the old summing form and
+                                confirming the check goes red), abs_metric's
+                                sign-symmetry with a sensitivity check using
+                                the real shift-positive branch to show what
+                                breaks without it, its winsorization ratio
+                                (exactly 20, by construction), and its own fix
+                                (a multi-row-mapped protein takes the MAX
+                                magnitude among its rows, not the sum,
+                                discriminated against a hand-computed
+                                sum-hypothesis value on real data); the
+                                giant-module warning; the small-graph guard;
+                                and enrich_modules_by_symbol's namespace-
+                                selection correction (a two-namespace fixture
+                                confirms top_fdr_corrected == min(raw_fdr *
+                                n_namespaces_compared, 1.0) exactly, with two
+                                sensitivity checks - a stand-in uncorrected
+                                wrapper, and a real production-code revert -
+                                both confirmed to go red).
 
 test_transcriptomics_client_state.py  49 checks. Generic, source-level
                                 invariants over static/app.js's Transcriptomics
@@ -310,24 +379,39 @@ regression_ora_gsea.py          22 checks. The pre-existing GO-only ORA/GSEA
                                 test_msigdb_fetcher.py (direct function
                                 calls) or playwright_regulon.py (browser).
 
-live_e2e_transcriptomics_network.py  23 checks. Full real HTTP round trip
+live_e2e_transcriptomics_network.py  22 checks. Full real HTTP round trip
                                 for Transcriptomics Network / Module
                                 Detection - upload -> resolve -> configure ->
                                 run -> download x3 -> guards - against the
-                                bundled human example. Real mygene.info/
-                                STRING/QuickGO calls. Confirms mapping 97.2%,
-                                552 seeds, 571 significant proteins (534
-                                seed, 37 recruited), transcriptomics-shaped
-                                hit columns (no "UniProt ID"), a real
-                                subnetwork edge list, 27 modules, direction-
-                                composition columns, both the post-selection
-                                and seed-circularity caveats present, full
-                                reproducibility parameters, and each of the 3
-                                CSV downloads working; guards an unknown table
-                                name, a missing resolved table, and MSigDB
-                                labelling with no collection selected.
+                                bundled human example, at 500 permutations
+                                (200 is now confirmed REJECTED to the new
+                                default of 1000, not silently honored - a
+                                dedicated check for this). Real mygene.info/
+                                STRING/QuickGO calls. Under the corrected,
+                                production-scale-calibrated statistics (see
+                                calibration_network_production_scale.py),
+                                this specific example legitimately produces 0
+                                significant proteins at 500+ permutations -
+                                assertions on hit/recruited/module counts and
+                                caveat presence are REPORT-ONLY or gated on
+                                the real observed count rather than assuming
+                                a positive result, so the suite stays honest
+                                either way. Confirms mapping coverage,
+                                transcriptomics-shaped hit columns (no
+                                "UniProt ID"), a real subnetwork edge list,
+                                direction-composition columns, full
+                                reproducibility parameters, and each of the
+                                (up to) 3 CSV downloads working; guards an
+                                unknown table name, a missing resolved table,
+                                MSigDB labelling with no collection selected,
+                                and (new) that a "which=modules" download
+                                correctly returns 400 when a run produced no
+                                modules. live_e2e_transcriptomics_network_
+                                mouse.py below is the reference for what a
+                                genuine positive result looks like under this
+                                same, fully-corrected engine.
 
-live_exercise_transcriptomics_network_branches.py  18 checks. Exercises
+live_exercise_transcriptomics_network_branches.py  16 checks. Exercises
                                 branches of the Network module that existed
                                 but had never actually RUN even once: a real
                                 abs_metric-weighted run (a real winsorization
@@ -346,7 +430,12 @@ live_exercise_transcriptomics_network_branches.py  18 checks. Exercises
                                 STRING can never recognise, confirming
                                 map_de_table_to_string resolves them ONLY
                                 through the alias tiers and lands on the
-                                correct protein.
+                                correct protein. Uses n_permutations=500 (was
+                                100, itself always an invalid value silently
+                                rejected to whichever default was active -
+                                corrected here to the real evidence-supported
+                                floor, restoring the "keep it fast" intent
+                                without asserting an invalid setting).
 
 live_e2e_transcriptomics_network_mouse.py  12 checks. A full real run on a
                                 SECOND organism (mouse, taxon 10090), kept in
@@ -361,7 +450,14 @@ live_e2e_transcriptomics_network_mouse.py  12 checks. A full real run on a
                                 (not a leftover human session), a real
                                 ~16,000-protein mouse network gets built,
                                 29/30 genes map, and hits/modules are
-                                produced.
+                                produced (13 hits, 12 recruited at time of
+                                writing, under the same corrected, skew-aware
+                                statistics as the human example above) - the
+                                canonical proof that this module's positive
+                                capability still works end to end, now that
+                                the bundled human example alone legitimately
+                                shows 0 hits at production-calibrated
+                                permutation counts.
 
 live_msigdb_urls.py             49 checks. LIVE network test: every pinned
                                 MSigDB URL (14 available collection/organism
@@ -441,7 +537,7 @@ playwright_genomics_results_cards.py  13 checks. The FIRST browser coverage
                                 synthetic STATE injection, which would risk
                                 silently drifting from the real payload shape
                                 and giving false confidence).
-playwright_transcriptomics_network.py  42 checks. The FIRST real-browser
+playwright_transcriptomics_network.py  37 checks. The FIRST real-browser
                                 coverage of the Transcriptomics Network /
                                 Module Detection tile - the fourth
                                 Transcriptomics analysis, replacing the
@@ -449,27 +545,40 @@ playwright_transcriptomics_network.py  42 checks. The FIRST real-browser
                                 placeholder. Drives the real flow (tile ->
                                 organism selector scoped to STRING, not the
                                 whole UniProt taxonomy -> resolve -> config ->
-                                run -> results) and asserts actual CONTENT,
-                                not just that panes exist: transcriptomics-
-                                shaped hit columns, recruited genes present,
-                                every module row internally consistent
-                                (Seeds + Recruited == Size), both figures
-                                rendering, and the seed-circularity caveat
-                                reaching the screen. Also covers three
+                                run -> results) at 500 permutations and
+                                asserts actual CONTENT, not just that panes
+                                exist: transcriptomics-shaped hit columns and
+                                the null-distribution figure rendering. Under
+                                the corrected, production-scale-calibrated
+                                statistics, this specific real run legitimately
+                                produces 0 significant proteins - so hit/
+                                recruited/caveat/module/network-figure
+                                assertions are REPORT-ONLY or gated on the
+                                real observed count (stats["hits"]>0,
+                                stats["seedHits"]>0, stats["recruitedAll
+                                Family"]>0) rather than assuming a positive
+                                result, keeping the suite honest either way
+                                rather than loosened. Also covers three
                                 evaluation fixes verified on this SAME real
-                                run: (3a) a genuinely underflowed FDR (the run
-                                really does produce one) renders "< 1e-300" on
-                                screen, never the pre-fix "0.000e+0", while
-                                the CSV download keeps full precision; (3b)
-                                the "recruited only" Hit table toggle defaults
-                                ON with recruited genes present, shows EXACTLY
-                                the recruited rows with zero seed leakage when
-                                checked, the full network when unchecked, and
-                                never affects the CSV; (3c) the on-screen
-                                caveat's own parsed numbers (534/571/37) match
-                                the payload's n_hits_seed/n_hits/n_recruited
-                                exactly, confirming the 3b toggle never
-                                touches the underlying counts.
+                                run: (3a) a genuinely underflowed FDR renders
+                                "< 1e-300" on screen, never the pre-fix
+                                "0.000e+0", while the CSV download keeps full
+                                precision (asserted unconditionally, not
+                                data-dependent); (3b) the "recruited only" Hit
+                                table toggle's default state matches whether
+                                recruited genes actually exist
+                                (toggle_state == stats["recruited"]>0), with a
+                                full branch for the zero-recruited case
+                                (verifies default OFF, full table shown, and
+                                that checking it correctly empties the table
+                                to 0 rows) and, symmetrically, would verify
+                                the positive-path filtering if a run produces
+                                recruited genes; (3c) the on-screen caveat's
+                                own parsed numbers match the payload's
+                                n_hits_seed/n_hits/n_recruited_all_family
+                                exactly, each check independently gated on
+                                whether that specific caveat is expected to
+                                appear at all.
 test_organism_allowlist_mirror.py  7 checks. Guards a drift risk found while
                                 auditing organism generality: several
                                 per-database organism allowlists are
@@ -596,8 +705,8 @@ in one never hides another. From the repo root, with the server up:
     Get-ChildItem tests\*.py | ForEach-Object { python $_.FullName }
 
 Expected totals as of the last full run, in file-listing order: 117, 22, 16,
-4, 15, 5, 16, 10, 24, 45, 37, 49, 52, 8, 21, 15, 12, 12, 22, 23, 18, 12, 49,
-90, 13, 42, 7, 4, 15, 68 - all passing (843 checks across 30 files).
+4, 15, 5, 16, 10, 24, 58, 44, 49, 52, 8, 21, 15, 12, 12, 22, 22, 16, 12, 49,
+90, 13, 37, 7, 4, 15, 68 - all passing (855 checks across 30 files).
 
 A NOTE ON WRITING NEW CHECKS HERE. Prefer assertions that can actually fail
 for the reason you care about. A concrete example lives in
