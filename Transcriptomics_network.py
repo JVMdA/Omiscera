@@ -109,7 +109,7 @@ NETWORK_ENRICHMENT_DATABASE_DEFAULT = "GO"
 
 HIT_COLUMNS = [
     "STRING ID", "Gene Symbol", "Mapped via", "log2FC", "padj",
-    "Propagated score", "Z-score", "p-value", "FDR", "Seed", "Seed score",
+    "Propagated score", "Z-score", "p-value", "Empirical p-value", "FDR", "Seed", "Seed score",
 ]
 MODULE_COLUMNS = [
     "Module ID", "Size", "Seeds", "Recruited", "Up", "Down", "Mean log2FC",
@@ -667,6 +667,7 @@ def run_network_analysis(
             "Propagated score": float(core["observed"][i]),
             "Z-score": float(core["zscores"][i]),
             "p-value": float(core["pvalues"][i]),
+            "Empirical p-value": float(core["pvalues_empirical"][i]),
             "FDR": float(core["fdrs"][i]),
             "Seed": bool(is_seed),
             "Seed score": float(seed_idx_score[i]) if is_seed else None,
@@ -697,11 +698,21 @@ def run_network_analysis(
         )
     skew = core["null_skew_at_max"]
     if abs(skew) > 1.0:
-        caveats.append(
-            f"The permutation null is right-skewed (skewness {skew:.2f} at the top-scoring protein), while "
-            f"the p-values assume a normal null. Treat the exact p-values and FDRs as approximate; the "
-            f"RANKING is far more trustworthy than the absolute significance."
-        )
+        if core["n_gamma_tail"] > 0:
+            caveats.append(
+                f"The permutation null is right-skewed (skewness {skew:.2f} at the top-scoring protein). "
+                f"p-values account for this with a skew-aware (Pearson III) fit for "
+                f"{core['n_gamma_tail']} of {graph['n_proteins']} proteins whose null was skewed enough "
+                f"to fit reliably; the rest use the normal approximation. Treat the RANKING as more "
+                f"reliable than any single protein's exact FDR."
+            )
+        else:
+            caveats.append(
+                f"The permutation null is right-skewed (skewness {skew:.2f} at the top-scoring protein), "
+                f"but the skew-aware fit could not be applied and p-values fall back to the normal "
+                f"approximation. Treat the exact p-values and FDRs as approximate; the RANKING is far "
+                f"more trustworthy than the absolute significance."
+            )
     if n_unnamed:
         caveats.append(
             f"{n_unnamed} protein(s) in this network have no gene name in STRING and are shown as "
@@ -764,6 +775,7 @@ def run_network_analysis(
             "null_diagnostics": {
                 "n_exceed_top": core["n_exceed_top"],
                 "null_skew_at_max": core["null_skew_at_max"],
+                "n_gamma_tail": core["n_gamma_tail"],
                 "n_permutations": core["n_permutations"],
             },
         },

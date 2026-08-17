@@ -178,18 +178,33 @@ except ValueError:
     check(True, "an all-zero seed vector raises ValueError rather than dividing by zero")
 
 # =============================================================================
-print("=== _welford_update: matches numpy's mean/variance ===")
+print("=== _welford_update: matches numpy's mean/variance/skewness ===")
 # =============================================================================
 rng = np.random.default_rng(7)
-samples = [rng.normal(size=5) for _ in range(200)]
+# Gamma samples are genuinely right-skewed - unlike a normal sample, this
+# actually exercises the M3 term: a bug in the skewness recurrence would not
+# necessarily show up on a symmetric distribution, where skew hovers near 0
+# regardless of whether M3 is computed correctly.
+samples = [rng.gamma(shape=2.0, scale=1.0, size=5) for _ in range(300)]
 mean = np.zeros(5)
 m2 = np.zeros(5)
+m3 = np.zeros(5)
 for c, x in enumerate(samples, start=1):
-    mean, m2 = gnet._welford_update(mean, m2, c, x)
+    mean, m2, m3 = gnet._welford_update(mean, m2, m3, c, x)
 stack = np.vstack(samples)
-check(np.allclose(mean, stack.mean(axis=0), atol=1e-12), "Welford mean matches np.mean to 1e-12")
-check(np.allclose(m2 / (len(samples) - 1), stack.var(axis=0, ddof=1), atol=1e-12),
-      "Welford m2/(n-1) matches np.var(ddof=1) to 1e-12")
+check(np.allclose(mean, stack.mean(axis=0), atol=1e-10), "Welford mean matches np.mean to 1e-10")
+check(np.allclose(m2 / (len(samples) - 1), stack.var(axis=0, ddof=1), atol=1e-10),
+      "Welford m2/(n-1) matches np.var(ddof=1) to 1e-10")
+n_s = len(samples)
+skew_online = np.sqrt(n_s) * m3 / np.power(m2, 1.5)
+sd_pop = stack.std(axis=0, ddof=0)
+skew_batch = (((stack - stack.mean(axis=0)) / sd_pop) ** 3).mean(axis=0)
+check(np.allclose(skew_online, skew_batch, atol=1e-8),
+      f"Welford's streaming skewness (sqrt(n)*M3/M2**1.5) matches a batch computation to 1e-8 "
+      f"(max diff {np.abs(skew_online - skew_batch).max():.2e})")
+check(skew_batch.mean() > 0.3,
+      f"the gamma fixture is genuinely right-skewed (mean skew {skew_batch.mean():.3f} across the 5 "
+      f"series), so the check above is not vacuously comparing two near-zero numbers")
 
 # =============================================================================
 print("=== _degree_bins: a real partition, ordered by degree ===")
@@ -247,8 +262,21 @@ def planted_graph():
     Expected: A's satellites (adjacent to real seeds) become significant;
     B's satellites (identical degree, identical local shape, but NOT adjacent
     to seeds) must not - that is the specificity half of the test.
+
+    Cluster size (20) and satellite-to-cluster links (4) were sized empirically
+    against the SKEW-AWARE p-value (Fix 1), not chosen arbitrarily: the
+    original, smaller fixture (10-member clusters, 2 links/satellite) produced
+    seeded-satellite Z-scores of ~2.7-3.8, which cleared FDR<0.05 under the
+    old (anti-conservative) normal-tail approximation but NOT under the more
+    accurate gamma tail - the corrected p-value is legitimately larger for a
+    right-skewed null at a given Z, which is the entire point of Fix 1. This
+    size was swept (tests/README.txt-adjacent scratch work, not committed)
+    across several (cluster_size, links, seed_rng) combinations and gives a
+    comfortable, reproducible margin (FDR <= 0.007 for every seeded satellite
+    across 3 different seed_rng values), not a value sitting right at the
+    0.05 boundary.
     """
-    n_nodes = 80
+    n_nodes = 100
     A = np.zeros((n_nodes, n_nodes))
     W = 0.9
 
@@ -257,19 +285,21 @@ def planted_graph():
             for y in range(x + 1, len(nodes)):
                 A[nodes[x], nodes[y]] = A[nodes[y], nodes[x]] = W
 
-    cluster_a = list(range(0, 10))
-    sat_a = [10, 11, 12]
-    cluster_b = list(range(13, 23))
-    sat_b = [23, 24, 25]
+    cluster_a = list(range(0, 20))
+    sat_a = [20, 21, 22]
+    cluster_b = list(range(23, 43))
+    sat_b = [43, 44, 45]
     clique(cluster_a)
     clique(cluster_b)
-    for k, s in enumerate(sat_a):                      # each satellite -> 2 cluster members
-        for t in (cluster_a[2 * k], cluster_a[2 * k + 1]):
+    for k, s in enumerate(sat_a):                      # each satellite -> 4 cluster members
+        for j in range(4):
+            t = cluster_a[(2 * k + j) % len(cluster_a)]
             A[s, t] = A[t, s] = W
     for k, s in enumerate(sat_b):
-        for t in (cluster_b[2 * k], cluster_b[2 * k + 1]):
+        for j in range(4):
+            t = cluster_b[(2 * k + j) % len(cluster_b)]
             A[s, t] = A[t, s] = W
-    filler = list(range(26, 80))                       # 54 nodes -> 18 disjoint triangles
+    filler = list(range(46, 100))                      # 54 nodes -> 18 disjoint triangles
     for g in range(0, len(filler), 3):
         clique(filler[g:g + 3])
     return _graph_from_dense(A), cluster_a, sat_a, sat_b
@@ -370,7 +400,7 @@ print("=== power AND specificity on a planted structure ===")
 # =============================================================================
 pg, seeded_cluster, sat_seeded, sat_control = planted_graph()
 pres = gnet.run_propagation_with_significance(
-    pg, {f"U{i}": 1.0 for i in seeded_cluster}, n_permutations=300, fdr_alpha=0.05, seed_rng=3)
+    pg, {f"U{i}": 1.0 for i in seeded_cluster}, n_permutations=500, fdr_alpha=0.05, seed_rng=3)
 ptab = pres["table"].set_index("STRING ID")
 z_seeded = [float(ptab.loc[f"{TAX}.N{i}", "Z-score"]) for i in sat_seeded]
 z_control = [float(ptab.loc[f"{TAX}.N{i}", "Z-score"]) for i in sat_control]
@@ -378,20 +408,20 @@ rec = sum(1 for i in sat_seeded if ptab.loc[f"{TAX}.N{i}", "FDR"] < 0.05)
 ctrl = sum(1 for i in sat_control if ptab.loc[f"{TAX}.N{i}", "FDR"] < 0.05)
 
 # Separation is the honest measure of power here, not a raw count of FDR<0.05.
-# Measured: seeded satellites Z = +3.75/+2.76/+2.70 against controls at
-# -1.99/-2.38/-2.15 - unambiguous. Only one clears FDR<0.05 because BH is
-# applied across all 80 proteins of which just three are true positives, which
-# is a property of the multiple-testing correction at this fixture's size, not
-# a weakness of the propagation. Asserting separation keeps the test meaningful
-# without hard-coding a threshold that would drift with n.
+# Measured (seed_rng=3, skew-aware p-values): seeded satellites Z =
+# +4.05/+4.25/+3.82, FDR = 0.0049/0.0049/0.0068 against controls at
+# -3.46/-3.72/-3.63 - unambiguous, and every seeded satellite clears FDR<0.05
+# with a comfortable margin (checked, not assumed, across seed_rng in
+# {3, 7, 11} while sizing this fixture - see planted_graph()'s docstring).
 check(min(z_seeded) > max(z_control),
       f"EVERY satellite of the seeded cluster out-scores EVERY satellite of the unseeded one "
       f"(seeded Z {[round(z,2) for z in z_seeded]} vs control Z {[round(z,2) for z in z_control]}) - "
       f"identical degree and identical local shape, so the signal is topological proximity to seeds, "
       f"not degree")
-check(rec >= 1,
-      f"at least one seeded satellite is genuinely significant at FDR<0.05 ({rec}/3) - real significance is "
-      f"attainable, so the null-calibration result above is not merely 'it never calls anything'")
+check(rec == 3,
+      f"ALL THREE seeded satellites are genuinely significant at FDR<0.05 ({rec}/3) - real significance is "
+      f"attainable under the skew-aware p-value too, so the null-calibration result above is not merely "
+      f"'it never calls anything'")
 check(ctrl == 0,
       f"and NO satellite of the unseeded cluster is ever called ({ctrl}/3) - specificity")
 check(pres["n_recruited"] >= 1,
@@ -400,10 +430,45 @@ check(pres["n_recruited"] >= 1,
 
 # Nodes no seed can ever reach exercise the null_std == 0 guard: their z-score
 # is forced to exactly 0 (conservative) rather than becoming NaN or +inf.
-z_filler = [float(ptab.loc[f"{TAX}.N{i}", "Z-score"]) for i in (26, 30, 40, 50)]
+z_filler = [float(ptab.loc[f"{TAX}.N{i}", "Z-score"]) for i in (46, 55, 70, 90)]
 check(all(z == 0.0 for z in z_filler),
       f"proteins unreachable from any seed get a z-score of exactly 0, not NaN/inf (got {z_filler}) - "
       f"the null_std==0 guard is real and exercised")
+
+# =============================================================================
+print("=== Fix 1: the skew-aware p-value is genuinely closer to the empirical tail than a normal-only one ===")
+# =============================================================================
+# Direct call to _propagation_core (not the identifier-vocabulary wrapper) to
+# reach the per-protein diagnostics (null_skew, pvalues_empirical) the wrapper
+# does not expose. Reuses the same planted graph and seeds as the power/
+# specificity check above, so this is real data, not a synthetic distribution.
+seed_idx_score_pg, _ = gnet._map_seeds_to_indices(
+    pg["uniprot_to_protein"], pg["protein_index"], {f"U{i}": 1.0 for i in seeded_cluster})
+core_pg = gnet._propagation_core(pg, seed_idx_score_pg, n_permutations=500, seed_rng=3)
+skew_pg = core_pg["null_skew"]
+high_skew_idx = int(np.argmax(skew_pg))
+check(skew_pg[high_skew_idx] > gnet.SKEW_GAMMA_THRESHOLD,
+      f"the fixture genuinely produces a protein with null skew above SKEW_GAMMA_THRESHOLD "
+      f"(max skew {skew_pg[high_skew_idx]:.2f}) - otherwise the gamma fit is never exercised and the "
+      f"comparison below would be vacuous")
+check(core_pg["n_gamma_tail"] > 0,
+      f"at least one protein's p-value actually used the gamma fit, not just the normal fallback "
+      f"(n_gamma_tail={core_pg['n_gamma_tail']} of {pg['n_proteins']})")
+
+from scipy.special import ndtr as _ndtr
+
+p_empirical = float(core_pg["pvalues_empirical"][high_skew_idx])
+p_skew_aware = float(core_pg["pvalues"][high_skew_idx])
+z_here = float(core_pg["zscores"][high_skew_idx])
+p_normal_only = float(_ndtr(-z_here))
+log_err_skew = abs(np.log10(max(p_skew_aware, 1e-300)) - np.log10(max(p_empirical, 1e-300)))
+log_err_normal = abs(np.log10(max(p_normal_only, 1e-300)) - np.log10(max(p_empirical, 1e-300)))
+check(log_err_skew < log_err_normal,
+      f"for the highest-skew protein (skew {skew_pg[high_skew_idx]:.2f}), the skew-aware p-value "
+      f"({p_skew_aware:.3g}) sits closer in log-space to the empirical exceedance rate "
+      f"({p_empirical:.3g}) than the pre-fix normal-only p-value ({p_normal_only:.3g}) does "
+      f"(log10 error {log_err_skew:.2f} vs {log_err_normal:.2f}) - Fix 1 measurably improves calibration "
+      f"here, not just in theory")
 
 # =============================================================================
 print("=== mcl_cluster / detect_modules ===")

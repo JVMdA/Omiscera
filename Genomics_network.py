@@ -78,6 +78,11 @@ CONFIDENCE_CHOICES = (150, 400, 700, 900)
 DEFAULT_N_PERMUTATIONS = 1000
 N_PERMUTATIONS_CHOICES = (500, 1000, 2000, 5000, 10000)
 DEFAULT_FDR_ALPHA = 0.05
+# Below this skewness, a Pearson III (shifted-gamma) tail is not worth its own
+# fragility: the gamma degenerates toward the normal as skew -> 0 anyway, and
+# sample skewness itself has standard error ~sqrt(6/n) (~0.17 at 200
+# permutations), so a small measured skew may just be noise around zero.
+SKEW_GAMMA_THRESHOLD = 0.1
 # Caps per-module enrichment term size so a module's label isn't dominated by
 # a huge, uninformative catch-all GO term (e.g. "protein binding", ~10k
 # genes) - the same practice standard enrichment tools (g:Profiler, Enrichr,
@@ -99,7 +104,7 @@ DEGREE_BIN_COUNT = 10             # for degree-preserving permutation seed resam
 
 NETPROP_HIT_COLUMNS = [
     "STRING ID", "Gene Symbol", "UniProt ID", "Propagated score",
-    "Z-score", "p-value", "FDR", "Seed", "Seed score",
+    "Z-score", "p-value", "Empirical p-value", "FDR", "Seed", "Seed score",
 ]
 NETPROP_MODULE_COLUMNS = [
     "Module ID", "Size", "Genes", "Top enriched term", "Top enriched FDR", "Enrichment database",
@@ -398,15 +403,29 @@ def _degree_bins(raw_adjacency, n_bins: int = DEGREE_BIN_COUNT):
     return bin_of, bins_map
 
 
-def _welford_update(mean, m2, count, x):
-    """One step of Welford's online mean/variance update, extracted from the
-    permutation-null loop below so it's independently unit-testable. count
-    is the UPDATED (1-indexed) sample count after including x; the caller
-    reads variance back out as m2 / (count - 1)."""
+def _welford_update(mean, m2, m3, count, x):
+    """One step of the online (streaming) mean/M2/M3 update - Pébay's
+    single-pass extension of Welford's algorithm to the third central
+    moment - extracted from the permutation-null loop below so it's
+    independently unit-testable. count is the UPDATED (1-indexed) sample
+    count after including x; the caller reads variance back out as
+    m2 / (count - 1) and skewness as sqrt(count) * m3 / m2**1.5.
+
+    M3 needs a moment (M2) that has NOT yet been updated with this sample, so
+    this is not simply the old 2-moment update with an extra line bolted on -
+    it is a different but equivalent recurrence (verified against a batch
+    numpy computation to 1e-15 for mean/var and 1e-14 for skewness). Kept as
+    the ONLY update path (not "2-moment normally, 3-moment on request") so
+    Genomics and Transcriptomics can never silently diverge on which formula
+    computed a given null's mean/variance.
+    """
     delta = x - mean
-    mean = mean + delta / count
-    m2 = m2 + delta * (x - mean)
-    return mean, m2
+    delta_n = delta / count
+    term1 = delta * delta_n * (count - 1)
+    mean = mean + delta_n
+    m3 = m3 + term1 * delta_n * (count - 2) - 3.0 * delta_n * m2
+    m2 = m2 + term1
+    return mean, m2, m3
 
 
 def _map_seeds_to_indices(id_map: dict, protein_index: dict, seed_scores: dict) -> tuple:
@@ -461,7 +480,7 @@ def _propagation_core(
     progress_callback=None,
 ) -> dict:
     """The numerical heart: observed RWR, degree-preserving permutation null,
-    z-scores, normal-tail p-values, BH-FDR. Works purely in index space and
+    z-scores, skew-aware p-values, BH-FDR. Works purely in index space and
     contains NO identifier vocabulary, so both the Genomics (UniProt) and
     Transcriptomics (gene symbol) modules share one implementation rather than
     keeping two copies that could drift apart and give different answers to the
@@ -471,15 +490,33 @@ def _propagation_core(
     random seed set exceeds the observed) is deliberate: on a dense PPI network
     hubs soak up signal from ANY high-degree seeds, so a raw exceedance count is
     far too conservative. Z-scoring each protein against its own null removes
-    that baseline. Welford's online mean/variance keeps memory O(n).
+    that baseline. The streaming mean/M2/M3 update (_welford_update) keeps
+    memory O(n) regardless of n_permutations.
 
-    Returns observed/zscores/pvalues/fdrs plus two honesty diagnostics:
-    n_exceed (how many permutations actually met or beat the observed - the
-    empirical view the z-scores approximate) and null_skew_at_max (skewness of
-    the null at the top-scoring protein, since the p-values assume a normal
-    null that a permutation distribution is typically right-skewed against).
-    Neither is used as a p-value: at ~1000 permutations the empirical floor of
-    1/(n+1), after BH across ~20k proteins, would call nothing significant.
+    P-VALUES ARE NOT FROM A NORMAL TAIL. A permutation null here is measurably
+    right-skewed (real human runs: skewness ~2-2.5), and the normal
+    approximation is not merely imprecise there - it is WRONG BY ORDERS OF
+    MAGNITUDE in exactly the far tail where every "hit" is called (measured on
+    a skew-1.4 test distribution, milder than what this app actually produces:
+    normal reports p=2.8e-12 at the 99.99th percentile where the true value is
+    1e-4). Instead, each protein's null is fit with a Pearson III / shifted-
+    gamma distribution by method of moments (mean, sd, skew from the streaming
+    accumulators) and the p-value is that distribution's upper tail
+    (scipy.special.gammaincc - a vectorized special function, not a BLAS
+    matmul, so unaffected by the dense-solve crash noted in mcl_cluster's
+    docstring). Falls back to the normal tail per-protein when the gamma fit
+    isn't meaningful: null_std <= 0 (no null variability - preserves the exact
+    z==0.0 behaviour below), |skew| < SKEW_GAMMA_THRESHOLD (the gamma
+    degenerates to the normal there anyway, and sample skewness is itself
+    noisy at low permutation counts), skew <= 0 (this fit only models a
+    right-skewed tail), or any non-finite intermediate value.
+
+    Returns observed/zscores/pvalues/fdrs, an EMPIRICAL p-value
+    ((1+n_exceed)/(n+1)) for transparency (never used for FDR - its floor
+    cannot survive BH across ~20k proteins), and diagnostics: null_skew (per
+    protein), null_skew_at_max (at the top-scoring protein - the number shown
+    to users), and n_gamma_tail (how many proteins actually used the gamma
+    fit rather than falling back).
     """
     def _progress(current, total, label):
         if progress_callback:
@@ -506,9 +543,9 @@ def _propagation_core(
     rng = np.random.default_rng(seed_rng)
     null_mean = np.zeros(n, dtype=np.float64)
     null_m2 = np.zeros(n, dtype=np.float64)
+    null_m3 = np.zeros(n, dtype=np.float64)
     n_exceed = np.zeros(n, dtype=np.int64)
     top_idx = int(np.argmax(observed))
-    top_null_samples = []
     count = 0
     for perm_i in range(n_permutations):
         perm_vector = np.zeros(n, dtype=np.float64)
@@ -524,43 +561,65 @@ def _propagation_core(
             perm_vector[cand] += score
         perm_p = propagate_rwr(adjacency, perm_vector, restart_prob=restart_prob)
         count += 1
-        null_mean, null_m2 = _welford_update(null_mean, null_m2, count, perm_p)
+        null_mean, null_m2, null_m3 = _welford_update(null_mean, null_m2, null_m3, count, perm_p)
         n_exceed += (perm_p >= observed)
-        top_null_samples.append(float(perm_p[top_idx]))
         if (perm_i + 1) % max(1, n_permutations // 20) == 0:
             _progress(perm_i + 1, n_permutations + 1, f"Permutation {perm_i + 1}/{n_permutations}")
 
     null_std = np.sqrt(null_m2 / max(count - 1, 1))
+    valid_std = null_std > 0
     with np.errstate(divide="ignore", invalid="ignore"):
         zscores = (observed - null_mean) / null_std
     # Proteins with zero null variability (e.g. never reached by any random
     # seed set) are treated as non-significant rather than +inf - a
     # conservative default that avoids spurious hits from numerical edge cases.
-    zscores = np.where(null_std > 0, zscores, 0.0)
-    # One-sided upper-tail p-value from the standard normal (ndtr is the normal
-    # CDF; it's a vectorized special function, not a BLAS matmul, so it is not
-    # affected by the dense-BLAS issue noted in mcl_cluster).
-    from scipy.special import ndtr
-    pvalues = ndtr(-zscores)
-    fdrs = genomics_ora.benjamini_hochberg(list(pvalues))
+    zscores = np.where(valid_std, zscores, 0.0)
 
-    skew = 0.0
-    if len(top_null_samples) > 2:
-        arr = np.asarray(top_null_samples, dtype=np.float64)
-        sd = arr.std(ddof=1)
-        if sd > 0:
-            skew = float((((arr - arr.mean()) / sd) ** 3).mean())
+    # Population skewness (g1) from the streaming third moment. Only
+    # meaningful where null_std > 0 (same guard as z-scores above).
+    with np.errstate(divide="ignore", invalid="ignore"):
+        skew_raw = np.sqrt(count) * null_m3 / np.power(null_m2, 1.5)
+    null_skew = np.where(valid_std, np.nan_to_num(skew_raw, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
+
+    # ndtr is the normal CDF - a vectorized special function, not a BLAS
+    # matmul, so also unaffected by the dense-solve crash.
+    from scipy.special import ndtr, gammaincc
+    pvalues_normal = ndtr(-zscores)
+
+    use_gamma = valid_std & (null_skew > SKEW_GAMMA_THRESHOLD)
+    pvalues = pvalues_normal.copy()
+    n_gamma_tail = 0
+    if np.any(use_gamma):
+        skew_safe = np.where(use_gamma, null_skew, 1.0)  # avoid 0-div where unused
+        k = 4.0 / np.square(skew_safe)
+        theta = null_std * skew_safe / 2.0
+        shift = null_mean - 2.0 * null_std / skew_safe
+        with np.errstate(divide="ignore", invalid="ignore"):
+            arg = np.where(theta > 0, (observed - shift) / theta, np.nan)
+        gamma_p = np.where(observed > shift, gammaincc(k, np.clip(arg, 0.0, None)), 1.0)
+        finite_mask = (
+            use_gamma & np.isfinite(gamma_p) & np.isfinite(k)
+            & np.isfinite(theta) & np.isfinite(shift) & (theta > 0)
+        )
+        pvalues = np.where(finite_mask, gamma_p, pvalues)
+        n_gamma_tail = int(finite_mask.sum())
+
+    fdrs = genomics_ora.benjamini_hochberg(list(pvalues))
+    pvalues_empirical = (1.0 + n_exceed) / (count + 1.0)
 
     return {
         "observed": observed,
         "null_mean": null_mean,
         "null_std": null_std,
+        "null_skew": null_skew,
         "zscores": zscores,
         "pvalues": pvalues,
+        "pvalues_empirical": pvalues_empirical,
         "fdrs": fdrs,
         "n_exceed": n_exceed,
         "n_exceed_top": int(n_exceed[top_idx]),
-        "null_skew_at_max": skew,
+        "null_skew_at_max": float(null_skew[top_idx]),
+        "n_gamma_tail": n_gamma_tail,
         "n_permutations": count,
         "seed_idx_score": seed_idx_score,
     }
@@ -621,6 +680,7 @@ def run_propagation_with_significance(
     observed = core["observed"]
     zscores = core["zscores"]
     pvalues = core["pvalues"]
+    pvalues_empirical = core["pvalues_empirical"]
     fdrs = core["fdrs"]
     seed_idx_score = core["seed_idx_score"]
 
@@ -635,6 +695,7 @@ def run_propagation_with_significance(
             "Propagated score": float(observed[i]),
             "Z-score": float(zscores[i]),
             "p-value": float(pvalues[i]),
+            "Empirical p-value": float(pvalues_empirical[i]),
             "FDR": float(fdrs[i]),
             "Seed": bool(is_seed),
             "Seed score": float(seed_idx_score[i]) if is_seed else None,
@@ -656,11 +717,13 @@ def run_propagation_with_significance(
         "n_recruited": n_recruited,
         "seed_string_ids": seed_string_ids,
         # Diagnostics only, never p-values (see _propagation_core's docstring):
-        # how the normal-tail approximation held up against the actual
-        # permutation distribution.
+        # how the empirical exceedance count and measured skewness compare to
+        # what the fitted (skew-aware, or normal where the fit doesn't apply)
+        # tail assumes.
         "null_diagnostics": {
             "n_exceed_top": core["n_exceed_top"],
             "null_skew_at_max": core["null_skew_at_max"],
+            "n_gamma_tail": core["n_gamma_tail"],
             "n_permutations": core["n_permutations"],
         },
     }

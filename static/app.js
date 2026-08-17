@@ -4901,9 +4901,11 @@ function renderTranscriptomicsNetworkResultsScreen() {
     const nd = prop.null_diagnostics || {};
     overview.appendChild(el("div", { class: "caption" },
         "Significance comes from " + (nd.n_permutations || params.n_permutations || "?") + " degree-preserving " +
-        "permutations. p-values assume a normal null; the measured null skewness at the top protein was " +
+        "permutations. p-values use a skew-aware (Pearson III) fit where the null is skewed enough to fit " +
+        "reliably (" + (nd.n_gamma_tail || 0) + " of " + (prop.n_proteins || "?") + " proteins here), falling " +
+        "back to the normal approximation otherwise. Measured null skewness at the top protein was " +
         (nd.null_skew_at_max !== undefined && nd.null_skew_at_max !== null ? Number(nd.null_skew_at_max).toFixed(2) : "n/a") +
-        " (0 = perfectly normal), so treat the ranking as more reliable than the exact FDR values."));
+        " (0 = perfectly normal); treat the ranking as more reliable than any single protein's exact FDR."));
 
     // ----- Gene mapping -----
     const mapPane = nav.pane("Gene mapping");
@@ -4936,7 +4938,7 @@ function renderTranscriptomicsNetworkResultsScreen() {
         "cutoffs; rows with no log2FC/padj were never in your table at all - those are the recruited ones."));
     const hitAlpha = params.fdr_alpha || 0.05;
     const hitCellFormatFn = (col, val) => {
-        if (col === "p-value" || col === "FDR" || col === "padj") return _fmtSci(val, 3);
+        if (col === "p-value" || col === "Empirical p-value" || col === "FDR" || col === "padj") return _fmtSci(val, 3);
         if (col === "Propagated score") {
             if (val === "") return "";
             const num = Number(val);
@@ -9718,6 +9720,16 @@ function renderNetpropAnalysisResultsScreen() {
     hitPane.appendChild(buildTable(prop.table, {
         rowClassFn: (row) => (Number(row["FDR"]) < ((payload.parameters && payload.parameters.fdr_alpha) || 0.05) ? "row-significant" : null),
         maxHeight: 480,
+        cellFormatFn: (col, val) => {
+            if (col === "p-value" || col === "Empirical p-value" || col === "FDR") return _fmtSci(val, 3);
+            if (col === "Propagated score") {
+                if (val === "") return "";
+                const num = Number(val);
+                return isFinite(num) ? num.toExponential(2) : val;
+            }
+            if (col === "Z-score" || col === "Seed score") return _fmtFixed(val, 2);
+            return val;
+        },
     }));
     const hitDl = el("button", { class: "btn" }, "Download hit table (CSV)");
     hitDl.addEventListener("click", () => downloadFile("/api/netprop/analysis/download/hits.csv", "network_propagation_hits.csv"));
