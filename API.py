@@ -1563,11 +1563,15 @@ def _job_run_netprop(job_id: str, session: dict) -> dict:
         for mod in modules:
             genes = [graph["protein_gene"].get(sid, sid) for sid in mod["string_ids"]]
             e = enr.get(mod["module_id"])
-            top_term, top_fdr, enr_db = "", None, ""
+            top_term, top_fdr, top_fdr_raw, enr_db = "", None, None, ""
             if e and e["block"] is not None and not e["block"]["table"].empty:
                 top = e["block"]["table"].iloc[0]
                 top_term = str(top["Term Name"])
-                top_fdr = float(top["FDR"])
+                top_fdr_raw = float(top["FDR"])
+                # Corrected for having picked the best of N namespaces per
+                # module - see Genomics_network.enrich_modules. The raw,
+                # within-namespace value is kept alongside for reference.
+                top_fdr = float(e["top_fdr_corrected"])
                 enr_db = f'{params["enrichment_database"]}:{e["namespace"]}' if e.get("namespace") else params["enrichment_database"]
                 # Ship the module's full enrichment table (trimmed to the top 50
                 # rows, already FDR-sorted) so the results screen can draw a
@@ -1588,6 +1592,7 @@ def _job_run_netprop(job_id: str, session: dict) -> dict:
                 "Genes": ", ".join(sorted(genes)),
                 "Top enriched term": top_term,
                 "Top enriched FDR": top_fdr,
+                "Top enriched FDR (raw, uncorrected)": top_fdr_raw,
                 "Enrichment database": enr_db,
             })
             module_id_map[mod["module_id"]] = mod["string_ids"]

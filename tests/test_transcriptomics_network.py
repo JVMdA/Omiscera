@@ -400,6 +400,78 @@ check(right_k == 3 and wrong_k == 2,
 check("GENE3" not in wrong_block["table"].iloc[0]["Overlapping Genes"],
       "confirmed: GENE3 is absent from 'Overlapping Genes' under the wrong universe")
 
+# =============================================================================
+print("=== Fix 4: 'Top enriched FDR' corrects for comparing multiple namespaces per module ===")
+# =============================================================================
+# TWO namespaces populated this time (bp AND mf), so the module-labelling
+# step genuinely compares more than one family and the correction factor is
+# visibly not 1. Each namespace also carries a non-overlapping FILLER term
+# (excluded from the result table itself, since it shares no genes with the
+# module - k=0 terms are skipped) purely to widen the ANNOTATED universe
+# beyond the real term's own gene set: with only one term per namespace the
+# annotated universe is defined as exactly that term's genes, making
+# K == N and the hypergeometric test degenerate (p forced to exactly 1.0
+# regardless of overlap) - not what this fixture is meant to demonstrate.
+FAKE_GO_SETS_TWO_NS = {
+    "biological_process": {
+        "GO:BP1": {"name": "BP term", "genes": ["GENE1", "GENE2", "GENE3", "GENE4"]},
+        "GO:BP2": {"name": "BP filler", "genes": ["GENE5", "GENE6", "DUPGENE"]},
+    },
+    "molecular_function": {
+        "GO:MF1": {"name": "MF term", "genes": ["GENE1", "GENE2", "GENE3", "GENE5"]},
+        "GO:MF2": {"name": "MF filler", "genes": ["GENE4", "GENE6", "EGENE9"]},
+    },
+    "cellular_component": {},
+}
+tx.fetch_go_sets = lambda *a, **kw: FAKE_GO_SETS_TWO_NS
+try:
+    enr2 = txnet.enrich_modules_by_symbol(modules, GRAPH, TAX, database="GO", min_term_size=1)
+finally:
+    tx.fetch_go_sets = _real_fetch_go_sets
+
+e = enr2["results"]["M1"]
+check(e is not None and e["n_namespaces_compared"] == 2,
+      f"both populated namespaces (bp, mf) actually got tested for module M1 "
+      f"(n_namespaces_compared={e.get('n_namespaces_compared') if e else None})")
+raw_fdr = float(e["block"]["table"].iloc[0]["FDR"])
+expected_corrected = min(raw_fdr * 2, 1.0)
+check(abs(e["top_fdr_corrected"] - expected_corrected) < 1e-12,
+      f"top_fdr_corrected = min(raw_FDR * n_namespaces_compared, 1.0) = min({raw_fdr:.4g}*2, 1.0) = "
+      f"{expected_corrected:.4g} (got {e['top_fdr_corrected']:.4g})")
+check(abs(e["top_fdr_corrected"] - raw_fdr) > 1e-9,
+      f"SENSITIVITY: the corrected value genuinely differs from the raw, within-namespace value "
+      f"(corrected={e['top_fdr_corrected']:.4g}, raw={raw_fdr:.4g}) - not a no-op relabelling")
+
+print("=== SENSITIVITY: the correction above is not vacuous ===")
+# Break it for real: an uncorrected "best of N" (what this fix replaces)
+# would just report the raw within-namespace FDR as the headline value.
+import Transcriptomics_network as _txnet_src  # noqa: E402  (re-import for clarity, same module)
+_src_before_tx = open(_txnet_src.__file__, "rb").read()
+_orig_enrich = txnet.enrich_modules_by_symbol
+
+
+def _uncorrected_enrich_modules_by_symbol(*a, **kw):
+    result = _orig_enrich(*a, **kw)
+    for mod_id, entry in result["results"].items():
+        if entry is not None:
+            entry["top_fdr_corrected"] = float(entry["block"]["table"].iloc[0]["FDR"])  # pre-fix behaviour
+    return result
+
+
+tx.fetch_go_sets = lambda *a, **kw: FAKE_GO_SETS_TWO_NS
+try:
+    broken_enr = _uncorrected_enrich_modules_by_symbol(modules, GRAPH, TAX, database="GO", min_term_size=1)
+finally:
+    tx.fetch_go_sets = _real_fetch_go_sets
+check(open(_txnet_src.__file__, "rb").read() == _src_before_tx,
+      "the module's source file on disk was never touched by this sensitivity test (monkeypatch only)")
+broken_e = broken_enr["results"]["M1"]
+check(abs(broken_e["top_fdr_corrected"] - broken_e["block"]["table"].iloc[0]["FDR"]) < 1e-12
+      and abs(broken_e["top_fdr_corrected"] - expected_corrected) > 1e-9,
+      f"the PRE-FIX (uncorrected) value equals the raw FDR ({broken_e['top_fdr_corrected']:.4g}), not the "
+      f"corrected value ({expected_corrected:.4g}) this fix produces - proving the checks above are "
+      f"discriminating, not accidentally always true")
+
 TMP.cleanup()
 print("\nTOTAL: %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

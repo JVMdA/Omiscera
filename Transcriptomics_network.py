@@ -114,7 +114,8 @@ HIT_COLUMNS = [
 ]
 MODULE_COLUMNS = [
     "Module ID", "Size", "Seeds", "Recruited", "Up", "Down", "Mean log2FC",
-    "Genes", "Top enriched term", "Top enriched FDR", "Enrichment database",
+    "Genes", "Top enriched term", "Top enriched FDR", "Top enriched FDR (raw, uncorrected)",
+    "Enrichment database",
 ]
 MAPPING_COLUMNS = ["input_id", "gene_symbol", "STRING ID", "Mapped via", "Seed", "Seed score"]
 
@@ -511,18 +512,35 @@ def enrich_modules_by_symbol(modules: list, graph: dict, taxon_id: str,
             if str(protein_gene.get(pid, "")).strip()
         }
         best = None
+        # Only namespaces that actually returned a testable (non-empty)
+        # result for THIS module count toward the correction below - a
+        # namespace with zero eligible terms for this module's genes was
+        # never really "compared", so it must not inflate the penalty.
+        n_tested = 0
         for ns, term_map in term_maps.items():
             block = tx._run_ora_for_sets(term_map, universe_symbols, symbols,
                                          min_term_size, max_term_size, None)
             tbl = block.get("table")
             if tbl is None or tbl.empty:
                 continue
+            n_tested += 1
             top_fdr = float(tbl.iloc[0]["FDR"])
             if best is None or top_fdr < best["top_fdr"]:
                 best = {"namespace": ns, "block": block, "top_fdr": top_fdr}
-        results[mod["module_id"]] = (
-            {"namespace": best["namespace"], "block": best["block"]} if best else None
-        )
+        if best:
+            # Picking the smallest FDR out of n_tested independent namespaces
+            # is itself a selection - an uncorrected "best of N" is
+            # optimistically biased low. Bonferroni-style correction for that
+            # specific selection (not a claim about the terms WITHIN a
+            # namespace, which BH inside _run_ora_for_sets already handles).
+            results[mod["module_id"]] = {
+                "namespace": best["namespace"],
+                "block": best["block"],
+                "top_fdr_corrected": min(best["top_fdr"] * n_tested, 1.0),
+                "n_namespaces_compared": n_tested,
+            }
+        else:
+            results[mod["module_id"]] = None
 
     return {
         "results": results,
@@ -533,8 +551,9 @@ def enrich_modules_by_symbol(modules: list, graph: dict, taxon_id: str,
         "selection_caveat": (
             "Modules were selected for being densely connected and carrying propagated signal, and are "
             "only then tested for enrichment. These labels describe what a module contains; they are not "
-            "hypothesis tests, and their FDR is not corrected for having compared "
-            f"{max(len(term_maps), 1)} annotation source(s) per module."
+            "hypothesis tests. 'Top enriched FDR' additionally corrects for comparing multiple annotation "
+            "namespaces/collections per module (min(raw FDR x namespaces compared, 1.0)); the "
+            "uncorrected, within-namespace value is also shown for reference."
         ),
     }
 
@@ -838,10 +857,11 @@ def run_network_analysis(
             finite = [float(v) for v in lfcs if v is not None and pd.notna(v)]
             n_seed = sum(1 for p in pids if p in seed_id_set)
             e = enr["results"].get(mod["module_id"])
-            top_term, top_fdr, db_label = "", None, ""
+            top_term, top_fdr, top_fdr_raw, db_label = "", None, None, ""
             if e and e["block"] is not None and not e["block"]["table"].empty:
                 top = e["block"]["table"].iloc[0]
-                top_term, top_fdr, db_label = top["Term Name"], float(top["FDR"]), e["namespace"]
+                top_term, top_fdr_raw, db_label = top["Term Name"], float(top["FDR"]), e["namespace"]
+                top_fdr = float(e["top_fdr_corrected"])
             module_rows.append({
                 "Module ID": mod["module_id"],
                 "Size": mod["size"],
@@ -854,7 +874,13 @@ def run_network_analysis(
                 "Mean log2FC": round(sum(finite) / len(finite), 4) if finite else None,
                 "Genes": ", ".join(names),
                 "Top enriched term": top_term,
+                # Corrected for having picked the best of N namespaces/
+                # collections per module (see enrich_modules_by_symbol) - the
+                # headline value. The uncorrected, within-namespace value
+                # (already BH-corrected across terms IN that namespace) sits
+                # alongside it for reference.
                 "Top enriched FDR": top_fdr,
+                "Top enriched FDR (raw, uncorrected)": top_fdr_raw,
                 "Enrichment database": db_label,
             })
         payload["modules"] = {

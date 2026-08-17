@@ -107,7 +107,8 @@ NETPROP_HIT_COLUMNS = [
     "Z-score", "p-value", "Empirical p-value", "FDR", "FDR (recruited family)", "Seed", "Seed score",
 ]
 NETPROP_MODULE_COLUMNS = [
-    "Module ID", "Size", "Genes", "Top enriched term", "Top enriched FDR", "Enrichment database",
+    "Module ID", "Size", "Genes", "Top enriched term", "Top enriched FDR",
+    "Top enriched FDR (raw, uncorrected)", "Enrichment database",
 ]
 
 # In-process cache of built (taxon, confidence) -> parsed network dict, so a
@@ -965,15 +966,35 @@ def enrich_modules(
         if not accs:
             results[mod["module_id"]] = None
             continue
-        best_block, best_key = None, None
+        best_block, best_key, best_min_fdr = None, None, None
+        # Only namespaces that actually returned a testable (non-empty)
+        # result for THIS module count toward the correction below.
+        n_tested = 0
         for key, term_map in term_maps.items():
             block = genomics_ora._run_fisher_for_namespace(
                 term_map, accs, universe_by_ns[key], include_bonferroni=True,
                 min_term_size=min_term_size, max_term_size=max_term_size,
             )
-            block_min_fdr = block["table"]["FDR"].min() if not block["table"].empty else None
-            best_min_fdr = best_block["table"]["FDR"].min() if best_block is not None and not best_block["table"].empty else None
-            if best_block is None or (block_min_fdr is not None and (best_min_fdr is None or block_min_fdr < best_min_fdr)):
-                best_block, best_key = block, key
-        results[mod["module_id"]] = {"namespace": best_key, "block": best_block} if best_block is not None else None
+            if block["table"].empty:
+                continue
+            n_tested += 1
+            block_min_fdr = float(block["table"]["FDR"].min())
+            if best_block is None or block_min_fdr < best_min_fdr:
+                best_block, best_key, best_min_fdr = block, key, block_min_fdr
+        if best_block is not None:
+            # Picking the smallest FDR out of n_tested independent namespaces
+            # is itself a selection - an uncorrected "best of N" is
+            # optimistically biased low. Bonferroni-style correction for that
+            # specific selection (not a claim about the terms WITHIN a
+            # namespace, which BH inside _run_fisher_for_namespace already
+            # handles). See Transcriptomics_network.enrich_modules_by_symbol
+            # for the identical fix on the Transcriptomics side.
+            results[mod["module_id"]] = {
+                "namespace": best_key,
+                "block": best_block,
+                "top_fdr_corrected": min(best_min_fdr * n_tested, 1.0),
+                "n_namespaces_compared": n_tested,
+            }
+        else:
+            results[mod["module_id"]] = None
     return {"results": results, "caveat": universe.get("caveat")}

@@ -5056,7 +5056,7 @@ function renderTranscriptomicsNetworkResultsScreen() {
         modPane.appendChild(buildTable(mods.table, {
             maxHeight: 460,
             cellFormatFn: (col, val) => {
-                if (col === "Top enriched FDR") return _fmtSci(val, 3);
+                if (col === "Top enriched FDR" || col === "Top enriched FDR (raw, uncorrected)") return _fmtSci(val, 3);
                 if (col === "Mean log2FC") return _fmtFixed(val, 3);
                 return val;
             },
@@ -9797,7 +9797,13 @@ function renderNetpropAnalysisResultsScreen() {
         }
         const mtable = payload.modules.table;
         modulesPane.appendChild(el("div", { class: "caption" }, (mtable.rows || []).length + " module(s) detected (MCL). Each is labeled by its top GO enrichment term."));
-        modulesPane.appendChild(buildTable(mtable, { maxHeight: 400 }));
+        modulesPane.appendChild(buildTable(mtable, {
+            maxHeight: 400,
+            cellFormatFn: (col, val) => {
+                if (col === "Top enriched FDR" || col === "Top enriched FDR (raw, uncorrected)") return _fmtSci(val, 3);
+                return val;
+            },
+        }));
         const modDl = el("button", { class: "btn" }, "Download module table (CSV)");
         modDl.addEventListener("click", () => downloadFile("/api/netprop/analysis/download/modules.csv", "network_modules.csv"));
         modulesPane.appendChild(modDl);
