@@ -2851,7 +2851,11 @@ function renderProteomicsUploadSection() {
             const parts = Object.keys(cm).map((k) => k + " -> " + cm[k]);
             wrap.appendChild(el("div", { class: "caption" }, "Detected columns: " + parts.join(", ")));
         }
-        wrap.appendChild(buildTable(STATE.proteomics.deTable, { maxHeight: 300 }));
+        // Dynamic height matching renderTranscriptomicsUploadSection's own
+        // sizing exactly - a fixed 300px was an unjustified inconsistency
+        // (also: the preview itself now carries up to 200 rows, not 10).
+        const maxHeight = Math.min(400, Math.max(200, (STATE.proteomics.deTable.rows.length + 1) * 35));
+        wrap.appendChild(buildTable(STATE.proteomics.deTable, { maxHeight }));
     }
 
     return wrap;

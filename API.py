@@ -3264,11 +3264,15 @@ async def proteomics_upload(
     session["proteomics"]["de_df"] = de_df
     session["proteomics"]["column_mapping"] = column_mapping
 
+    # 200 rows, matching transcriptomics_upload's own preview size exactly
+    # (de_df.head(200)) - an earlier version of this endpoint used head(10),
+    # an arbitrary, unjustified inconsistency with no reason to differ from
+    # the other retriever's preview.
     return {
         "n_rows": len(de_df),
         "columns": list(de_df.columns),
         "column_mapping": column_mapping,
-        "preview": df_payload(de_df.head(10)),
+        "preview": df_payload(de_df.head(200)),
     }
 
 
