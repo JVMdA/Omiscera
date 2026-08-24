@@ -750,10 +750,17 @@ def run_network_analysis(
                 f" ({n_recruited_all_family} would pass the looser all-protein family alone.)"
             )
         caveats.append(recruited_note)
+    # Kept OUT of the generic `caveats` list on purpose: this is specifically
+    # about how the null-distribution figure's permutation test behaves, not
+    # a run-level finding like seed circularity - the frontend places it next
+    # to that figure (Figures pane) rather than in the top-of-page banner
+    # list, so a methodology note about one figure doesn't read as a general
+    # warning about the whole run.
     skew = core["null_skew_at_max"]
+    skew_caveat = None
     if abs(skew) > 1.0:
         if core["n_gamma_tail"] > 0:
-            caveats.append(
+            skew_caveat = (
                 f"The permutation null is right-skewed (skewness {skew:.2f} at the top-scoring protein). "
                 f"p-values account for this with a skew-aware (Pearson III) fit for "
                 f"{core['n_gamma_tail']} of {graph['n_proteins']} proteins whose null was skewed enough "
@@ -761,7 +768,7 @@ def run_network_analysis(
                 f"reliable than any single protein's exact FDR."
             )
         else:
-            caveats.append(
+            skew_caveat = (
                 f"The permutation null is right-skewed (skewness {skew:.2f} at the top-scoring protein), "
                 f"but the skew-aware fit could not be applied and p-values fall back to the normal "
                 f"approximation. Treat the exact p-values and FDRs as approximate; the RANKING is far "
@@ -832,6 +839,7 @@ def run_network_analysis(
                 "null_skew_at_max": core["null_skew_at_max"],
                 "n_gamma_tail": core["n_gamma_tail"],
                 "n_permutations": core["n_permutations"],
+                "skew_caveat": skew_caveat,
             },
         },
         "modules": None,
