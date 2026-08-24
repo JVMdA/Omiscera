@@ -92,8 +92,35 @@ DIRECTIONS = ("all", "up", "down")
 # PANTHER intentionally excluded - see module docstring.
 PROTEOMICS_ORA_DATABASES = [
     "GO", "Reactome", "MSigDB", "UniProt (disease)", "UniProt (keywords)",
-    "InterPro", "Complex Portal", "Custom database",
+    "InterPro", "Complex Portal", "DISEASES", "Custom database",
 ]
+
+# DISEASES (Jensen Lab, https://diseases.jensenlab.org) - added because
+# UniProt's own disease annotations, while correct, are structurally
+# unusable for enrichment: measured live 2026-08-24, 97.5% of all 6862
+# human UniProt disease terms have exactly ONE gene ("Diamond-Blackfan
+# anemia 22", "Diamond-Blackfan anemia 19", ...), so only 77 terms (1.1%)
+# survive even a minimum-size-3 gate. DISEASES aggregates the same kind of
+# knowledge into real disease CATEGORIES instead: 396 of its 1115 curated
+# terms (35.5%) clear K>=3, and its largest terms are things like
+# "Neurodegenerative disease" (442 genes), "Cancer" (326), "Epilepsy" (324).
+# Both are kept - UniProt's narrow monogenic entries are still right for
+# someone studying one specific rare disease.
+#
+# ONLY the manually-curated "knowledge" channel is used. The other two
+# channels were deliberately rejected: "experiments" is GWAS-scale (its
+# largest term has 2535 genes - far past any sensible max-term-size gate
+# and uninformative as a "disease gene set"), and "textmining" is
+# lower-confidence still.
+#
+# Licence: CC BY 4.0 (verified live 2026-08-24) - the same licence family
+# as STRING, from the same lab, so it carries no new licensing risk.
+# HUMAN ONLY by design (it is a human-disease resource); other organisms
+# get an explicit empty universe with a caveat, never a silent zero.
+DISEASES_KNOWLEDGE_URL = "https://download.jensenlab.org/human_disease_knowledge_filtered.tsv"
+DISEASES_LOCAL_NAME = "diseases_knowledge_filtered.tsv"
+DISEASES_REFRESH_DAYS = 30
+DISEASES_HUMAN_TAXON_ID = "9606"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
@@ -305,6 +332,96 @@ def _ensure_complexportal_file(taxon_id: str, verbose: bool = False, force_refre
     return local_path if os.path.exists(local_path) else None
 
 
+def _ensure_diseases_file(verbose: bool = False, force_refresh: bool = False) -> "str | None":
+    """Download DISEASES' curated knowledge channel if missing/stale.
+    Single global human file (~600KB), not per-taxon."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    local_path = os.path.join(CACHE_DIR, DISEASES_LOCAL_NAME)
+    if not force_refresh and os.path.exists(local_path):
+        age_days = (time.time() - os.path.getmtime(local_path)) / 86400.0
+        if age_days < DISEASES_REFRESH_DAYS:
+            return local_path
+    if HTTP_SESSION is None:
+        return local_path if os.path.exists(local_path) else None
+    try:
+        resp = HTTP_SESSION.get(DISEASES_KNOWLEDGE_URL, headers=OMISCERA_HEADERS, timeout=120)
+        if resp.status_code == 200 and resp.content:
+            tmp_path = local_path + ".tmp"
+            with open(tmp_path, "wb") as fh:
+                fh.write(resp.content)
+            os.replace(tmp_path, local_path)
+            return local_path
+        if verbose:
+            print(f"[DISEASES] fetch failed: HTTP {resp.status_code}")
+    except Exception as exc:
+        if verbose:
+            print(f"[DISEASES] fetch failed: {exc}")
+    # A stale cached copy beats nothing, matching every other fetcher here.
+    return local_path if os.path.exists(local_path) else None
+
+
+def build_diseases_universe(taxon_id: str, verbose: bool = False, force_refresh: bool = False) -> dict:
+    """DISEASES (Jensen Lab) curated gene-disease universe, GENE-SYMBOL keyed.
+
+    File columns (verified live 2026-08-24, tab-separated, no header):
+        0 Ensembl protein id | 1 gene symbol | 2 DOID | 3 disease name
+        4 source | 5 evidence type | 6 confidence score
+    Only columns 1-3 are used; the Ensembl protein id is ignored because
+    this module bridges through gene symbols (the same route MSigDB already
+    uses here), not through Ensembl.
+
+    Returns {"terms": {DOID: {"name","genes": set[SYMBOL]}}, "universe_size",
+    "fetched_at", "caveat": str|None}. Symbols are upper-cased to match the
+    accession->symbol map run_ora builds (which upper-cases too).
+    """
+    cache_db = "Proteomics_DISEASES"
+    if not force_refresh:
+        cached = _load_universe_cache(cache_db, taxon_id)
+        if cached is not None:
+            return cached
+
+    # Human-only resource, by design - not a fetch failure, a scope limit.
+    if str(taxon_id).strip() != DISEASES_HUMAN_TAXON_ID:
+        return {
+            "terms": {}, "universe_size": 0,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "caveat": (
+                f"DISEASES is a human-only resource (taxon {DISEASES_HUMAN_TAXON_ID}); it has no data for "
+                f"taxon {taxon_id}, so this database shows no results for this organism."
+            ),
+        }
+
+    path = _ensure_diseases_file(verbose=verbose, force_refresh=force_refresh)
+    terms: dict = {}
+    universe: set = set()
+    caveat = None
+    if path is None:
+        caveat = "Could not fetch the DISEASES database for this run (transient service error). Re-run to retry."
+    else:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for row in csv.reader(fh, delimiter="\t"):
+                if len(row) < 4:
+                    continue
+                symbol = row[1].strip().upper()
+                doid = row[2].strip()
+                name = row[3].strip()
+                if not symbol or not doid or not name:
+                    continue
+                bucket = terms.setdefault(doid, {"name": name, "genes": set()})
+                bucket["genes"].add(symbol)
+                universe.add(symbol)
+
+    result = {
+        "terms": terms, "universe_size": len(universe),
+        "fetched_at": datetime.now(timezone.utc).isoformat(), "caveat": caveat,
+    }
+    if terms:
+        _save_universe_cache(cache_db, taxon_id, result)
+    elif verbose:
+        print(f"[DISEASES universe] not caching: empty (taxon={taxon_id})")
+    return result
+
+
 def build_complex_portal_universe(taxon_id: str, verbose: bool = False, force_refresh: bool = False) -> dict:
     """Complex Portal universe from the organism's own ComplexTAB file.
     Returns {"terms": {complex_ac: {"name","genes": set}}, "universe_size",
@@ -421,8 +538,20 @@ def run_ora(
         directions[direction_key] = raw_set & universe_accessions_all
 
     n_msigdb_selected = len(_msigdb_selected_keys(msigdb_collections))
+    # GO increments `step` once per NAMESPACE x DIRECTION (3x3=9), and MSigDB
+    # once per SELECTED COLLECTION x DIRECTION, not once per direction like
+    # every other database - a plain len(databases)*len(DIRECTIONS) undercounts
+    # both, so progress (step/steps_total) overshoots 1.0 and the bar pins at
+    # 100% before the run actually finishes. Mirrors the identical, already-
+    # documented calculation in Transcriptomics_module.run_ora.
     steps_total = max(
-        sum(1 if db != "MSigDB" else n_msigdb_selected for db in databases) * len(DIRECTIONS), 1,
+        sum(
+            3 if db == "GO" else            # biological_process/molecular_function/cellular_component
+            n_msigdb_selected if db == "MSigDB" else
+            1
+            for db in databases
+        ) * len(DIRECTIONS),
+        1,
     )
     step = 0
     tables: dict = {}
@@ -558,17 +687,55 @@ def run_ora(
         for direction_key in DIRECTIONS:
             _run_family(f"Complex Portal ({direction_key})", direction_key, cpx_universe["terms"], c_genes, cpx_universe.get("caveat"))
 
-    if "MSigDB" in databases:
-        selected = _msigdb_selected_keys(msigdb_collections)
-        # Symbol-space universe: the same accession-space universe, bridged
-        # via the resolved accession->gene_symbol map - mirrors Genomics'
-        # own "GWAS Catalog is symbol-native inside an accession-native
-        # module" pattern, not a new architectural choice.
+    # Symbol-space bridge, shared by the two symbol-keyed databases here
+    # (MSigDB and DISEASES): the same accession-space universe, mapped
+    # through the resolved accession->gene_symbol pairs - mirrors Genomics'
+    # own "GWAS Catalog is symbol-native inside an accession-native module"
+    # pattern, not a new architectural choice. Computed once, lazily, only
+    # if one of those databases was actually selected.
+    symbol_universe_all: set = set()
+    directions_symbol: dict = {}
+    if "MSigDB" in databases or "DISEASES" in databases:
         symbol_universe_all = {accession_to_symbol[a] for a in universe_accessions_all if accession_to_symbol.get(a)}
         directions_symbol = {
             d: {accession_to_symbol[a] for a in directions[d] if accession_to_symbol.get(a)}
             for d in DIRECTIONS
         }
+
+    if "DISEASES" in databases:
+        dis_universe = build_diseases_universe(taxon_id, verbose=verbose, force_refresh=force_refresh)
+        # Narrow to symbols BOTH quantified here AND annotated in DISEASES -
+        # the same ALWAYS-narrow rule every other database above follows,
+        # applied in symbol space.
+        dis_annotated: set = set()
+        for info in dis_universe["terms"].values():
+            dis_annotated |= info["genes"]
+        dis_symbol_universe = symbol_universe_all & dis_annotated
+        for direction_key in DIRECTIONS:
+            step += 1
+            _progress(step, steps_total, f"DISEASES ({direction_key})")
+            result_key = f"DISEASES ({direction_key})"
+            sig_symbols = directions_symbol[direction_key]
+            if not dis_universe["terms"]:
+                tables[result_key] = _empty_block(
+                    dis_universe.get("caveat") or "No DISEASES data available for this run.")
+                continue
+            if not sig_symbols:
+                tables[result_key] = _empty_block("No significant proteins in this direction at the current thresholds.")
+                continue
+            filtered_sets, n_excl, n_no_overlap = _drop_zero_overlap(
+                dis_universe["terms"], sig_symbols, dis_symbol_universe)
+            block = _run_fisher_for_namespace(
+                filtered_sets, sig_symbols, dis_symbol_universe, FDR_ALPHA_DEFAULT, True, 0, None,
+            )
+            block["n_terms_excluded_min_size"] = n_excl
+            block["n_terms_no_overlap"] = n_no_overlap
+            if dis_universe.get("caveat"):
+                block["caveat"] = dis_universe["caveat"]
+            tables[result_key] = block
+
+    if "MSigDB" in databases:
+        selected = _msigdb_selected_keys(msigdb_collections)
         for coll_key in selected:
             coll_label = MSIGDB_COLLECTIONS.get(coll_key, {}).get("label", coll_key)
             if not msigdb_collection_available(coll_key, taxon_id):

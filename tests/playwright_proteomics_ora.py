@@ -157,6 +157,25 @@ with sync_playwright() as p:
     }""")
     check(caveat_visible, "the contaminant-removal count is shown on screen, not just in the payload")
 
+    print("=== DISEASES: present, human-gated, and finds real disease enrichment ===")
+    # The messy-example section above left us on the upload/resolve screen,
+    # which has no database checkboxes - go to the config screen first.
+    page.evaluate("""() => { STATE.proteomics.taxonId = '9606'; STATE.aaPage = 'proteomics_ora_config'; render(); }""")
+    page.wait_for_timeout(250)
+    dis_pill = page.locator("label.ora-db-pill", has_text="DISEASES")
+    check(dis_pill.count() >= 1, "the DISEASES database checkbox is present on the config screen")
+    check(not dis_pill.locator("input[type=checkbox]").first.is_disabled(),
+          "DISEASES is ENABLED for human (taxon 9606)")
+    # Human-only gating: switching to mouse must grey it out rather than
+    # letting a run come back silently empty.
+    page.evaluate("""() => { STATE.proteomics.taxonId = '10090'; render(); }""")
+    page.wait_for_timeout(250)
+    dis_pill_mouse = page.locator("label.ora-db-pill", has_text="DISEASES")
+    check(dis_pill_mouse.locator("input[type=checkbox]").first.is_disabled(),
+          "DISEASES is correctly DISABLED for a non-human organism (mouse), not silently empty")
+    page.evaluate("""() => { STATE.proteomics.taxonId = '9606'; render(); }""")
+    page.wait_for_timeout(250)
+
     print("=== custom-database example zip (real download endpoint) ===")
     import io as _io
     import zipfile as _zipfile

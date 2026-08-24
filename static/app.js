@@ -2689,10 +2689,18 @@ const PROTEOMICS_TILES_NOT_YET_IMPLEMENTED = new Set([
     "Quantitative Enrichment", "PPI Network / Module Detection", "PTM / Phosphosite Enrichment",
 ]);
 
+// Mirrors Proteomics_module.PROTEOMICS_ORA_DATABASES - keep in sync.
 const PROTEOMICS_ORA_DATABASES = [
     "GO", "Reactome", "MSigDB", "UniProt (disease)", "UniProt (keywords)",
-    "InterPro", "Complex Portal", "Custom database",
+    "InterPro", "Complex Portal", "DISEASES", "Custom database",
 ];
+// DISEASES (Jensen Lab) is a HUMAN-only resource by design, so its
+// checkbox greys out for any other organism - same treatment MSigDB gets
+// for being human/mouse-only, rather than letting a run come back
+// silently empty with no explanation.
+function _diseasesAvailableForTaxon(taxonId) {
+    return String(taxonId) === "9606";
+}
 
 function renderProteomicsScreen() {
     const wrap = el("div", {});
@@ -3111,8 +3119,10 @@ function renderProteomicsOraConfigScreen() {
 
     const taxonId = STATE.proteomics.taxonId;
     const msigdbAvailable = _msigdbAvailableForTaxon(taxonId);
+    const diseasesAvailable = _diseasesAvailableForTaxon(taxonId);
     PROTEOMICS_ORA_DATABASES.forEach((dbName) => {
-        const unavailable = dbName === "MSigDB" && !msigdbAvailable;
+        const unavailable = (dbName === "MSigDB" && !msigdbAvailable)
+                          || (dbName === "DISEASES" && !diseasesAvailable);
         if (unavailable) draft.databases = draft.databases.filter((d) => d !== dbName);
         const label = el("label", { class: "ora-db-pill" });
         const cb = el("input", { type: "checkbox", class: "ora-db-checkbox" });
@@ -3128,13 +3138,18 @@ function renderProteomicsOraConfigScreen() {
             else renderOraRunBtn();
         });
         label.appendChild(cb);
-        label.appendChild(document.createTextNode(" " + dbName + (unavailable ? " (human/mouse only)" : "")));
+        const unavailableNote = dbName === "DISEASES" ? " (human only)" : " (human/mouse only)";
+        label.appendChild(document.createTextNode(" " + dbName + (unavailable ? unavailableNote : "")));
         checkRow.appendChild(label);
     });
     wrap.appendChild(checkRow);
     if (!msigdbAvailable) {
         wrap.appendChild(el("div", { class: "caption" },
             "MSigDB is disabled: it covers human and mouse only."));
+    }
+    if (!diseasesAvailable) {
+        wrap.appendChild(el("div", { class: "caption" },
+            "DISEASES is disabled: it is a human-only disease-gene resource."));
     }
     if (draft.databases.indexOf("MSigDB") !== -1 && msigdbAvailable) {
         wrap.appendChild(renderMsigdbCollectionSelector(locked, draft, taxonId, renderOraRunBtn));
@@ -3144,7 +3159,11 @@ function renderProteomicsOraConfigScreen() {
     }
     wrap.appendChild(el("div", { class: "caption" },
         "GO / Reactome / MSigDB / Custom: same engines as Transcriptomics. UniProt (disease) and " +
-        "UniProt (keywords): UniProt's own curated annotations. InterPro: protein domain/family " +
+        "UniProt (keywords): UniProt's own curated annotations - note UniProt's disease entries are " +
+        "overwhelmingly one-gene rare diseases, so most are too small to test. DISEASES (Jensen Lab, " +
+        "CC BY 4.0, human only): curated gene-disease associations grouped into broad disease " +
+        "CATEGORIES (e.g. \"Neurodegenerative disease\", \"Cancer\"), which is what makes it usable for " +
+        "enrichment where UniProt's disease entries are not. InterPro: protein domain/family " +
         "membership. Complex Portal: known macromolecular complexes (CC0). Each is tested against all " +
         "significant proteins, and separately against up- and down-regulated ones - independently " +
         "FDR-corrected, never pooled."));
@@ -3267,6 +3286,7 @@ function startProteomicsOraRun(draft) {
 const PROTEOMICS_ORA_FAMILY_ORDER = [
     "GO: Biological Process", "GO: Molecular Function", "GO: Cellular Component",
     "Reactome", "UniProt disease", "UniProt keywords", "InterPro", "Complex Portal",
+    "DISEASES",
     ...TRANSCRIPTOMICS_MSIGDB_COLLECTIONS.map((c) => "MSigDB: " + c.label),
     "Custom database",
 ];
