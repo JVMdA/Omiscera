@@ -3343,6 +3343,27 @@ async def proteomics_custom_db_upload(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    # Guard against a silent wrong answer: Proteomics custom databases are
+    # accession-only (no symbol/Ensembl option, unlike Genomics), but a
+    # symbol-based file still PARSES cleanly here - it just then matches
+    # nothing at run time, and the results screen blames the term-size
+    # filter instead of the real cause. Reject up front with the real
+    # reason if almost nothing in the file looks like a UniProt accession.
+    all_genes = {g for info in parsed["terms"].values() for g in info["genes"]}
+    if all_genes:
+        n_accession_like = sum(1 for g in all_genes if proteomics_engine._UNIPROT_ACC_RE.match(g))
+        if n_accession_like / len(all_genes) < 0.5:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"This file parsed, but only {n_accession_like} of {len(all_genes)} gene values look "
+                    "like UniProt accessions (e.g. P04637) - Proteomics custom databases must use UniProt "
+                    "accessions, not gene symbols or another identifier type. If your gene column has gene "
+                    "symbols, convert them to UniProt accessions first (e.g. via UniProt's own ID mapping "
+                    "tool at uniprot.org/id-mapping)."
+                ),
+            )
+
     parsed["filename"] = file.filename or "custom_database"
     session["proteomics"]["custom_db"] = parsed
 
@@ -3356,6 +3377,35 @@ async def proteomics_custom_db_upload(
         "universe_size": parsed["universe_size"],
         "sample_terms": sample_terms,
     }
+
+
+@app.get("/api/proteomics/ora/custom-db-example")
+def proteomics_custom_db_example():
+    """Example custom gene-set database, zipped with a README (mirrors
+    /api/ora/custom-db-example's shape) - GMT and tidy CSV formats, built
+    from the SAME six real Complex Portal complexes seeded into the bundled
+    example_proteomics_de_full.csv DE example, so downloading this and
+    running it against that example produces genuine enrichment."""
+    data3_dir = os.path.join(BASE_DIR, "Data3")
+    files_to_zip = [
+        "README_proteomics_custom_geneset_db.txt",
+        "example_proteomics_custom_geneset_db.gmt",
+        "example_proteomics_custom_geneset_db_TIDY.csv",
+    ]
+    missing = [f for f in files_to_zip if not os.path.isfile(os.path.join(data3_dir, f))]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"Example file(s) not found: {', '.join(missing)}")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname in files_to_zip:
+            zf.write(os.path.join(data3_dir, fname), arcname=fname)
+    buf.seek(0)
+    return Response(
+        content=buf.read(),
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="proteomics_custom_geneset_db_example.zip"'},
+    )
 
 
 @app.post("/api/proteomics/ora/background-upload")

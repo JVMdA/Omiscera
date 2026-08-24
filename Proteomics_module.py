@@ -493,8 +493,17 @@ def run_ora(
             ns_genes: set = set()
             for info in go_universe[ns].values():
                 ns_genes |= info["genes"]
-            if background_accessions:
-                ns_genes &= universe_accessions_all
+            # ALWAYS narrow to the proteins actually quantified in this
+            # experiment (universe_accessions_all is already narrowed by any
+            # background at the top of this function) - matches
+            # Transcriptomics_module._run_ora_for_sets' "annotated_universe =
+            # universe_symbols & annotated_genes" convention. A conditional
+            # narrow (only when a background file was uploaded) was a real
+            # bug: without it N was the WHOLE GO-annotated proteome (~150k
+            # entries incl. isoforms/unreviewed) instead of the ~3-8k
+            # proteins actually measured, inflating every p-value here by
+            # many orders of magnitude - verified live 2026-08-24.
+            ns_genes &= universe_accessions_all
             for direction_key in DIRECTIONS:
                 _run_family(f"GO: {ns_label} ({direction_key})", direction_key, go_universe[ns], ns_genes, go_universe.get("caveat"))
 
@@ -509,8 +518,7 @@ def run_ora(
             r_genes: set = set()
             for info in reactome_universe["pathways"].values():
                 r_genes |= info["genes"]
-            if background_accessions:
-                r_genes &= universe_accessions_all
+            r_genes &= universe_accessions_all  # ALWAYS - see the GO block's comment above
             for direction_key in DIRECTIONS:
                 _run_family(f"Reactome ({direction_key})", direction_key, reactome_universe["pathways"], r_genes)
 
@@ -519,8 +527,7 @@ def run_ora(
         d_genes: set = set()
         for info in disease_universe["terms"].values():
             d_genes |= info["genes"]
-        if background_accessions:
-            d_genes &= universe_accessions_all
+        d_genes &= universe_accessions_all  # ALWAYS - see the GO block's comment above
         for direction_key in DIRECTIONS:
             _run_family(f"UniProt disease ({direction_key})", direction_key, disease_universe["terms"], d_genes)
 
@@ -529,8 +536,7 @@ def run_ora(
         k_genes: set = set()
         for info in kw_universe["terms"].values():
             k_genes |= info["genes"]
-        if background_accessions:
-            k_genes &= universe_accessions_all
+        k_genes &= universe_accessions_all  # ALWAYS - see the GO block's comment above
         for direction_key in DIRECTIONS:
             _run_family(f"UniProt keywords ({direction_key})", direction_key, kw_universe["terms"], k_genes)
 
@@ -539,8 +545,7 @@ def run_ora(
         i_genes: set = set()
         for info in ipr_universe["terms"].values():
             i_genes |= info["genes"]
-        if background_accessions:
-            i_genes &= universe_accessions_all
+        i_genes &= universe_accessions_all  # ALWAYS - see the GO block's comment above
         for direction_key in DIRECTIONS:
             _run_family(f"InterPro ({direction_key})", direction_key, ipr_universe["terms"], i_genes)
 
@@ -549,8 +554,7 @@ def run_ora(
         c_genes: set = set()
         for info in cpx_universe["terms"].values():
             c_genes |= info["genes"]
-        if background_accessions:
-            c_genes &= universe_accessions_all
+        c_genes &= universe_accessions_all  # ALWAYS - see the GO block's comment above
         for direction_key in DIRECTIONS:
             _run_family(f"Complex Portal ({direction_key})", direction_key, cpx_universe["terms"], c_genes, cpx_universe.get("caveat"))
 
@@ -578,6 +582,15 @@ def run_ora(
                 name: {"name": info["name"], "genes": set(info["genes"])}
                 for name, info in fetched.get("sets", {}).items()
             }
+            # Narrow to symbols BOTH quantified in this experiment AND
+            # annotated somewhere in this MSigDB collection - same ALWAYS-
+            # narrow fix as every accession-space database above, applied in
+            # symbol space. Per-collection (not computed once outside the
+            # loop) because each collection annotates a different symbol set.
+            msigdb_annotated_symbols: set = set()
+            for info in msigdb_sets.values():
+                msigdb_annotated_symbols |= info["genes"]
+            symbol_universe = symbol_universe_all & msigdb_annotated_symbols
             for direction_key in DIRECTIONS:
                 step += 1
                 _progress(step, steps_total, f"MSigDB: {coll_label} ({direction_key})")
@@ -589,9 +602,9 @@ def run_ora(
                 if not sig_symbols:
                     tables[result_key] = _empty_block("No significant proteins in this direction at the current thresholds.")
                     continue
-                filtered_sets, n_excl, n_no_overlap = _drop_zero_overlap(msigdb_sets, sig_symbols, symbol_universe_all)
+                filtered_sets, n_excl, n_no_overlap = _drop_zero_overlap(msigdb_sets, sig_symbols, symbol_universe)
                 block = _run_fisher_for_namespace(
-                    filtered_sets, sig_symbols, symbol_universe_all, FDR_ALPHA_DEFAULT, True, 0, None,
+                    filtered_sets, sig_symbols, symbol_universe, FDR_ALPHA_DEFAULT, True, 0, None,
                 )
                 block["n_terms_excluded_min_size"] = n_excl
                 block["n_terms_no_overlap"] = n_no_overlap
@@ -601,8 +614,7 @@ def run_ora(
         custom_genes: set = set()
         for info in custom_db["terms"].values():
             custom_genes |= info["genes"]
-        if background_accessions:
-            custom_genes &= universe_accessions_all
+        custom_genes &= universe_accessions_all  # ALWAYS - see the GO block's comment above
         for direction_key in DIRECTIONS:
             _run_family(f"Custom database ({direction_key})", direction_key, custom_db["terms"], custom_genes)
 

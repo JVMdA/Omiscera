@@ -166,6 +166,64 @@ check(block_strict["table"].empty, "the result table is genuinely empty, not jus
 check(bool(block_strict.get("note")), "an empty block carries an explanatory note")
 
 
+# =============================================================================
+# run_ora: the universe must be the QUANTIFIED proteins, not every protein
+# the database happens to annotate (the real bug found live 2026-08-24: a
+# conditional `if background_accessions: ns_genes &= universe_accessions_all`
+# meant N was the WHOLE annotated database - e.g. GO:CC's ~150k entries -
+# instead of the ~3-8k proteins actually measured, unless a background file
+# happened to be uploaded too). The fixture above is unaffected by this bug
+# (every custom-DB gene is already in the resolved table, so both the
+# correct and the buggy convention give the same universe) - a NEW fixture
+# with database-annotated-but-UNQUANTIFIED genes is required to expose it.
+# =============================================================================
+print("=== run_ora: the universe excludes database-annotated-but-unquantified genes ===")
+UNQUANTIFIED_ONLY = [f"UNMEASURED{i:04d}" for i in range(50)]  # annotated in the DB, never in resolved_df
+gmt_lines2 = [
+    "SET_A\tReal UP signal, padded with unmeasured accessions\t"
+    + "\t".join(set_a + UNQUANTIFIED_ONLY[:20]),
+    "SET_B\tReal DOWN signal, padded with unmeasured accessions\t"
+    + "\t".join(set_b + UNQUANTIFIED_ONLY[20:35]),
+]
+custom_db_padded = genomics_ora.load_custom_geneset_db(
+    ("\n".join(gmt_lines2)).encode("utf-8"), id_type="accession",
+)
+result_padded = pm.run_ora(
+    resolved_df, databases=["Custom database"], taxon_id="9606", taxon_name="Homo sapiens",
+    padj_cutoff=0.05, lfc_cutoff=1.0, min_term_size=1, custom_db=custom_db_padded, verbose=False,
+)
+block_padded = result_padded["tables"]["Custom database (all)"]
+set_a_row_padded = block_padded["table"].set_index("Term ID").loc["SET_A"]
+check(set_a_row_padded["K"] == 5,
+      f"SET_A's K counts ONLY its 5 QUANTIFIED members, not the 20 unmeasured accessions padded into the "
+      f"same term (got K={set_a_row_padded['K']}) - this is exactly the case the bug got wrong: it would "
+      f"have reported K=25")
+check(set_a_row_padded["k"] == 5, f"k (significant overlap) is unaffected either way (got k={set_a_row_padded['k']})")
+check(block_padded["universe_size"] == 9,
+      f"the reported universe is 'quantified AND annotated in THIS custom DB' - SET_A's 5 + SET_B's 4 real "
+      f"quantified members, no overlap between them - NOT the full {N_UNIVERSE}-protein experiment (that "
+      f"would be wrong the other direction) and NOT inflated by the 35 unmeasured accessions the custom DB "
+      f"also mentions (got {block_padded['universe_size']}); matches how every other database block here "
+      f"reports its own annotated-and-quantified count, not the whole-experiment universe")
+
+print("=== SENSITIVITY: reproduce the pre-fix universe and confirm it genuinely differs ===")
+# The pre-fix convention: only narrow when a background was supplied. Here,
+# with none supplied, the "buggy" universe is simply every custom-DB gene,
+# unfiltered by what was actually quantified.
+buggy_universe = set()
+for info in custom_db_padded["terms"].values():
+    buggy_universe |= info["genes"]
+buggy_block = genomics_ora._run_fisher_for_namespace(
+    custom_db_padded["terms"], sig_set, buggy_universe, 0.05, True, 1, None,
+)
+buggy_set_a_K = buggy_block["table"].set_index("Term ID").loc["SET_A", "K"]
+check(buggy_set_a_K == 25,
+      f"confirmed: computing the SAME fixture with the OLD (buggy) unfiltered universe reports K=25 for "
+      f"SET_A, not 5 (got K={buggy_set_a_K}) - proving the fix in Proteomics_module.py's run_ora (always "
+      f"intersecting with the quantified universe, not only when a background file is supplied) is real "
+      f"and this test would have caught the original bug")
+
+
 print(f"\nTOTAL: {PASS} passed, {FAIL} failed")
 if FAIL:
     raise SystemExit(1)

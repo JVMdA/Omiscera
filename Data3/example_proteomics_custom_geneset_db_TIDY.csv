@@ -1,0 +1,185 @@
+Gene_Set_ID,Gene_Set_Name,UniProt_Accession
+26S_proteasome,26S proteasome complex,O00231
+26S_proteasome,26S proteasome complex,O00232
+26S_proteasome,26S proteasome complex,O00487
+26S_proteasome,26S proteasome complex,O14818
+26S_proteasome,26S proteasome complex,O43242
+26S_proteasome,26S proteasome complex,P17980
+26S_proteasome,26S proteasome complex,P20618
+26S_proteasome,26S proteasome complex,P25786
+26S_proteasome,26S proteasome complex,P25787
+26S_proteasome,26S proteasome complex,P25788
+26S_proteasome,26S proteasome complex,P25789
+26S_proteasome,26S proteasome complex,P28066
+26S_proteasome,26S proteasome complex,P28070
+26S_proteasome,26S proteasome complex,P28072
+26S_proteasome,26S proteasome complex,P28074
+26S_proteasome,26S proteasome complex,P35998
+26S_proteasome,26S proteasome complex,P43686
+26S_proteasome,26S proteasome complex,P48556
+26S_proteasome,26S proteasome complex,P49720
+26S_proteasome,26S proteasome complex,P49721
+26S_proteasome,26S proteasome complex,P51665
+26S_proteasome,26S proteasome complex,P55036
+26S_proteasome,26S proteasome complex,P60896
+26S_proteasome,26S proteasome complex,P60900
+26S_proteasome,26S proteasome complex,P62191
+26S_proteasome,26S proteasome complex,P62195
+26S_proteasome,26S proteasome complex,P62333
+26S_proteasome,26S proteasome complex,Q13200
+26S_proteasome,26S proteasome complex,Q15008
+26S_proteasome,26S proteasome complex,Q16186
+26S_proteasome,26S proteasome complex,Q99436
+26S_proteasome,26S proteasome complex,Q99460
+26S_proteasome,26S proteasome complex,Q9UNM6
+20S_proteasome_core,20S proteasome complex,O14818
+20S_proteasome_core,20S proteasome complex,P20618
+20S_proteasome_core,20S proteasome complex,P25786
+20S_proteasome_core,20S proteasome complex,P25787
+20S_proteasome_core,20S proteasome complex,P25788
+20S_proteasome_core,20S proteasome complex,P25789
+20S_proteasome_core,20S proteasome complex,P28066
+20S_proteasome_core,20S proteasome complex,P28070
+20S_proteasome_core,20S proteasome complex,P28072
+20S_proteasome_core,20S proteasome complex,P28074
+20S_proteasome_core,20S proteasome complex,P49720
+20S_proteasome_core,20S proteasome complex,P49721
+20S_proteasome_core,20S proteasome complex,P60900
+20S_proteasome_core,20S proteasome complex,Q99436
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P08708
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P08865
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P15880
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P23396
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P25398
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P39019
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P46781
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P46782
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P46783
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P60866
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P61247
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62081
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62241
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62244
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62249
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62263
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62266
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62269
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62273
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62277
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62280
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62753
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62841
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62847
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62851
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62854
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62857
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62861
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P62979
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P63220
+40S_ribosomal_subunit,40S cytosolic small ribosomal subunit,P63244
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P05386
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P05387
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P05388
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P18077
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P18124
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P18621
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P26373
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P27635
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P30050
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P32969
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P36578
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P39023
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P40429
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P42766
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P46776
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P46777
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P46778
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P46779
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P47914
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P49207
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P50914
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P61313
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P61353
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P61513
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P61927
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P62424
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P62750
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P62829
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P62888
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P62891
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P62899
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P62906
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P62910
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P62913
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P62917
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P62945
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P62987
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P63173
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P83731
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,P84098
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,Q02543
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,Q02878
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,Q07020
+60S_ribosomal_subunit,60S cytosolic large ribosomal subunit,Q9Y3U8
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,O75533
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,P08579
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,P08621
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,P09012
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,P09234
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,P09661
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,P14678
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,P62304
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,P62306
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,P62308
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,P62314
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,P62316
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,P62318
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,Q12874
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,Q13435
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,Q15393
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,Q15427
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,Q15428
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,Q15459
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,Q7RTV0
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,Q9BWJ5
+spliceosome_preB_complex,Major Spliceosomal Pre-B complex,Q9Y3B4
+spliceosome_B_complex,Major Spliceosomal B complex,O43172
+spliceosome_B_complex,Major Spliceosomal B complex,O43290
+spliceosome_B_complex,Major Spliceosomal B complex,O43395
+spliceosome_B_complex,Major Spliceosomal B complex,O75533
+spliceosome_B_complex,Major Spliceosomal B complex,O75643
+spliceosome_B_complex,Major Spliceosomal B complex,O94906
+spliceosome_B_complex,Major Spliceosomal B complex,O95777
+spliceosome_B_complex,Major Spliceosomal B complex,P08579
+spliceosome_B_complex,Major Spliceosomal B complex,P09661
+spliceosome_B_complex,Major Spliceosomal B complex,P14678
+spliceosome_B_complex,Major Spliceosomal B complex,P55769
+spliceosome_B_complex,Major Spliceosomal B complex,P62304
+spliceosome_B_complex,Major Spliceosomal B complex,P62306
+spliceosome_B_complex,Major Spliceosomal B complex,P62308
+spliceosome_B_complex,Major Spliceosomal B complex,P62310
+spliceosome_B_complex,Major Spliceosomal B complex,P62312
+spliceosome_B_complex,Major Spliceosomal B complex,P62314
+spliceosome_B_complex,Major Spliceosomal B complex,P62316
+spliceosome_B_complex,Major Spliceosomal B complex,P62318
+spliceosome_B_complex,Major Spliceosomal B complex,P83876
+spliceosome_B_complex,Major Spliceosomal B complex,Q12874
+spliceosome_B_complex,Major Spliceosomal B complex,Q13435
+spliceosome_B_complex,Major Spliceosomal B complex,Q15029
+spliceosome_B_complex,Major Spliceosomal B complex,Q15393
+spliceosome_B_complex,Major Spliceosomal B complex,Q15427
+spliceosome_B_complex,Major Spliceosomal B complex,Q15428
+spliceosome_B_complex,Major Spliceosomal B complex,Q15459
+spliceosome_B_complex,Major Spliceosomal B complex,Q53GS9
+spliceosome_B_complex,Major Spliceosomal B complex,Q6P2Q9
+spliceosome_B_complex,Major Spliceosomal B complex,Q8WVK2
+spliceosome_B_complex,Major Spliceosomal B complex,Q8WWY3
+spliceosome_B_complex,Major Spliceosomal B complex,Q96DI7
+spliceosome_B_complex,Major Spliceosomal B complex,Q9BTD8
+spliceosome_B_complex,Major Spliceosomal B complex,Q9BUQ8
+spliceosome_B_complex,Major Spliceosomal B complex,Q9BWJ5
+spliceosome_B_complex,Major Spliceosomal B complex,Q9UK45
+spliceosome_B_complex,Major Spliceosomal B complex,Q9Y333
+spliceosome_B_complex,Major Spliceosomal B complex,Q9Y3B4
+spliceosome_B_complex,Major Spliceosomal B complex,Q9Y4Y9
+spliceosome_B_complex,Major Spliceosomal B complex,Q9Y4Z0

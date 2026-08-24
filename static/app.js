@@ -2993,6 +2993,12 @@ function renderProteomicsCustomDbWidget(locked) {
         wrap.appendChild(el("div", { class: "caption ora-custom-summary" },
             "Loaded \"" + s.filename + "\": " + s.n_terms + " gene set(s), " + s.universe_size + " unique accessions."));
     }
+
+    const exampleLink = el("button", { class: "ora-inline-example-link", type: "button" }, "(example input files)");
+    exampleLink.addEventListener("click", () => {
+        downloadFile("/api/proteomics/ora/custom-db-example", "proteomics_custom_geneset_db_example.zip");
+    });
+    wrap.appendChild(exampleLink);
     return wrap;
 }
 

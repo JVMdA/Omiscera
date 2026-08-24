@@ -157,6 +157,51 @@ with sync_playwright() as p:
     }""")
     check(caveat_visible, "the contaminant-removal count is shown on screen, not just in the payload")
 
+    print("=== custom-database example zip (real download endpoint) ===")
+    import io as _io
+    import zipfile as _zipfile
+    import uuid as _uuid
+    import urllib.request as _urlreq
+    req = _urlreq.Request(BASE + "/api/proteomics/ora/custom-db-example",
+                           headers={"X-Session-Id": _uuid.uuid4().hex})
+    with _urlreq.urlopen(req, timeout=30) as resp:
+        zip_bytes = resp.read()
+    zf = _zipfile.ZipFile(_io.BytesIO(zip_bytes))
+    names = set(zf.namelist())
+    check(names == {"README_proteomics_custom_geneset_db.txt",
+                     "example_proteomics_custom_geneset_db.gmt",
+                     "example_proteomics_custom_geneset_db_TIDY.csv"},
+          f"the custom-DB example zip contains exactly the README + GMT + tidy CSV (got {sorted(names)})")
+
+    print("=== custom-DB upload: real GMT/tidy files from the zip actually parse and load ===")
+    page.evaluate("""() => { STATE.aaPage = 'proteomics_ora_config'; render(); }""")
+    page.wait_for_timeout(150)
+    gmt_bytes = zf.read("example_proteomics_custom_geneset_db.gmt")
+    import tempfile as _tempfile
+    with _tempfile.NamedTemporaryFile(suffix=".gmt", delete=False) as tmp:
+        tmp.write(gmt_bytes)
+        gmt_path = tmp.name
+    custom_cb = page.locator("label.ora-db-pill", has_text="Custom database").locator("input[type=checkbox]")
+    custom_cb.check()
+    page.wait_for_timeout(200)
+    page.locator("input[type=file]").last.set_input_files(gmt_path)
+    page.wait_for_timeout(800)
+    custom_db_state = page.evaluate("STATE.proteomics.customDb")
+    check(custom_db_state is not None and custom_db_state.get("n_terms") == 6,
+          f"the real zipped GMT example uploads and parses as 6 gene sets (got {custom_db_state})")
+
+    print("=== SENSITIVITY: a symbol-based custom DB is rejected with the REAL reason, not a silent empty result ===")
+    with _tempfile.NamedTemporaryFile(suffix=".gmt", mode="w", delete=False, encoding="utf-8") as tmp2:
+        tmp2.write("fake_set\tNot real accessions\tTP53\tMDM2\tBRCA1\tEGFR\tMYC\n")
+        symbol_path = tmp2.name
+    page.once("dialog", lambda d: d.accept())
+    page.locator("input[type=file]").last.set_input_files(symbol_path)
+    page.wait_for_timeout(500)
+    custom_db_after_bad = page.evaluate("STATE.proteomics.customDb")
+    check(custom_db_after_bad is None,
+          f"a gene-symbol-only file is REJECTED (customDb stays null), not silently accepted and matching nothing "
+          f"(got {custom_db_after_bad})")
+
     print("=== console error check ===")
     check(len(errors) == 0, f"no console/page errors during the whole flow (got {errors})")
 
