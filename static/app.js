@@ -414,7 +414,14 @@ function fileInputWidget(opts) {
 // the row-height explosion at the source, and vertical-align:top is kept as
 // a second, independent safeguard for any other column that turns out to
 // hold unexpectedly long content.
-const TABLE_LONG_LIST_COLUMNS = new Set(["Overlapping Genes", "Leading Edge Genes", "Genes"]);
+// "Overlapping Proteins" is Proteomics' own name for the same kind of long
+// comma-joined member list (Proteomics_module.OVERLAP_COLUMN) - it MUST be
+// listed here too, or that module's result tables reintroduce the exact
+// row-height explosion this clamp exists to prevent (see
+// tests/test_table_long_list_rendering.py).
+const TABLE_LONG_LIST_COLUMNS = new Set([
+    "Overlapping Genes", "Overlapping Proteins", "Leading Edge Genes", "Genes",
+]);
 
 // scipy p-values/FDRs (hypergeom.sf, a normal-tail p, BH correction on either)
 // can genuinely underflow to a literal 0.0 for an astronomically significant
@@ -9396,9 +9403,21 @@ function buildBurdenVolcanoPlot(div, table, dbName, namespace, alpha, opts) {
 // ---------------------------------------------------------------------------
 
 function _oraGeneSet(row) {
-    const raw = String(row["Overlapping Genes"] || "").trim();
+    // Proteomics names this column "Overlapping Proteins" and formats each
+    // member as "ACCESSION (SYMBOL)" (see Proteomics_module.OVERLAP_COLUMN).
+    // Read either column name, and keep only the leading identifier - the
+    // callers that consume this set (gene/protein-concept network node ids,
+    // and its log2FC lookup) key on the bare accession/symbol, so passing
+    // "P05386 (RPLP0)" through would break every lookup silently. Genomics
+    // and Transcriptomics values contain no parenthesis, so the strip is a
+    // no-op for them.
+    const raw = String(row["Overlapping Genes"] || row["Overlapping Proteins"] || "").trim();
     if (!raw) return new Set();
-    return new Set(raw.split(",").map(g => g.trim()).filter(Boolean));
+    return new Set(
+        raw.split(",")
+           .map(g => g.trim().split(" (")[0].trim())
+           .filter(Boolean)
+    );
 }
 
 // Burden analog of _oraGeneSet: the burden result table's per-term gene list

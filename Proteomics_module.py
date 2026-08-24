@@ -122,6 +122,18 @@ DISEASES_LOCAL_NAME = "diseases_knowledge_filtered.tsv"
 DISEASES_REFRESH_DAYS = 30
 DISEASES_HUMAN_TAXON_ID = "9606"
 
+# Proteomics renames the shared engine's "Overlapping Genes" column: in a
+# proteomics module these are the measured PROTEINS that fall inside a term,
+# not genes. The rename also fixes a real inconsistency - the same column
+# silently held two different identifier types depending on the database
+# (UniProt accessions for the 6 accession-keyed sources, gene SYMBOLS for
+# the 2 symbol-keyed ones, MSigDB and DISEASES). _finalize_member_column()
+# below normalises every database to one readable "P05386 (RPLP0)" form.
+OVERLAP_COLUMN = "Overlapping Proteins"
+PROTEOMICS_ORA_RESULT_COLUMNS = [
+    OVERLAP_COLUMN if c == "Overlapping Genes" else c for c in ORA_RESULT_COLUMNS
+]
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 
@@ -558,7 +570,7 @@ def run_ora(
 
     def _empty_block(note: str) -> dict:
         return {
-            "table": pd.DataFrame(columns=ORA_RESULT_COLUMNS),
+            "table": pd.DataFrame(columns=PROTEOMICS_ORA_RESULT_COLUMNS),
             "n_terms_tested": 0, "n_terms_excluded_min_size": 0,
             "universe_size": 0, "n_input_in_universe": 0, "n_input_dropped": 0,
             "note": note, "caveat": None,
@@ -784,6 +796,52 @@ def run_ora(
         custom_genes &= universe_accessions_all  # ALWAYS - see the GO block's comment above
         for direction_key in DIRECTIONS:
             _run_family(f"Custom database ({direction_key})", direction_key, custom_db["terms"], custom_genes)
+
+    # --- Normalise the overlapping-member column across every database -----
+    # Applied ONCE here, over every stored block, rather than at each of the
+    # several places a block is created (_run_family, the MSigDB loop, the
+    # DISEASES loop, _empty_block) - one pass cannot miss a path.
+    #
+    # Two problems this fixes, both real and user-reported:
+    #   1. The shared engine names the column "Overlapping Genes"; in a
+    #      proteomics module these are PROTEINS.
+    #   2. Its contents silently changed identifier type per database -
+    #      accessions from the 6 accession-keyed sources, bare gene symbols
+    #      from MSigDB and DISEASES - so the same column meant different
+    #      things on different rows of the same results screen.
+    # Both are normalised to "ACCESSION (SYMBOL)", which keeps the
+    # unambiguous proteomics identifier while staying readable (P05386 alone
+    # tells a reader nothing; RPLP0 alone loses the isoform-level identity
+    # that is the whole point of an accession).
+    symbol_to_accession: dict = {}
+    for acc, sym in accession_to_symbol.items():
+        if sym:
+            symbol_to_accession.setdefault(sym, acc)
+
+    def _display_member(member: str) -> str:
+        m = member.strip()
+        if not m:
+            return m
+        sym = accession_to_symbol.get(m)          # accession-space member
+        if sym:
+            return f"{m} ({sym})"
+        acc = symbol_to_accession.get(m.upper())  # symbol-space member (MSigDB/DISEASES)
+        if acc:
+            return f"{acc} ({m.upper()})"
+        return m   # unresolvable (e.g. a custom-DB gene never quantified) - left as-is
+
+    for block in tables.values():
+        tbl = block.get("table")
+        if tbl is None:
+            continue
+        if "Overlapping Genes" in tbl.columns:
+            if not tbl.empty:
+                tbl["Overlapping Genes"] = tbl["Overlapping Genes"].map(
+                    lambda cell: ", ".join(_display_member(x) for x in str(cell).split(",") if x.strip())
+                )
+            tbl = tbl.rename(columns={"Overlapping Genes": OVERLAP_COLUMN})
+        # Reindex so an empty block still carries the proteomics column set.
+        block["table"] = tbl.reindex(columns=PROTEOMICS_ORA_RESULT_COLUMNS)
 
     n_deg_before_background = {d: len(select_significant_proteins(resolved_df, padj_cutoff, lfc_cutoff, d)) for d in DIRECTIONS}
     summary = {

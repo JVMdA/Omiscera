@@ -130,6 +130,29 @@ with sync_playwright() as p:
         page.wait_for_timeout(600)
         check(page.locator(".js-plotly-plot").count() >= 1, "dot plot rendered a real Plotly figure")
 
+    print("=== overlapping-member column: renamed, and one consistent ACCESSION (SYMBOL) format ===")
+    cpx_rows = (tables.get("Complex Portal (all)") or {}).get("table", {}).get("rows", [])
+    check(bool(cpx_rows) and "Overlapping Proteins" in cpx_rows[0],
+          "the column is named 'Overlapping Proteins' (not the shared engine's 'Overlapping Genes')")
+    if cpx_rows:
+        members = str(cpx_rows[0].get("Overlapping Proteins", ""))
+        check(" (" in members and members.split(",")[0].strip().endswith(")"),
+              f"members are formatted 'ACCESSION (SYMBOL)', not a bare accession (got {members[:48]!r})")
+
+    print("=== SENSITIVITY: the protein-concept network still parses that column ===")
+    # _oraGeneSet must strip the " (SYMBOL)" suffix, or every node id stops
+    # matching the accession-keyed log2FC map and the figure silently loses
+    # its colouring. Exercise the REAL parser against the REAL row.
+    parsed = page.evaluate("""(row) => Array.from(_oraGeneSet(row))""", cpx_rows[0] if cpx_rows else {})
+    check(bool(parsed) and all(" (" not in p and ")" not in p for p in parsed),
+          f"_oraGeneSet returns bare accessions usable as node ids/log2FC keys (got {parsed[:4]})")
+    log2fc_keys = page.evaluate("""() => {
+        const rows = (STATE.proteomics.resolved.resolved_table.rows) || [];
+        return rows.slice(0, 400).map(r => String(r.accession || '').toUpperCase());
+    }""")
+    check(bool(parsed) and any(p.upper() in set(log2fc_keys) for p in parsed),
+          "those parsed ids genuinely match resolved-table accessions, so the network's log2FC colouring still resolves")
+
     print("=== the messy MaxQuant example: contaminant filtering visible on screen ===")
     page.evaluate("""() => { STATE.aaPage = 'proteomics'; STATE.proteomicsModuleName = ''; render(); }""")
     page.wait_for_timeout(150)
