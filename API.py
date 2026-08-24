@@ -57,6 +57,8 @@ import Genomics_annotation as genomics_annot
 import Transcriptomics_module_retriever as transcriptomics_retriever
 import Transcriptomics_module as transcriptomics_engine
 import Transcriptomics_regulon as transcriptomics_regulon_engine
+import Proteomics_module_retriever as proteomics_retriever
+import Proteomics_module as proteomics_engine
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -564,6 +566,24 @@ def _fresh_transcriptomics_state() -> dict:
     }
 
 
+def _fresh_proteomics_state() -> dict:
+    """Single source of truth for the 'proteomics' session sub-dict shape.
+    Mirrors _fresh_transcriptomics_state() - see that function's comment for
+    why a factory function (not an inline literal) is the pattern here."""
+    return {
+        "de_df": None,
+        "column_mapping": None,
+        "taxon_id": "",
+        "taxon_name": "",
+        "resolved_df": None,
+        "meta": None,
+        "ora_config": None,
+        "ora_results": None,
+        "custom_db": None,
+        "background_accessions": None,
+    }
+
+
 def new_session_state() -> dict:
     return {
         "input_df": None,
@@ -573,6 +593,7 @@ def new_session_state() -> dict:
         "analysis_results": {},
         "ora": _fresh_ora_state(),
         "transcriptomics": _fresh_transcriptomics_state(),
+        "proteomics": _fresh_proteomics_state(),
     }
 
 
@@ -836,6 +857,99 @@ def _job_run_transcriptomics_ora(job_id: str, session: dict) -> dict:
     update_job(job_id, progress=1.0, message="Done")
     return {
         "tables": _serialize_transcriptomics_ora_tables(result["tables"]),
+        "summary": result["summary"],
+    }
+
+
+def _job_resolve_proteins(job_id: str, session: dict, taxon_id: str, taxon_name: str) -> dict:
+    """Proteomics retrieval worker: resolves the uploaded protein-level DE
+    table via Proteomics_module_retriever.resolve_protein_table (UniProt ID
+    Mapping - never per-accession, see that module). Mirrors _job_resolve_de's
+    commit-both-together discipline: taxon_id/taxon_name/resolved_df/meta are
+    all written here, together, on success only, so a failed re-resolve
+    cannot leave the session holding a new organism's name beside an old
+    organism's resolved table (see _job_resolve_de's docstring for the exact
+    failure mode this prevents)."""
+    update_job(job_id, message="Resolving accessions via UniProt ID Mapping...")
+    de_df = session["proteomics"]["de_df"]
+
+    def _progress(current, total, label):
+        frac = current / max(total, 1)
+        update_job(job_id, progress=frac, message=f"{label} ({current}/{total})")
+
+    resolved_df, meta = proteomics_retriever.resolve_protein_table(
+        de_df, taxon_id, progress_callback=_progress, verbose=False,
+    )
+    session["proteomics"]["taxon_id"] = taxon_id
+    session["proteomics"]["taxon_name"] = taxon_name
+    session["proteomics"]["resolved_df"] = resolved_df
+    session["proteomics"]["meta"] = meta
+
+    update_job(job_id, progress=1.0, message="Done")
+    return {
+        "resolved_table": df_payload(resolved_df),
+        "metrics": meta,
+    }
+
+
+def _serialize_proteomics_ora_tables(tables: dict) -> dict:
+    """JSON-safe view of Proteomics_module.run_ora's 'tables' dict. Mirrors
+    _serialize_transcriptomics_ora_tables' shape; no length-correction keys
+    since Proteomics ORA has no PWF/gene-length-bias concept in this
+    milestone."""
+    payload = {}
+    for key, block in tables.items():
+        payload[key] = {
+            "table": df_payload(block["table"]),
+            "n_terms_tested": block["n_terms_tested"],
+            "n_terms_excluded_min_size": block["n_terms_excluded_min_size"],
+            "n_terms_no_overlap": block.get("n_terms_no_overlap", 0),
+            "universe_size": block["universe_size"],
+            "n_input_in_universe": block.get("n_input_in_universe", 0),
+            "n_input_dropped": block.get("n_input_dropped", 0),
+            "caveat": block.get("caveat"),
+            "note": block.get("note"),
+        }
+    return payload
+
+
+def _job_run_proteomics_ora(job_id: str, session: dict) -> dict:
+    """Proteomics ORA worker: runs Proteomics_module.run_ora against the
+    retriever's resolved protein table using the stored ora_config."""
+    update_job(job_id, message="Starting over-representation analysis...")
+    resolved_df = session["proteomics"]["resolved_df"]
+    if resolved_df is None:
+        raise ValueError("No resolved protein table available.")
+
+    config = session["proteomics"]["ora_config"]
+    if config is None:
+        raise ValueError("Configure the analysis first.")
+
+    def _progress(step, total, label):
+        update_job(job_id, progress=step / max(total, 1), message=label)
+
+    result = proteomics_engine.run_ora(
+        resolved_df,
+        databases=config["databases"],
+        taxon_id=session["proteomics"]["taxon_id"],
+        taxon_name=session["proteomics"].get("taxon_name", ""),
+        padj_cutoff=config["padj_cutoff"],
+        lfc_cutoff=config["lfc_cutoff"],
+        min_term_size=config["min_term_size"],
+        max_term_size=config["max_term_size"],
+        include_iea=config.get("include_iea", True),
+        custom_db=session["proteomics"].get("custom_db"),
+        background_accessions=(
+            session["proteomics"].get("background_accessions") if config.get("use_background") else None
+        ),
+        msigdb_collections=config.get("msigdb_collections"),
+        progress_callback=_progress,
+        verbose=False,
+    )
+    session["proteomics"]["ora_results"] = result
+    update_job(job_id, progress=1.0, message="Done")
+    return {
+        "tables": _serialize_proteomics_ora_tables(result["tables"]),
         "summary": result["summary"],
     }
 
@@ -3116,6 +3230,248 @@ def transcriptomics_ora_download(key: str, x_session_id: Optional[str] = Header(
         raise HTTPException(status_code=400, detail=f"Unknown result table: {key!r}")
     safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
     return df_to_csv_response(block["table"], f"transcriptomics_ora_{safe_name}.csv")
+
+
+# ---------------------------------------------------------------------------
+# Proteomics — upload / resolve / Over-Representation Analysis (ORA)
+#
+# Identifier space is UniProt accession ONLY (no identifier_type choice,
+# unlike Transcriptomics) - see Proteomics_module_retriever.py's module
+# docstring for why gene symbol was rejected as an input type.
+# ---------------------------------------------------------------------------
+
+PROTEOMICS_EXAMPLE_FILENAME = "example_proteomics_de_full.csv"
+PROTEOMICS_EXAMPLE_MESSY_FILENAME = "example_proteomics_maxquant_messy.csv"
+
+
+@app.post("/api/proteomics/upload")
+async def proteomics_upload(
+    file: UploadFile = File(...),
+    x_session_id: Optional[str] = Header(default=None),
+):
+    session = session_dep(x_session_id)
+    raw_bytes = await file.read()
+    try:
+        de_df = proteomics_retriever.load_de_table_from_bytes(raw_bytes)
+        column_mapping = proteomics_retriever.detect_columns(de_df)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # A brand new upload fully resets every downstream stage - same
+    # discipline as transcriptomics_upload, so a stale resolved table /
+    # ORA config from a PREVIOUS file can never silently leak into this run.
+    session["proteomics"] = _fresh_proteomics_state()
+    session["proteomics"]["de_df"] = de_df
+    session["proteomics"]["column_mapping"] = column_mapping
+
+    return {
+        "n_rows": len(de_df),
+        "columns": list(de_df.columns),
+        "column_mapping": column_mapping,
+        "preview": df_payload(de_df.head(10)),
+    }
+
+
+@app.post("/api/proteomics/resolve")
+def proteomics_resolve(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["proteomics"]["de_df"] is None:
+        raise HTTPException(status_code=400, detail="Upload a protein-level differential-abundance table first.")
+    taxon_id = str(payload.get("taxon_id") or "").strip()
+    if not taxon_id:
+        raise HTTPException(status_code=400, detail="Select an organism before resolving identifiers.")
+    taxon_name = str(payload.get("taxon_name") or "").strip()
+
+    job_id = submit_job(_job_resolve_proteins, session, taxon_id, taxon_name)
+    return {"job_id": job_id}
+
+
+@app.get("/api/proteomics/download/resolved.csv")
+def proteomics_download_resolved(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    resolved_df = session["proteomics"]["resolved_df"]
+    if resolved_df is None:
+        raise HTTPException(status_code=400, detail="No resolved table available.")
+    return df_to_csv_response(resolved_df, "proteomics_resolved.csv")
+
+
+@app.get("/api/proteomics/example")
+def proteomics_example(messy: bool = False):
+    """messy=true serves the deliberately dirty MaxQuant-style example
+    (protein groups, CON__/REV__ rows, '+' flag columns) - the only way to
+    demonstrate the contaminant-filtering and protein-group-parsing
+    behaviours that have no transcriptomics equivalent."""
+    fname = PROTEOMICS_EXAMPLE_MESSY_FILENAME if messy else PROTEOMICS_EXAMPLE_FILENAME
+    path = os.path.join(BASE_DIR, "Data3", fname)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Example protein-table input file not found.")
+    return FileResponse(path, filename=fname, media_type="text/csv")
+
+
+def _require_consistent_proteomics_taxon(session: dict) -> None:
+    """Proteomics analogue of _require_consistent_taxon - see that function's
+    docstring for the full rationale (a drifted organism silently mixes two
+    species in one result set rather than failing loudly)."""
+    px = session.get("proteomics") or {}
+    meta = px.get("meta") or {}
+    resolved_taxon = str(meta.get("taxon") or "").strip()
+    current_taxon = str(px.get("taxon_id") or "").strip()
+    if not resolved_taxon or not current_taxon:
+        return
+    if resolved_taxon != current_taxon:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Organism mismatch: the resolved table was built for taxon {resolved_taxon}, "
+                f"but the current organism is taxon {current_taxon}. Re-resolve your "
+                f"accessions for the current organism before running an analysis."
+            ),
+        )
+
+
+@app.post("/api/proteomics/ora/custom-db-upload")
+async def proteomics_custom_db_upload(
+    file: UploadFile = File(...),
+    x_session_id: Optional[str] = Header(default=None),
+):
+    """UniProt-accession space, matching Genomics' custom database
+    (id_type="accession" is load_custom_geneset_db's own default)."""
+    session = session_dep(x_session_id)
+    raw_bytes = await file.read()
+    try:
+        parsed = genomics_ora.load_custom_geneset_db(raw_bytes)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    parsed["filename"] = file.filename or "custom_database"
+    session["proteomics"]["custom_db"] = parsed
+
+    sample_terms = [
+        {"term": tid, "name": info["name"], "n_genes": len(info["genes"])}
+        for tid, info in list(parsed["terms"].items())[:5]
+    ]
+    return {
+        "filename": parsed["filename"],
+        "n_terms": parsed["n_terms"],
+        "universe_size": parsed["universe_size"],
+        "sample_terms": sample_terms,
+    }
+
+
+@app.post("/api/proteomics/ora/background-upload")
+async def proteomics_background_upload(
+    file: UploadFile = File(...),
+    x_session_id: Optional[str] = Header(default=None),
+):
+    """UniProt-accession-space background list, applied globally across
+    every selected database (mirrors Transcriptomics' one-shared-universe
+    pattern, not Genomics' per-database one)."""
+    session = session_dep(x_session_id)
+    raw_bytes = await file.read()
+    try:
+        accessions = genomics_ora.load_user_background_list(raw_bytes)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not accessions:
+        raise HTTPException(status_code=400, detail="No UniProt accessions could be parsed from this file.")
+    session["proteomics"]["background_accessions"] = accessions
+    return {"filename": file.filename or "background", "n_accessions": len(accessions)}
+
+
+@app.post("/api/proteomics/ora/background-remove")
+def proteomics_background_remove(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    session["proteomics"]["background_accessions"] = None
+    return {"ok": True}
+
+
+@app.get("/api/proteomics/ora/background-example")
+def proteomics_background_example():
+    path = os.path.join(BASE_DIR, "Data3", "example_proteomics_background.csv")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Example background file not found.")
+    return FileResponse(path, filename="example_proteomics_background.csv", media_type="text/csv")
+
+
+@app.post("/api/proteomics/ora/configure")
+def proteomics_ora_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["proteomics"]["resolved_df"] is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No resolved protein table available. Complete retrieval first.",
+        )
+    _require_consistent_proteomics_taxon(session)
+
+    databases = list(dict.fromkeys(
+        d for d in (payload.get("databases") or []) if d in proteomics_engine.PROTEOMICS_ORA_DATABASES
+    ))
+    if not databases:
+        raise HTTPException(status_code=400, detail="Select at least one database.")
+    if "Custom database" in databases and not session["proteomics"].get("custom_db"):
+        raise HTTPException(status_code=400, detail="Upload a custom gene-set database file first.")
+
+    msigdb_collections = list(dict.fromkeys(
+        c for c in (payload.get("msigdb_collections") or [])
+        if c in transcriptomics_engine.MSIGDB_COLLECTIONS
+    ))
+    if "MSigDB" in databases and not msigdb_collections:
+        raise HTTPException(status_code=400, detail="Select at least one MSigDB collection.")
+
+    try:
+        padj_cutoff = float(payload.get("padj_cutoff", proteomics_engine.PADJ_CUTOFF_DEFAULT))
+        lfc_cutoff = float(payload.get("lfc_cutoff", proteomics_engine.LFC_CUTOFF_DEFAULT))
+        min_term_size = int(payload.get("min_term_size", genomics_ora.MIN_TERM_SIZE))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Thresholds must be numeric.")
+
+    _MISSING = object()
+    max_term_size_raw = payload.get("max_term_size", _MISSING)
+    if max_term_size_raw is _MISSING:
+        max_term_size = genomics_ora.MAX_TERM_SIZE_DEFAULT
+    elif max_term_size_raw in (None, ""):
+        max_term_size = None
+    else:
+        try:
+            max_term_size = int(max_term_size_raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Max term size must be numeric.")
+
+    config = {
+        "databases": databases,
+        "msigdb_collections": msigdb_collections,
+        "padj_cutoff": padj_cutoff,
+        "lfc_cutoff": lfc_cutoff,
+        "min_term_size": min_term_size,
+        "max_term_size": max_term_size,
+        "include_iea": bool(payload.get("include_iea", True)),
+        "use_background": bool(payload.get("use_background", False)),
+    }
+    session["proteomics"]["ora_config"] = config
+    session["proteomics"]["ora_results"] = None
+    return {"config": config}
+
+
+@app.post("/api/proteomics/ora/run")
+def proteomics_ora_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["proteomics"]["ora_config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_run_proteomics_ora, session)
+    return {"job_id": job_id}
+
+
+@app.get("/api/proteomics/ora/download")
+def proteomics_ora_download(key: str, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    results = session["proteomics"]["ora_results"]
+    if not results:
+        raise HTTPException(status_code=400, detail="No ORA results available.")
+    block = results["tables"].get(key)
+    if block is None:
+        raise HTTPException(status_code=400, detail=f"Unknown result table: {key!r}")
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
+    return df_to_csv_response(block["table"], f"proteomics_ora_{safe_name}.csv")
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,8 @@ const STATE = {
     },
     ora: null,
     transcriptomics: null,
+    proteomics: null,
+    proteomicsModuleName: "",
 };
 
 function freshOraState() {
@@ -69,6 +71,17 @@ function freshOraState() {
         annotationConfig: { includeIea: true },
         annotationResults: null,
         annotationRunLocked: false,
+    };
+}
+
+function freshProteomicsState() {
+    return {
+        taxonId: "", taxonName: "",
+        deTable: null, uploadedFilename: "", columnMapping: null,
+        resolved: null,
+        oraConfig: null, oraResults: null, oraRunLocked: false,
+        oraSigAlpha: 0.05,
+        customDb: null, background: null,
     };
 }
 
@@ -1204,12 +1217,16 @@ function renderAnnotationAnalytics() {
     if (STATE.aaPage === "transcriptomics_regulon_results") return renderTranscriptomicsRegulonResultsScreen();
     if (STATE.aaPage === "transcriptomics_network_config") return renderTranscriptomicsNetworkConfigScreen();
     if (STATE.aaPage === "transcriptomics_network_results") return renderTranscriptomicsNetworkResultsScreen();
+    if (STATE.aaPage === "proteomics") return renderProteomicsScreen();
+    if (STATE.aaPage === "proteomics_module") return renderProteomicsModuleScreen();
+    if (STATE.aaPage === "proteomics_ora_config") return renderProteomicsOraConfigScreen();
+    if (STATE.aaPage === "proteomics_ora_results") return renderProteomicsOraResultsScreen();
 
     const wrap = el("div", {});
     wrap.appendChild(aaHeader());
 
     const topGrid = el("div", { class: "aa-module-grid aa-module-grid-top" });
-    [["Genomics", "genomics"], ["Transcriptomics", "transcriptomics"], ["Proteomics", null]].forEach(([name, key]) => {
+    [["Genomics", "genomics"], ["Transcriptomics", "transcriptomics"], ["Proteomics", "proteomics"]].forEach(([name, key]) => {
         const btn = el("button", { class: "module-btn " + name.toLowerCase() }, name);
         if (key) btn.addEventListener("click", () => { STATE.aaPage = key; render(); });
         topGrid.appendChild(btn);
@@ -2655,6 +2672,930 @@ function renderTranscriptomicsOraResultsScreen() {
     wrap.appendChild(newRunBtn);
     wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
     wrap.appendChild(backToTranscriptomicsActions());
+    return wrap;
+}
+
+// ---------------------------------------------------------------------------
+// Proteomics — tile grid, upload/resolve, Over-Representation Analysis
+//
+// Identifier space is UniProt accession ONLY - no identifierType choice,
+// unlike Transcriptomics (see Proteomics_module_retriever.py's module
+// docstring for why). Only ORA is wired this milestone; the other three
+// tiles (Quantitative Enrichment, PPI Network, PTM) are visible but
+// disabled, matching TRANSCRIPTOMICS_TILES_NOT_YET_IMPLEMENTED's pattern.
+// ---------------------------------------------------------------------------
+
+const PROTEOMICS_TILES_NOT_YET_IMPLEMENTED = new Set([
+    "Quantitative Enrichment", "PPI Network / Module Detection", "PTM / Phosphosite Enrichment",
+]);
+
+const PROTEOMICS_ORA_DATABASES = [
+    "GO", "Reactome", "MSigDB", "UniProt (disease)", "UniProt (keywords)",
+    "InterPro", "Complex Portal", "Custom database",
+];
+
+function renderProteomicsScreen() {
+    const wrap = el("div", {});
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle" }, "Proteomics"));
+    const grid = el("div", { class: "aa-genomics-grid" });
+    [
+        "Over-Representation Analysis",
+        "Quantitative Enrichment",
+        "PPI Network / Module Detection",
+        "PTM / Phosphosite Enrichment",
+    ].forEach((name) => {
+        const notYetImplemented = PROTEOMICS_TILES_NOT_YET_IMPLEMENTED.has(name);
+        const btn = el("button", {
+            class: "module-btn proteomics" + (notYetImplemented ? " module-btn-disabled" : ""),
+            title: notYetImplemented ? name + " is not implemented yet - coming soon." : "",
+        }, name + (notYetImplemented ? " (coming soon)" : ""));
+        btn.disabled = notYetImplemented;
+        btn.addEventListener("click", () => {
+            if (notYetImplemented) return;
+            STATE.aaPage = "proteomics_module";
+            STATE.proteomicsModuleName = name;
+            STATE.proteomics = freshProteomicsState();
+            render();
+        });
+        grid.appendChild(btn);
+    });
+    wrap.appendChild(grid);
+    return wrap;
+}
+
+function backToProteomicsActions() {
+    const actions = el("div", { class: "right-actions" });
+    const btn = el("button", { class: "btn" }, "Back to Proteomics");
+    btn.addEventListener("click", () => { STATE.aaPage = "proteomics"; render(); });
+    actions.appendChild(el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, btn));
+    return actions;
+}
+
+function renderProteomicsOrganismSelector() {
+    const wrap = el("div", {});
+    const input = el("input", { class: "text-input", type: "text",
+        placeholder: "Species / organism (name or UniProt taxon ID)" });
+    const resultsSelect = el("select", { class: "hidden" });
+    const selectedCaption = el("div", { class: "caption" });
+
+    function refreshCaption() {
+        selectedCaption.textContent = STATE.proteomics.taxonId
+            ? "Selected: " + STATE.proteomics.taxonName + " (taxon " + STATE.proteomics.taxonId + ")"
+            : "";
+    }
+    refreshCaption();
+
+    let lastQuery = "";
+    let timer = null;
+    input.addEventListener("input", () => {
+        const query = input.value.trim();
+        if (timer) clearTimeout(timer);
+        if (query.length < 3) {
+            resultsSelect.innerHTML = "";
+            resultsSelect.classList.add("hidden");
+            return;
+        }
+        timer = setTimeout(async () => {
+            if (query === lastQuery) return;
+            lastQuery = query;
+            try {
+                const data = await apiJson("/api/contexts/search?database=" + encodeURIComponent("Rhea + UniProt") + "&query=" + encodeURIComponent(query) + "&limit=10");
+                resultsSelect.innerHTML = "";
+                resultsSelect.appendChild(el("option", { value: "" }, "Select organism"));
+                (data.results || []).forEach((rec, idx) => {
+                    const label = rec.context_id && rec.context_name ? rec.context_id + " | " + rec.context_name : (rec.context_name || rec.context_id || "");
+                    resultsSelect.appendChild(el("option", { value: String(idx) }, label));
+                });
+                resultsSelect._records = data.results || [];
+                resultsSelect.classList.toggle("hidden", (data.results || []).length === 0);
+            } catch (err) { /* keep prior dropdown contents on transient search errors */ }
+        }, 350);
+    });
+
+    resultsSelect.addEventListener("change", () => {
+        if (resultsSelect.value === "") return;
+        const rec = resultsSelect._records[parseInt(resultsSelect.value, 10)];
+        const newTaxonId = String(rec.context_id || "");
+        const hadResolvedForDifferentOrganism =
+            !!STATE.proteomics.resolved && newTaxonId !== STATE.proteomics.taxonId;
+        STATE.proteomics.taxonId = newTaxonId;
+        STATE.proteomics.taxonName = String(rec.context_name || "");
+        if (hadResolvedForDifferentOrganism) {
+            STATE.proteomics.resolved = null;
+            STATE.proteomics.oraConfig = null;
+            STATE.proteomics.oraResults = null;
+            STATE.proteomics.oraRunLocked = false;
+        }
+        render();
+    });
+
+    wrap.appendChild(input);
+    wrap.appendChild(resultsSelect);
+    wrap.appendChild(selectedCaption);
+    return wrap;
+}
+
+function renderProteomicsUploadSection() {
+    const wrap = el("div", {});
+    wrap.appendChild(el("div", { class: "section-label" }, "Upload protein-level differential-abundance table"));
+    wrap.appendChild(fileInputWidget({
+        accept: ".csv",
+        buttonLabel: "Choose CSV file",
+        initialFilename: STATE.proteomics.uploadedFilename,
+        onChange: async (file) => {
+            if (!file) return;
+            const formData = new FormData();
+            formData.append("file", file);
+            try {
+                const data = await apiUpload("/api/proteomics/upload", formData);
+                STATE.proteomics.deTable = data.preview;
+                STATE.proteomics.uploadedFilename = file.name;
+                STATE.proteomics.columnMapping = data.column_mapping;
+                // Server's upload endpoint resets the whole session sub-dict -
+                // clear client-side too, or the UI would keep showing state
+                // the server can no longer serve (mirrors Transcriptomics).
+                STATE.proteomics.customDb = null;
+                STATE.proteomics.background = null;
+                STATE.proteomics.resolved = null;
+                STATE.proteomics.oraConfig = null;
+                STATE.proteomics.oraResults = null;
+                STATE.proteomics.oraRunLocked = false;
+                render();
+            } catch (err) {
+                alert(err.message);
+            }
+        },
+    }));
+
+    wrap.appendChild(el("div", { class: "caption" },
+        "Required columns: UniProt accession (or protein group, e.g. \"P04637;P04637-2\") + log2FC + " +
+        "pvalue. Optional: padj/FDR (computed via Benjamini-Hochberg if omitted); MaxQuant's QC flag " +
+        "columns (\"Potential contaminant\", \"Reverse\", \"Only identified by site\") are auto-detected " +
+        "and those rows removed, alongside any CON__/REV__-prefixed ID."));
+
+    const exLink = el("button", { class: "ora-inline-example-link", type: "button" }, "Example file");
+    exLink.addEventListener("click", () => downloadFile("/api/proteomics/example", "example_proteomics_de_full.csv"));
+    wrap.appendChild(exLink);
+    const messyLink = el("button", { class: "ora-inline-example-link", type: "button" }, "Messy MaxQuant-style example");
+    messyLink.addEventListener("click", () => downloadFile("/api/proteomics/example?messy=true", "example_proteomics_maxquant_messy.csv"));
+    wrap.appendChild(document.createTextNode(" "));
+    wrap.appendChild(messyLink);
+    wrap.appendChild(el("div", { class: "caption" },
+        "The messy example deliberately contains protein groups, CON__/REV__ rows, and QC flag columns - " +
+        "upload it to see the contaminant-filtering report below."));
+
+    if (STATE.proteomics.deTable) {
+        if (STATE.proteomics.columnMapping) {
+            const cm = STATE.proteomics.columnMapping;
+            const parts = Object.keys(cm).map((k) => k + " -> " + cm[k]);
+            wrap.appendChild(el("div", { class: "caption" }, "Detected columns: " + parts.join(", ")));
+        }
+        wrap.appendChild(buildTable(STATE.proteomics.deTable, { maxHeight: 300 }));
+    }
+
+    return wrap;
+}
+
+function renderProteomicsResolveControls() {
+    const wrap = el("div", {});
+    const disabled = !STATE.proteomics.deTable || !STATE.proteomics.taxonId;
+    const btn = el("button", { class: "btn" }, "Resolve accessions");
+    btn.disabled = disabled;
+    btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        const spinner = el("div", { class: "caption" }, "Resolving accessions via UniProt ID Mapping...");
+        wrap.appendChild(spinner);
+        try {
+            const { job_id } = await apiPostJson("/api/proteomics/resolve", {
+                taxon_id: STATE.proteomics.taxonId,
+                taxon_name: STATE.proteomics.taxonName,
+            });
+            pollJob(job_id, {
+                onDone: (result) => {
+                    STATE.proteomics.resolved = result;
+                    render();
+                },
+                onError: (err) => { alert(err); render(); },
+            });
+        } catch (err) {
+            alert(err.message);
+            render();
+        }
+    });
+    wrap.appendChild(btn);
+    return wrap;
+}
+
+function renderProteomicsResults() {
+    const wrap = el("div", {});
+    const resolved = STATE.proteomics.resolved;
+    const meta = resolved.metrics;
+    wrap.appendChild(el("div", { class: "section-label" }, "Resolved protein table"));
+    wrap.appendChild(buildTable(resolved.resolved_table, { maxHeight: 420 }));
+    wrap.appendChild(metricCards([
+        ["Mapped", meta.n_mapped],
+        ["Unmapped", meta.n_unmapped],
+        ["Resolved via secondary accession", meta.n_resolved_secondary],
+        ["Duplicates collapsed", meta.n_duplicates_collapsed],
+        ["Dropped (non-numeric)", meta.n_dropped_nonnumeric],
+    ], 5));
+
+    // Contaminant/decoy report - the proteomics-specific behaviour with no
+    // transcriptomics equivalent, so it earns its own visible block rather
+    // than being buried in the generic metric cards above.
+    const c = meta.contaminants || {};
+    if (c.n_total_removed > 0) {
+        wrap.appendChild(alertBox("info",
+            c.n_total_removed + " contaminant/decoy row(s) removed before resolution: " +
+            c.n_prefix_removed + " by CON__/REV__ ID prefix" +
+            (c.flag_columns_found && c.flag_columns_found.length
+                ? ", " + c.n_flagged_removed + " by QC flag column(s) (" + c.flag_columns_found.join(", ") + ")"
+                : "") + "."));
+    }
+    if (meta.padj_computed) {
+        wrap.appendChild(alertBox("info",
+            "No adjusted p-value (padj/FDR) column was found - it was computed automatically via " +
+            "Benjamini-Hochberg from the p-value column."));
+    }
+    if (meta.n_fetch_failures > 0) {
+        wrap.appendChild(alertBox("warning",
+            meta.n_fetch_failures + " UniProt ID Mapping batch(es) failed after retries. Consider " +
+            "re-running if this table looks incomplete."));
+    }
+
+    const dlResolvedBtn = el("button", { class: "btn" }, "Download resolved table (CSV)");
+    dlResolvedBtn.addEventListener("click", () => {
+        downloadFile("/api/proteomics/download/resolved.csv", "proteomics_resolved.csv");
+    });
+    wrap.appendChild(dlResolvedBtn);
+
+    if (STATE.proteomicsModuleName === "Over-Representation Analysis") {
+        const continueBtn = el("button", { class: "btn btn-primary", style: { marginTop: "0.8rem" } }, "Continue to Over-Representation Analysis");
+        continueBtn.addEventListener("click", () => {
+            STATE.proteomics.oraConfig = null;
+            STATE.proteomics.oraResults = null;
+            STATE.proteomics.oraRunLocked = false;
+            STATE.aaPage = "proteomics_ora_config";
+            render();
+        });
+        wrap.appendChild(continueBtn);
+    } else {
+        wrap.appendChild(el("div", { class: "caption" }, "This analysis module is not available yet."));
+    }
+    return wrap;
+}
+
+function renderProteomicsModuleScreen() {
+    const wrap = el("div", { class: "ora-config-screen ora-module-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Proteomics — " + STATE.proteomicsModuleName));
+    wrap.appendChild(el("div", { class: "section-label" }, "Organism"));
+    wrap.appendChild(renderProteomicsOrganismSelector());
+    wrap.appendChild(renderProteomicsUploadSection());
+    wrap.appendChild(renderProteomicsResolveControls());
+    if (STATE.proteomics.resolved) wrap.appendChild(renderProteomicsResults());
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToProteomicsActions());
+    return wrap;
+}
+
+function renderProteomicsCustomDbWidget(locked) {
+    const wrap = el("div", { class: "ora-custom-db-widget" });
+    wrap.appendChild(el("div", { class: "section-label" }, "Custom database"));
+    wrap.appendChild(el("div", { class: "caption" },
+        "Upload your own gene sets (GMT or a tidy term/gene table), in UniProt-accession space."));
+
+    if (!locked) {
+        wrap.appendChild(fileInputWidget({
+            accept: ".gmt,.txt,.tsv,.csv",
+            buttonLabel: "Choose gene-set file",
+            initialFilename: STATE.proteomics.customDb ? STATE.proteomics.customDb.filename : "",
+            onChange: async (file) => {
+                if (!file) return;
+                const formData = new FormData();
+                formData.append("file", file);
+                try {
+                    const data = await apiUpload("/api/proteomics/ora/custom-db-upload", formData);
+                    STATE.proteomics.customDb = data;
+                    render();
+                } catch (err) {
+                    STATE.proteomics.customDb = null;
+                    alert(err.message);
+                    render();
+                }
+            },
+        }));
+    }
+
+    if (STATE.proteomics.customDb) {
+        const s = STATE.proteomics.customDb;
+        wrap.appendChild(el("div", { class: "caption ora-custom-summary" },
+            "Loaded \"" + s.filename + "\": " + s.n_terms + " gene set(s), " + s.universe_size + " unique accessions."));
+    }
+    return wrap;
+}
+
+function renderProteomicsBackgroundWidget(locked, draft) {
+    const wrap = el("div", { class: "ora-background-widget" });
+
+    const toggleRow = el("div", { class: "ora-iea-row ora-background-toggle-row" });
+    const toggleCb = el("input", { type: "checkbox", class: "ora-iea-checkbox ora-background-checkbox" });
+    toggleCb.checked = draft.useBackground;
+    toggleCb.disabled = locked;
+    toggleCb.addEventListener("change", () => { draft.useBackground = toggleCb.checked; render(); });
+    toggleRow.appendChild(toggleCb);
+    toggleRow.appendChild(document.createTextNode(" Background accession list (optional)"));
+    wrap.appendChild(toggleRow);
+
+    if (!draft.useBackground) return wrap;
+
+    const body = el("div", { class: "ora-background-body" });
+    if (!locked) {
+        body.appendChild(fileInputWidget({
+            accept: ".txt,.csv,.tsv",
+            buttonLabel: "Choose background file",
+            initialFilename: STATE.proteomics.background ? STATE.proteomics.background.filename : "",
+            onChange: async (file) => {
+                if (!file) return;
+                const formData = new FormData();
+                formData.append("file", file);
+                try {
+                    const data = await apiUpload("/api/proteomics/ora/background-upload", formData);
+                    STATE.proteomics.background = { filename: data.filename, n_accessions: data.n_accessions };
+                    render();
+                } catch (err) {
+                    STATE.proteomics.background = null;
+                    alert(err.message);
+                    render();
+                }
+            },
+        }));
+    }
+
+    if (STATE.proteomics.background) {
+        const s = STATE.proteomics.background;
+        body.appendChild(el("div", { class: "caption ora-background-summary" },
+            "Background: \"" + s.filename + "\" - " + s.n_accessions + " UniProt accession(s). Restricts " +
+            "the universe (for every selected database) to accessions present in both this list and the " +
+            "proteins quantified in this experiment."));
+        if (!locked) {
+            const removeBtn = el("button", { class: "btn btn-small ora-background-remove", type: "button" }, "Remove background");
+            removeBtn.addEventListener("click", async () => {
+                try { await apiPostJson("/api/proteomics/ora/background-remove", {}); } catch (err) { /* ignore */ }
+                STATE.proteomics.background = null;
+                render();
+            });
+            body.appendChild(removeBtn);
+        }
+    } else {
+        const exampleLink = el("button", { class: "ora-inline-example-link", type: "button" }, "example file");
+        exampleLink.addEventListener("click", () => {
+            downloadFile("/api/proteomics/ora/background-example", "example_proteomics_background.csv");
+        });
+        body.appendChild(el("div", { class: "caption ora-background-help" }, [
+            "Provide UniProt accessions (one per line, or a column headed \"UniProt Accession\") for a " +
+            "narrower reference set. Leave off to use the default: every protein quantified in this " +
+            "experiment. (",
+            exampleLink,
+            ")",
+        ]));
+    }
+    wrap.appendChild(body);
+    return wrap;
+}
+
+function renderProteomicsOraConfigScreen() {
+    const wrap = el("div", { class: "ora-config-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Proteomics — Over-Representation Analysis: database"));
+
+    const locked = STATE.proteomics.oraRunLocked;
+    if (locked) {
+        wrap.appendChild(alertBox("info", "Configuration is locked for the in-progress/completed run. Use \"Start new run\" on the results screen to change settings."));
+    }
+
+    if (!STATE.proteomics._oraDraft) {
+        STATE.proteomics._oraDraft = {
+            databases: [], msigdbCollections: [],
+            padjCutoff: 0.05, lfcCutoff: 1.0,
+            minTermSize: 10, maxTermSize: 500,
+            includeIea: true, useBackground: false,
+        };
+    }
+    const draft = STATE.proteomics._oraDraft;
+
+    wrap.appendChild(el("div", { class: "section-label ora-select-label" }, "Select database(s)"));
+    const checkRow = el("div", { class: "db-checkbox-row ora-db-checkbox-row" });
+    const runBtnWrap = el("div", { class: "col" });
+
+    function renderOraRunBtn() {
+        runBtnWrap.innerHTML = "";
+        const runBtn = el("button", { class: "btn btn-primary ora-run-btn" }, "Run");
+        const needsCustomDb = draft.databases.indexOf("Custom database") !== -1 && !STATE.proteomics.customDb;
+        const needsMsigdbCollection = draft.databases.indexOf("MSigDB") !== -1 && draft.msigdbCollections.length === 0;
+        runBtn.disabled = locked || draft.databases.length === 0 || needsCustomDb || needsMsigdbCollection;
+        runBtn.addEventListener("click", () => startProteomicsOraRun(draft));
+        runBtnWrap.appendChild(runBtn);
+    }
+
+    const taxonId = STATE.proteomics.taxonId;
+    const msigdbAvailable = _msigdbAvailableForTaxon(taxonId);
+    PROTEOMICS_ORA_DATABASES.forEach((dbName) => {
+        const unavailable = dbName === "MSigDB" && !msigdbAvailable;
+        if (unavailable) draft.databases = draft.databases.filter((d) => d !== dbName);
+        const label = el("label", { class: "ora-db-pill" });
+        const cb = el("input", { type: "checkbox", class: "ora-db-checkbox" });
+        cb.disabled = locked || unavailable;
+        cb.checked = !unavailable && draft.databases.indexOf(dbName) !== -1;
+        cb.addEventListener("change", () => {
+            if (cb.checked) {
+                if (draft.databases.indexOf(dbName) === -1) draft.databases.push(dbName);
+            } else {
+                draft.databases = draft.databases.filter((d) => d !== dbName);
+            }
+            if (dbName === "Custom database" || dbName === "MSigDB") render();
+            else renderOraRunBtn();
+        });
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(" " + dbName + (unavailable ? " (human/mouse only)" : "")));
+        checkRow.appendChild(label);
+    });
+    wrap.appendChild(checkRow);
+    if (!msigdbAvailable) {
+        wrap.appendChild(el("div", { class: "caption" },
+            "MSigDB is disabled: it covers human and mouse only."));
+    }
+    if (draft.databases.indexOf("MSigDB") !== -1 && msigdbAvailable) {
+        wrap.appendChild(renderMsigdbCollectionSelector(locked, draft, taxonId, renderOraRunBtn));
+    }
+    if (draft.databases.indexOf("Custom database") !== -1) {
+        wrap.appendChild(renderProteomicsCustomDbWidget(locked));
+    }
+    wrap.appendChild(el("div", { class: "caption" },
+        "GO / Reactome / MSigDB / Custom: same engines as Transcriptomics. UniProt (disease) and " +
+        "UniProt (keywords): UniProt's own curated annotations. InterPro: protein domain/family " +
+        "membership. Complex Portal: known macromolecular complexes (CC0). Each is tested against all " +
+        "significant proteins, and separately against up- and down-regulated ones - independently " +
+        "FDR-corrected, never pooled."));
+
+    wrap.appendChild(renderProteomicsBackgroundWidget(locked, draft));
+
+    function numberField(labelText, value, step, onChange) {
+        const col = el("div", { class: "col" });
+        col.appendChild(el("div", { class: "chart-option-label" }, labelText));
+        const input = el("input", { type: "number", class: "text-input", step: step });
+        input.value = value;
+        input.disabled = locked;
+        input.addEventListener("change", () => {
+            const v = parseFloat(input.value);
+            if (isFinite(v)) onChange(v);
+        });
+        col.appendChild(input);
+        return col;
+    }
+
+    const thresholdRow = el("div", { class: "row", style: { marginTop: "0.8rem" } });
+    thresholdRow.appendChild(numberField("Adjusted p-value (padj) cutoff", draft.padjCutoff, "0.001", (v) => { draft.padjCutoff = v; }));
+    thresholdRow.appendChild(numberField("|log2 Fold-Change| cutoff", draft.lfcCutoff, "0.1", (v) => { draft.lfcCutoff = v; }));
+    wrap.appendChild(thresholdRow);
+
+    const termSizeRow = el("div", { class: "row" });
+    const minCol = el("div", { class: "col" });
+    minCol.appendChild(el("div", { class: "chart-option-label" }, "Minimum term size (proteins)"));
+    const minInput = el("input", { type: "number", class: "text-input", min: "1", step: "1" });
+    minInput.value = draft.minTermSize;
+    minInput.disabled = locked;
+    minInput.addEventListener("change", () => {
+        const v = parseInt(minInput.value, 10);
+        draft.minTermSize = (isFinite(v) && v >= 1) ? v : 10;
+        minInput.value = draft.minTermSize;
+    });
+    minCol.appendChild(minInput);
+    termSizeRow.appendChild(minCol);
+
+    const maxCol = el("div", { class: "col" });
+    maxCol.appendChild(el("div", { class: "chart-option-label" }, "Maximum term size (proteins, blank = no limit)"));
+    const maxInput = el("input", { type: "number", class: "text-input", min: "1", step: "1", placeholder: "no limit" });
+    maxInput.value = draft.maxTermSize;
+    maxInput.disabled = locked;
+    maxInput.addEventListener("change", () => {
+        const raw = maxInput.value.trim();
+        draft.maxTermSize = raw === "" ? "" : parseInt(raw, 10);
+    });
+    maxCol.appendChild(maxInput);
+    termSizeRow.appendChild(maxCol);
+    wrap.appendChild(termSizeRow);
+
+    const ieaRow = el("div", { class: "row", style: { alignItems: "center", marginTop: "0.5rem" } });
+    const ieaLabel = el("label", { style: { display: "flex", alignItems: "center", gap: "0.4rem" } });
+    const ieaCheckbox = el("input", { type: "checkbox" });
+    ieaCheckbox.checked = draft.includeIea;
+    ieaCheckbox.disabled = locked;
+    ieaCheckbox.addEventListener("change", () => { draft.includeIea = ieaCheckbox.checked; });
+    ieaLabel.appendChild(ieaCheckbox);
+    ieaLabel.appendChild(document.createTextNode(" Include electronic annotations (IEA)"));
+    ieaRow.appendChild(ieaLabel);
+    wrap.appendChild(ieaRow);
+    wrap.appendChild(el("div", { class: "caption" },
+        "Applies to GO and Reactome. Uncheck to restrict both to curated (non-electronic) evidence only."));
+
+    const actions = el("div", { class: "right-actions", style: { marginTop: "1rem" } });
+    const btnRow = el("div", { class: "btn-row" });
+    const backBtn = el("button", { class: "btn" }, "Back");
+    backBtn.addEventListener("click", () => { STATE.aaPage = "proteomics_module"; render(); });
+    btnRow.appendChild(backBtn);
+    renderOraRunBtn();
+    btnRow.appendChild(runBtnWrap);
+    actions.appendChild(btnRow);
+    wrap.appendChild(actions);
+
+    return wrap;
+}
+
+function startProteomicsOraRun(draft) {
+    if (draft.databases.length === 0) return;
+    const payload = {
+        msigdb_collections: draft.databases.indexOf("MSigDB") !== -1 ? draft.msigdbCollections : [],
+        databases: draft.databases,
+        padj_cutoff: draft.padjCutoff,
+        lfc_cutoff: draft.lfcCutoff,
+        min_term_size: draft.minTermSize,
+        max_term_size: draft.maxTermSize === "" ? null : draft.maxTermSize,
+        include_iea: draft.includeIea,
+        use_background: !!(draft.useBackground && STATE.proteomics.background),
+    };
+    apiPostJson("/api/proteomics/ora/configure", payload).then(() => {
+        STATE.proteomics.oraConfig = payload;
+        STATE.proteomics.oraRunLocked = true;
+        STATE.proteomics.oraResults = null;
+        STATE.aaPage = "proteomics_ora_results";
+        render();
+        return apiPostJson("/api/proteomics/ora/run", {});
+    }).then(({ job_id }) => {
+        pollJob(job_id, {
+            onProgress: (job) => {
+                const bar = document.getElementById("proteomics-ora-progress-inner");
+                const label = document.getElementById("proteomics-ora-progress-label");
+                if (bar) bar.style.width = Math.round((job.progress || 0) * 100) + "%";
+                if (label) label.textContent = job.message || "";
+            },
+            onDone: (result) => { STATE.proteomics.oraResults = result; render(); },
+            onError: (err) => {
+                alert("ORA run failed: " + err);
+                STATE.proteomics.oraRunLocked = false;
+                render();
+            },
+        });
+    }).catch((err) => {
+        alert(err.message);
+        STATE.proteomics.oraRunLocked = false;
+        render();
+    });
+}
+
+const PROTEOMICS_ORA_FAMILY_ORDER = [
+    "GO: Biological Process", "GO: Molecular Function", "GO: Cellular Component",
+    "Reactome", "UniProt disease", "UniProt keywords", "InterPro", "Complex Portal",
+    ...TRANSCRIPTOMICS_MSIGDB_COLLECTIONS.map((c) => "MSigDB: " + c.label),
+    "Custom database",
+];
+const PROTEOMICS_ORA_DIRECTION_ORDER = ["all", "up", "down"];
+
+function _splitProteomicsOraKey(key) {
+    const m = key.match(/^(.*) \((all|up|down)\)$/);
+    return m ? [m[1], m[2]] : [key, "all"];
+}
+function _sortedProteomicsOraKeys(tables) {
+    return Object.keys(tables).sort((a, b) => {
+        const [famA, dirA] = _splitProteomicsOraKey(a);
+        const [famB, dirB] = _splitProteomicsOraKey(b);
+        const iA = PROTEOMICS_ORA_FAMILY_ORDER.indexOf(famA);
+        const iB = PROTEOMICS_ORA_FAMILY_ORDER.indexOf(famB);
+        if (iA !== iB) return iA - iB;
+        return PROTEOMICS_ORA_DIRECTION_ORDER.indexOf(dirA) - PROTEOMICS_ORA_DIRECTION_ORDER.indexOf(dirB);
+    });
+}
+function _proteomicsOraSlug(key) {
+    return key.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+function renderProteomicsOraResultsScreen() {
+    const wrap = el("div", { class: "ora-config-screen ora-results-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Proteomics — Over-Representation Analysis: results"));
+
+    if (!STATE.proteomics.oraResults) {
+        wrap.appendChild(alertBox("info", "Running analysis..."));
+        const progressWrap = el("div", { class: "progress-wrap" });
+        const progressInner = el("div", { id: "proteomics-ora-progress-inner", class: "progress-bar-inner", style: { width: "0%" } });
+        progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, progressInner));
+        progressWrap.appendChild(el("div", { id: "proteomics-ora-progress-label", class: "progress-label" }, ""));
+        wrap.appendChild(progressWrap);
+        return wrap;
+    }
+
+    const { tables, summary } = STATE.proteomics.oraResults;
+
+    wrap.appendChild(metricCards([
+        ["Universe (quantified proteins)", summary.n_universe],
+        ["Significant (all)", summary.n_sig_all],
+        ["Significant (up)", summary.n_sig_up],
+        ["Significant (down)", summary.n_sig_down],
+    ], 4));
+
+    if (summary.background_applied) {
+        const sigDropped = summary.n_sig_all_before_background - summary.n_sig_all;
+        wrap.appendChild(el("div", { class: "caption" },
+            "Background accession list applied: universe narrowed from " + summary.n_universe_before_background +
+            " quantified proteins to " + summary.n_universe + " (intersected with your uploaded background)." +
+            (sigDropped > 0
+                ? " " + sigDropped + " significant protein(s) outside the background were excluded from every count below."
+                : "")));
+    }
+
+    // Per-protein log2FC lookup (accession -> log2FC), built once from the
+    // retriever's resolved table - feeds the protein volcano and the
+    // protein-concept network's node coloring (reuses Transcriptomics'
+    // builders unchanged: both key off table cell TEXT, which is accessions
+    // here rather than gene symbols, and the label fallback in the volcano
+    // builder already reads gene_symbol/input_id from these exact rows).
+    const proteinLog2FC = {};
+    const resolvedRows = (STATE.proteomics.resolved && STATE.proteomics.resolved.resolved_table && STATE.proteomics.resolved.resolved_table.rows) || [];
+    resolvedRows.forEach((r) => {
+        const acc = String(r.accession || "").toUpperCase();
+        if (acc && r.log2FC !== null && isFinite(Number(r.log2FC))) proteinLog2FC[acc] = Number(r.log2FC);
+    });
+    const oraCfg = STATE.proteomics.oraConfig || {};
+    const padjCutoff = typeof oraCfg.padj_cutoff === "number" ? oraCfg.padj_cutoff : 0.05;
+    const lfcCutoff = typeof oraCfg.lfc_cutoff === "number" ? oraCfg.lfc_cutoff : 1.0;
+
+    let refreshMsigdbSummary = null;
+
+    const alphaRow = el("div", { class: "ora-sig-threshold-row" });
+    alphaRow.appendChild(el("span", { class: "chart-option-label" }, "Significance threshold (FDR <)"));
+    const alphaInput = el("input", { type: "number", class: "ora-sig-threshold-input", min: "0", max: "1", step: "0.001" });
+    alphaInput.value = STATE.proteomics.oraSigAlpha;
+    alphaInput.addEventListener("change", () => {
+        let v = parseFloat(alphaInput.value);
+        if (!isFinite(v) || v <= 0 || v > 1) v = 0.05;
+        STATE.proteomics.oraSigAlpha = v;
+        alphaInput.value = v;
+        renderPanel(select.value);
+        if (refreshMsigdbSummary) refreshMsigdbSummary();
+    });
+    alphaRow.appendChild(alphaInput);
+    wrap.appendChild(alphaRow);
+
+    wrap.appendChild(el("div", { class: "caption" },
+        "Each database x direction (and each selected MSigDB collection x direction) is independently " +
+        "Benjamini-Hochberg corrected - there is no correction ACROSS these families. Scanning every " +
+        "table and reporting the best hit across all of them inflates the true error rate above what " +
+        "any single FDR column states."));
+
+    const hasMsigdbFamilies = Object.keys(tables).some((k) => k.startsWith("MSigDB: ") && k.endsWith(" (all)"));
+    if (hasMsigdbFamilies) {
+        const summaryCard = el("div", { class: "ora-db-card msigdb-summary-card" });
+        summaryCard.appendChild(el("div", { class: "result-pane-header" },
+            el("h2", { class: "result-pane-title" }, "MSigDB collections")));
+        const summaryDiv = el("div", { id: _oraChartId("msigdbsummary", "proteomics_ora", null), class: "chart-container", style: { display: "none" } });
+        let summaryShown = false, summaryBuilt = false;
+        const summaryBtn = el("button", { class: "btn chart-toggle-btn" }, "Show MSigDB collection summary");
+        summaryBtn.addEventListener("click", () => {
+            if (!summaryShown) {
+                summaryDiv.style.display = "";
+                if (!summaryBuilt) {
+                    buildMsigdbOraCollectionSummary(summaryDiv, tables, STATE.proteomics.oraSigAlpha, "proteomics_ora");
+                    summaryBuilt = true;
+                } else if (typeof Plotly !== "undefined") Plotly.Plots.resize(summaryDiv);
+                summaryShown = true; summaryBtn.textContent = "Hide MSigDB collection summary";
+            } else { summaryDiv.style.display = "none"; summaryShown = false; summaryBtn.textContent = "Show MSigDB collection summary"; }
+        });
+        refreshMsigdbSummary = () => {
+            summaryBuilt = false;
+            if (summaryShown) {
+                buildMsigdbOraCollectionSummary(summaryDiv, tables, STATE.proteomics.oraSigAlpha, "proteomics_ora");
+                summaryBuilt = true;
+            }
+        };
+        summaryCard.appendChild(summaryBtn);
+        summaryCard.appendChild(summaryDiv);
+        wrap.appendChild(summaryCard);
+    }
+
+    const sortedKeys = _sortedProteomicsOraKeys(tables);
+    const selectorRow = el("div", { class: "row" });
+    const select = el("select", { class: "text-input transcriptomics-ora-result-select" });
+    sortedKeys.forEach((key) => {
+        const block = tables[key];
+        const suffix = block.n_terms_tested > 0 ? ` (${block.n_terms_tested} terms)` : " (no terms)";
+        select.appendChild(el("option", { value: key }, key + suffix));
+    });
+    selectorRow.appendChild(el("div", { class: "col" }, select));
+    wrap.appendChild(selectorRow);
+
+    const panelHost = el("div", {});
+    wrap.appendChild(panelHost);
+
+    function renderPanel(key) {
+        panelHost.innerHTML = "";
+        const block = tables[key];
+        if (!block) return;
+        const alpha = STATE.proteomics.oraSigAlpha;
+        const slug = _proteomicsOraSlug(key);
+        const card = el("div", { class: "rank-card ora-db-card ora-result-card ora-db-card-" + slug });
+        panelHost.appendChild(card);
+        const nav = makeResultNav(card, { stateKey: "proteomics_ora" });
+
+        const overviewPane = nav.pane("Overview");
+        if (block.caveat) overviewPane.appendChild(alertBox("warning", block.caveat));
+        if (block.note) overviewPane.appendChild(alertBox("info", block.note));
+        if (block.n_terms_tested > 0) {
+            overviewPane.appendChild(metricCards([
+                ["Terms tested", block.n_terms_tested],
+                ["Universe size", block.universe_size],
+                ["Significant proteins in universe", block.n_input_in_universe],
+                ["Excluded by term-size filter", block.n_terms_excluded_min_size],
+            ], 4));
+        }
+        if (block.n_terms_no_overlap > 0) {
+            overviewPane.appendChild(el("div", { class: "caption" },
+                block.n_terms_no_overlap + " term(s) contained none of the significant proteins and were " +
+                "not tested (excluded from the FDR calculation, not shown)."));
+        }
+        if (!block.table.rows || block.table.rows.length === 0) {
+            const reason = block.note || block.caveat ? null : (
+                block.n_terms_no_overlap > 0
+                    ? "No term (of the size-eligible ones) contained any significant protein for this selection."
+                    : "No terms passed the term-size filter for this selection."
+            );
+            if (reason) overviewPane.appendChild(alertBox("info", reason));
+            nav.finish();
+            return;
+        }
+
+        const tablePane = nav.pane("Result table");
+        tablePane.appendChild(buildTable(block.table, {
+            maxHeight: 480,
+            rowClassFn: (row) => {
+                const fdr = row["FDR"];
+                return (fdr !== "" && fdr !== null && isFinite(Number(fdr)) && Number(fdr) < alpha) ? "row-significant" : null;
+            },
+            cellFormatFn: (col, val) => {
+                if (col === "p-value" || col === "FDR" || col === "Bonferroni") return _fmtSci(val, 3);
+                if (col === "Fold Enrichment") return _fmtFixed(val, 2);
+                return val;
+            },
+        }));
+        const dlBtn = el("button", { class: "btn" }, "Download result table");
+        dlBtn.addEventListener("click", () => {
+            downloadFile("/api/proteomics/ora/download?key=" + encodeURIComponent(key),
+                         "proteomics_ora_" + _proteomicsOraSlug(key) + ".csv");
+        });
+        tablePane.appendChild(dlBtn);
+
+        const hasSigRows = (block.table.rows || []).some(row =>
+            row["FDR"] !== null && row["FDR"] !== "" && isFinite(Number(row["FDR"])) && Number(row["FDR"]) < alpha
+        );
+        if (!hasSigRows) { nav.finish(); return; }
+
+        function makeChartPane(title) {
+            const p = nav.pane(title, { group: "Charts" });
+            const controls = el("div", { class: "chart-toggle-row" });
+            const area = el("div", { class: "chart-pair" });
+            p.appendChild(controls);
+            p.appendChild(area);
+            const toggles = [];
+            return {
+                el: p,
+                option: (label, options, initialValue, onChange) => {
+                    const control = el("label", { class: "chart-option-control" });
+                    control.appendChild(el("span", { class: "chart-option-label" }, label));
+                    const sel = el("select", { class: "chart-option-select" });
+                    options.forEach(([optionLabel, optionValue]) => {
+                        sel.appendChild(el("option", { value: optionValue }, optionLabel));
+                    });
+                    sel.value = initialValue;
+                    sel.addEventListener("change", () => onChange(sel.value));
+                    control.appendChild(sel);
+                    controls.appendChild(control);
+                    return sel;
+                },
+                toggle: (kind, label, buildFn) => {
+                    const chartId = _oraChartId(kind, slug, null);
+                    const isNetwork = kind === "enrichmap" || kind === "network";
+                    const chartDiv = el("div", { id: chartId, class: "chart-container" + (isNetwork ? " chart-network" : ""), style: { display: "none" } });
+                    const chartBtn = el("button", { class: "btn chart-toggle-btn" }, "Show " + label);
+                    let chartShown = false;
+                    let chartBuilt = false;
+                    function renderChart() { buildFn(chartDiv); chartBuilt = true; }
+                    chartBtn.addEventListener("click", () => {
+                        if (!chartShown) {
+                            chartDiv.style.display = "";
+                            if (!chartBuilt) renderChart();
+                            else if (typeof Plotly !== "undefined") Plotly.Plots.resize(chartDiv);
+                            chartShown = true;
+                            chartBtn.textContent = "Hide " + label;
+                        } else {
+                            chartDiv.style.display = "none";
+                            chartShown = false;
+                            chartBtn.textContent = "Show " + label;
+                        }
+                    });
+                    controls.appendChild(chartBtn);
+                    area.appendChild(chartDiv);
+                    const t = { redraw: () => { if (chartShown) renderChart(); } };
+                    toggles.push(t);
+                    return t;
+                },
+                redraw: () => toggles.forEach(t => t.redraw()),
+            };
+        }
+
+        const overview = makeChartPane("Protein set overview");
+        overview.el.insertBefore(el("div", { class: "ora-chart-threshold-note" },
+            "Significance threshold: FDR < " + alpha + " (used for table highlighting, chart filtering, and protein-volcano coloring; adjustable above)."),
+            overview.el.firstChild);
+        let dotColorScale1 = ORA_DOT_COLOR_SCALES[0][1];
+        let barColor = ORA_BAR_COLORS[0][1];
+        let topN = 20;
+        let sortBy = "fdr";
+        let fontSize = 12;
+
+        overview.option("Terms shown", [
+            ["5", "5"], ["10", "10"], ["15", "15"], ["20", "20"], ["30", "30"],
+            ["50", "50"], ["100", "100"], ["200", "200"], ["All significant", "all"],
+        ], String(topN === Infinity ? "all" : topN), (value) => {
+            topN = value === "all" ? Infinity : Number(value);
+            overview.redraw();
+            relationships.redraw();
+        });
+        overview.option("Rank & show by", [["FDR", "fdr"], ["Fold enrichment", "fold"], ["Protein count", "k"], ["Protein ratio", "ratio"]], sortBy, (value) => {
+            sortBy = value;
+            overview.redraw();
+            relationships.redraw();
+        });
+        overview.option("Font size", [["10", "10"], ["12", "12"], ["14", "14"], ["16", "16"], ["18", "18"]], String(fontSize), (value) => {
+            fontSize = Number(value);
+            overview.redraw();
+            relationships.redraw();
+        });
+
+        const dotToggle = overview.toggle("dot", "dot plot", (div) => buildDotPlot(div, block.table, slug, null, dotColorScale1, { topN, sortBy, fontSize, alpha }));
+        overview.option("Dot gradient", ORA_DOT_COLOR_SCALES.map(([label, value]) => [label, value]), dotColorScale1, (value) => {
+            dotColorScale1 = value;
+            dotToggle.redraw();
+        });
+        const barToggle = overview.toggle("bar", "bar plot", (div) => buildBarPlot(div, block.table, slug, null, barColor, { topN, sortBy, fontSize, alpha }));
+        overview.option("Bar color", ORA_BAR_COLORS, barColor, (value) => {
+            barColor = value;
+            barToggle.redraw();
+        });
+        overview.toggle("proteinvolcano", "protein volcano", (div) =>
+            buildTranscriptomicsGeneVolcano(div, resolvedRows, slug, padjCutoff, lfcCutoff, { fontSize }));
+
+        const relationships = makeChartPane("Protein set relationships");
+        relationships.el.insertBefore(el("div", { class: "ora-chart-threshold-note ora-chart-encoding-note" },
+            "Circle color = -log10(FDR) (darker = more significant); circle size = number of significant proteins in the term. " +
+            "Rank & show by and Terms shown (Protein set overview) choose which terms are drawn."),
+            relationships.el.firstChild);
+        let dotColorScale2 = ORA_DOT_COLOR_SCALES[0][1];
+        let edgeThreshold = 1;
+        const enrichMapToggle = relationships.toggle("enrichmap", "enrichment map", (div) =>
+            buildEnrichmentMap(div, block.table, slug, null, dotColorScale2, { topN, sortBy, fontSize, edgeThreshold, alpha }));
+        relationships.option("Edge threshold (shared proteins)", [[">= 1", "1"], [">= 2", "2"], [">= 3", "3"], [">= 5", "5"]], String(edgeThreshold), (value) => {
+            edgeThreshold = Number(value);
+            enrichMapToggle.redraw();
+        });
+        const networkToggle = relationships.toggle("network", "protein-concept network", (div) =>
+            buildTranscriptomicsGeneConceptNetwork(div, block.table, slug, proteinLog2FC, { topN, sortBy, fontSize, alpha, dotColorScale: dotColorScale2 }));
+        relationships.option("Dot gradient", ORA_DOT_COLOR_SCALES.map(([label, value]) => [label, value]), dotColorScale2, (value) => {
+            dotColorScale2 = value;
+            enrichMapToggle.redraw();
+            networkToggle.redraw();
+        });
+
+        nav.finish();
+    }
+
+    select.addEventListener("change", () => renderPanel(select.value));
+    if (sortedKeys.length > 0) {
+        select.value = sortedKeys[0];
+        renderPanel(sortedKeys[0]);
+    }
+
+    const newRunBtn = el("button", { class: "btn", style: { marginTop: "0.8rem" } }, "Start new run");
+    newRunBtn.addEventListener("click", () => {
+        STATE.proteomics.oraConfig = null;
+        STATE.proteomics.oraResults = null;
+        STATE.proteomics.oraRunLocked = false;
+        STATE.proteomics._oraDraft = null;
+        STATE.aaPage = "proteomics_ora_config";
+        render();
+    });
+    wrap.appendChild(newRunBtn);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToProteomicsActions());
     return wrap;
 }
 
@@ -5044,6 +5985,7 @@ function renderTranscriptomicsNetworkResultsScreen() {
     figToggles.push(netToggle, histToggle);
     figPane.appendChild(netToggle.el);
     figPane.appendChild(histToggle.el);
+    if (nd.skew_caveat) figPane.appendChild(alertBox("warning", nd.skew_caveat));
 
     // ----- Modules -----
     if (payload.modules && (payload.modules.table.rows || []).length) {
