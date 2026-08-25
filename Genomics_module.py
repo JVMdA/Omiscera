@@ -1447,6 +1447,7 @@ def _run_wilcoxon_for_namespace(
     include_bonferroni: bool = True,
     min_term_size: int = MIN_TERM_SIZE,
     max_term_size: "int | None" = None,
+    alternative: str = "greater",
 ) -> dict:
     """Shared per-test-family competitive Wilcoxon rank-sum + BH-FDR runner.
 
@@ -1460,11 +1461,16 @@ def _run_wilcoxon_for_namespace(
 
     For each term, compares the scores of genes inside the term ("in-set")
     against every other scored gene in the universe ("out-set") with a
-    one-sided Mann-Whitney U / Wilcoxon rank-sum test (alternative="greater"
-    -> in-set scores are stochastically larger). Terms with fewer than
-    min_term_size scored genes, or more than max_term_size, are excluded
-    before FDR correction (same size-gate semantics as the ORA engine); a
-    term also needs at least one "out-set" gene to compare against.
+    Mann-Whitney U / Wilcoxon rank-sum test. `alternative` defaults to
+    "greater" (in-set scores are stochastically larger) - correct for the
+    Gene-set Burden Test, whose scores are unsigned severity values where
+    only "higher" is meaningful. Callers with a SIGNED score (e.g.
+    Proteomics' log2FC, where a downward shift is just as interesting as an
+    upward one) should pass "two-sided" - a one-sided test would silently
+    miss every down-shifted term. Terms with fewer than min_term_size scored
+    genes, or more than max_term_size, are excluded before FDR correction
+    (same size-gate semantics as the ORA engine); a term also needs at least
+    one "out-set" gene to compare against.
 
     Returns a result_block dict shaped like run_ora_for_database's blocks,
     but with the burden-specific columns in BURDEN_RESULT_COLUMNS.
@@ -1494,7 +1500,7 @@ def _run_wilcoxon_for_namespace(
         in_scores = [score_by_gene[g] for g in term_genes]
         out_scores = [score_by_gene[g] for g in out_genes]
         try:
-            _stat, p_val = _scipy_mannwhitneyu(in_scores, out_scores, alternative="greater")
+            _stat, p_val = _scipy_mannwhitneyu(in_scores, out_scores, alternative=alternative)
             p_val = float(p_val)
         except ValueError:
             # e.g. every score identical (mannwhitneyu can raise on degenerate input)

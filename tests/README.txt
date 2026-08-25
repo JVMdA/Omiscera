@@ -360,7 +360,7 @@ test_proteomics_retriever.py    31 checks. Proteomics_module_retriever.py -
                                 a secondary accession (Q15086) resolves to
                                 its current primary (P04637/TP53).
 
-test_proteomics_ora.py          21 checks. Proteomics_module.run_ora's own
+test_proteomics_ora.py          23 checks. Proteomics_module.run_ora's own
                                 logic, entirely offline via a synthetic
                                 Custom-database fixture (no live database
                                 fetch): direction semantics, independent
@@ -371,17 +371,49 @@ test_proteomics_ora.py          21 checks. Proteomics_module.run_ora's own
                                 fixture the pre-fix way and confirming it
                                 genuinely differs: (1) zero-overlap terms
                                 must never enter the BH family (unfiltered:
-                                183 terms tested instead of 2 - the defect
-                                Genomics_module._run_fisher_for_namespace
-                                STILL has, patched only locally here); and
-                                (2) the universe must be the QUANTIFIED
-                                proteins, not every protein the database
-                                annotates - exposed with a fixture whose
-                                terms deliberately contain
-                                annotated-but-never-measured accessions
-                                (pre-fix: K=25 instead of the correct K=5).
-                                The original fixture was blind to (2), since
-                                all of its genes were already quantified.
+                                183 terms tested instead of 2); and (2) the
+                                universe must be the QUANTIFIED proteins, not
+                                every protein the database annotates -
+                                exposed with a fixture whose terms
+                                deliberately contain annotated-but-never-
+                                measured accessions (pre-fix: K=25 instead of
+                                the correct K=5). The original fixture was
+                                blind to (2), since all of its genes were
+                                already quantified. Check (1) was updated
+                                2026-08-24 when Genomics_module.
+                                _run_fisher_for_namespace's own zero-overlap
+                                defect was fixed (b4e311f): it now asserts
+                                the FIXED shared-engine behaviour (2 terms
+                                tested, not 183; n_terms_no_overlap reported)
+                                instead of documenting a defect Genomics
+                                still had - guards against regressing it.
+
+test_proteomics_quant.py        27 checks. Proteomics_module.
+                                run_quantitative_enrichment's own logic,
+                                entirely offline via a synthetic Custom-
+                                database fixture with a real continuous
+                                log2FC signal (not ORA's significant/non-
+                                significant binary - this test has no
+                                cutoff): _build_protein_scores' four metric
+                                formulas, NaN-score dropping, duplicate-
+                                accession mean-aggregation, and the
+                                Overlapping Proteins member-column rename/
+                                format shared with ORA. The LOAD-BEARING
+                                check: a DOWN-shifted term must be AS
+                                significant as an UP-shifted one under the
+                                two-sided Wilcoxon test this milestone added
+                                (Genomics_module._run_wilcoxon_for_namespace,
+                                alternative param, default still "greater" so
+                                the Gene-set Burden Test is unaffected) -
+                                sensitivity-checked by recomputing the
+                                identical fixture with the OLD one-sided
+                                "greater" default and confirming the down
+                                term's p-value jumps from ~1e-7 to ~1.0,
+                                proving the fix is not vacuous. Also confirms
+                                Genomics' own Burden Test default is
+                                genuinely unchanged (omitting the new
+                                `alternative` kwarg reproduces the explicit
+                                "greater" call exactly).
 
 
 ---------------------------------------------------------------------------
@@ -629,10 +661,11 @@ playwright_proteomics_ora.py    40 checks. The FIRST real-browser coverage of
                                 the Proteomics module (Milestone 1: the
                                 foundation plus Over-Representation
                                 Analysis). Drives the real flow end to end -
-                                tile -> sub-tile gating (only ORA enabled;
-                                Quantitative Enrichment / PPI Network / PTM
-                                correctly disabled) -> organism -> upload ->
-                                REAL UniProt ID Mapping resolve of all 3500
+                                tile -> sub-tile gating (ORA and, since
+                                Milestone 2, Quantitative Enrichment both
+                                enabled; PPI Network / PTM still correctly
+                                disabled) -> organism -> upload -> REAL
+                                UniProt ID Mapping resolve of all 3500
                                 example accessions -> configure -> run
                                 against real InterPro/Complex Portal/UniProt
                                 fetches -> results. Asserts biology, not just
@@ -655,6 +688,37 @@ playwright_proteomics_ora.py    40 checks. The FIRST real-browser coverage of
                                 still parsed into bare accessions - without
                                 it the protein-concept network's log2FC
                                 colouring would silently stop resolving.
+playwright_proteomics_quant.py  41 checks. Milestone 2 - the first real-
+                                browser coverage of Quantitative Enrichment
+                                (1D annotation enrichment / competitive
+                                Wilcoxon, reusing Genomics' Gene-set Burden
+                                Test engine via alternative="two-sided").
+                                Drives tile -> organism -> upload -> REAL
+                                UniProt ID Mapping resolve -> continue ->
+                                configure (asserts NO padj/log2FC cutoff
+                                fields on this screen, and that the ranking-
+                                metric selector defaults to log2fc) -> run
+                                against GO/InterPro/Complex Portal/UniProt
+                                keywords -> results, asserting result keys
+                                carry NO direction suffix (unlike ORA's
+                                "(all)/(up)/(down)") and no ORA-style
+                                significance-count field leaked into the
+                                summary. The load-bearing sensitivity check:
+                                _burdenGeneSet - which read ONLY row['Genes']
+                                before this milestone - is run against a REAL
+                                Proteomics row (column renamed to "Overlapping
+                                Proteins") and must return a NON-EMPTY,
+                                bare-accession set; before the fix it would
+                                have silently returned empty, breaking the
+                                enrichment map and protein-concept network's
+                                edges with no error. Also selects whichever
+                                GO namespace actually came back significant
+                                this run (Cellular Component, live-verified
+                                2026-08-25) and exercises all 5 Burden-shaped
+                                chart builders (dot, bar, volcano, enrichment
+                                map, protein-concept network) for real
+                                rendered Plotly figures, plus the CSV download
+                                endpoint.
 test_organism_allowlist_mirror.py  7 checks. Guards a drift risk found while
                                 auditing organism generality: several
                                 per-database organism allowlists are
@@ -763,14 +827,15 @@ playwright_msigdb.py            68 checks. Same real-browser approach for
                                 multi-collection run produced a pile of
                                 indistinguishable "... (1).csv" files).
 
-These five (playwright_regulon.py, playwright_genomics_results_cards.py,
+These six (playwright_regulon.py, playwright_genomics_results_cards.py,
 playwright_msigdb.py, playwright_transcriptomics_network.py,
-playwright_proteomics_ora.py) make real network calls (mygene.info, TRRUST,
-ChEA3, MSigDB, UniProt, STRING, GO/QuickGO, InterPro, Complex Portal,
-DISEASES) and are not mocked, so they need internet and take a few
-minutes. test_msigdb_summary_figure.py, test_gsea_null_histogram_range.py,
-and test_organism_allowlist_mirror.py are the exceptions - all three need
-the server only to load app.js, and make no external calls.
+playwright_proteomics_ora.py, playwright_proteomics_quant.py) make real
+network calls (mygene.info, TRRUST, ChEA3, MSigDB, UniProt, STRING,
+GO/QuickGO, InterPro, Complex Portal, DISEASES) and are not mocked, so they
+need internet and take a few minutes. test_msigdb_summary_figure.py,
+test_gsea_null_histogram_range.py, and test_organism_allowlist_mirror.py
+are the exceptions - all three need the server only to load app.js, and
+make no external calls.
 
 
 ---------------------------------------------------------------------------
@@ -782,8 +847,9 @@ in one never hides another. From the repo root, with the server up:
     Get-ChildItem tests\*.py | ForEach-Object { python $_.FullName }
 
 Expected totals as of the last full run, in file-listing order: 117, 22, 16,
-4, 15, 5, 16, 10, 24, 58, 44, 49, 52, 8, 31, 21, 21, 15, 12, 12, 22, 22, 16,
-12, 49, 90, 13, 37, 40, 7, 4, 15, 68 - all passing (947 checks across 33 files).
+4, 15, 5, 16, 10, 24, 58, 44, 49, 52, 8, 31, 23, 27, 21, 15, 12, 12, 22, 22,
+16, 12, 49, 90, 13, 37, 40, 41, 7, 4, 15, 68 - all passing (1017 checks
+across 35 files).
 
 A NOTE ON WRITING NEW CHECKS HERE. Prefer assertions that can actually fail
 for the reason you care about. A concrete example lives in

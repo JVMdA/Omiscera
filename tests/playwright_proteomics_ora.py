@@ -52,7 +52,10 @@ with sync_playwright() as p:
     print("=== ORA sub-tile enabled, other three disabled ===")
     ora_btn = page.locator("button.module-btn.proteomics", has_text="Over-Representation Analysis")
     check(ora_btn.count() >= 1 and not ora_btn.first.is_disabled(), "ORA sub-tile present and enabled")
-    for name in ["Quantitative Enrichment", "PPI Network / Module Detection", "PTM / Phosphosite Enrichment"]:
+    quant_btn = page.locator("button.module-btn.proteomics", has_text="Quantitative Enrichment")
+    check(quant_btn.count() >= 1 and not quant_btn.first.is_disabled(),
+          "Quantitative Enrichment sub-tile present and ENABLED (Milestone 2)")
+    for name in ["PPI Network / Module Detection", "PTM / Phosphosite Enrichment"]:
         btn = page.locator("button.module-btn.proteomics", has_text=name)
         check(btn.count() >= 1 and btn.first.is_disabled(), f"'{name}' correctly disabled (coming soon)")
     ora_btn.first.click()

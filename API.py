@@ -579,6 +579,8 @@ def _fresh_proteomics_state() -> dict:
         "meta": None,
         "ora_config": None,
         "ora_results": None,
+        "quant_config": None,
+        "quant_results": None,
         "custom_db": None,
         "background_accessions": None,
     }
@@ -950,6 +952,69 @@ def _job_run_proteomics_ora(job_id: str, session: dict) -> dict:
     update_job(job_id, progress=1.0, message="Done")
     return {
         "tables": _serialize_proteomics_ora_tables(result["tables"]),
+        "summary": result["summary"],
+    }
+
+
+def _serialize_proteomics_quant_tables(tables: dict) -> dict:
+    """JSON-safe view of Proteomics_module.run_quantitative_enrichment's
+    'tables' dict. Mirrors _serialize_proteomics_ora_tables' shape, adjusted
+    for the Burden-Test-engine block shape (no n_terms_no_overlap concept -
+    the Wilcoxon engine has no analogous zero-overlap exclusion, see that
+    engine's docstring)."""
+    payload = {}
+    for key, block in tables.items():
+        payload[key] = {
+            "table": df_payload(block["table"]),
+            "n_terms_tested": block["n_terms_tested"],
+            "n_terms_excluded_min_size": block["n_terms_excluded_min_size"],
+            "universe_size": block["universe_size"],
+            "n_input_in_universe": block.get("n_input_in_universe", 0),
+            "n_input_dropped": block.get("n_input_dropped", 0),
+            "caveat": block.get("caveat"),
+            "note": block.get("note"),
+        }
+    return payload
+
+
+def _job_run_proteomics_quant(job_id: str, session: dict) -> dict:
+    """Proteomics Quantitative Enrichment worker: runs
+    Proteomics_module.run_quantitative_enrichment against the retriever's
+    resolved protein table using the stored quant_config. Mirrors
+    _job_run_proteomics_ora's shape."""
+    update_job(job_id, message="Starting quantitative enrichment...")
+    resolved_df = session["proteomics"]["resolved_df"]
+    if resolved_df is None:
+        raise ValueError("No resolved protein table available.")
+
+    config = session["proteomics"]["quant_config"]
+    if config is None:
+        raise ValueError("Configure the analysis first.")
+
+    def _progress(step, total, label):
+        update_job(job_id, progress=step / max(total, 1), message=label)
+
+    result = proteomics_engine.run_quantitative_enrichment(
+        resolved_df,
+        databases=config["databases"],
+        taxon_id=session["proteomics"]["taxon_id"],
+        taxon_name=session["proteomics"].get("taxon_name", ""),
+        metric=config["metric"],
+        min_term_size=config["min_term_size"],
+        max_term_size=config["max_term_size"],
+        include_iea=config.get("include_iea", True),
+        custom_db=session["proteomics"].get("custom_db"),
+        background_accessions=(
+            session["proteomics"].get("background_accessions") if config.get("use_background") else None
+        ),
+        msigdb_collections=config.get("msigdb_collections"),
+        progress_callback=_progress,
+        verbose=False,
+    )
+    session["proteomics"]["quant_results"] = result
+    update_job(job_id, progress=1.0, message="Done")
+    return {
+        "tables": _serialize_proteomics_quant_tables(result["tables"]),
         "summary": result["summary"],
     }
 
@@ -3526,6 +3591,88 @@ def proteomics_ora_download(key: str, x_session_id: Optional[str] = Header(defau
         raise HTTPException(status_code=400, detail=f"Unknown result table: {key!r}")
     safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
     return df_to_csv_response(block["table"], f"proteomics_ora_{safe_name}.csv")
+
+
+@app.post("/api/proteomics/quant/configure")
+def proteomics_quant_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["proteomics"]["resolved_df"] is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No resolved protein table available. Complete retrieval first.",
+        )
+    _require_consistent_proteomics_taxon(session)
+
+    databases = list(dict.fromkeys(
+        d for d in (payload.get("databases") or []) if d in proteomics_engine.PROTEOMICS_ORA_DATABASES
+    ))
+    if not databases:
+        raise HTTPException(status_code=400, detail="Select at least one database.")
+    if "Custom database" in databases and not session["proteomics"].get("custom_db"):
+        raise HTTPException(status_code=400, detail="Upload a custom gene-set database file first.")
+
+    msigdb_collections = list(dict.fromkeys(
+        c for c in (payload.get("msigdb_collections") or [])
+        if c in transcriptomics_engine.MSIGDB_COLLECTIONS
+    ))
+    if "MSigDB" in databases and not msigdb_collections:
+        raise HTTPException(status_code=400, detail="Select at least one MSigDB collection.")
+
+    metric = payload.get("metric", proteomics_engine.QUANT_METRIC_DEFAULT)
+    if metric not in transcriptomics_engine.GSEA_RANKING_METRICS:
+        raise HTTPException(status_code=400, detail=f"Unknown ranking metric: {metric!r}")
+
+    try:
+        min_term_size = int(payload.get("min_term_size", genomics_ora.MIN_TERM_SIZE))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Thresholds must be numeric.")
+
+    _MISSING = object()
+    max_term_size_raw = payload.get("max_term_size", _MISSING)
+    if max_term_size_raw is _MISSING:
+        max_term_size = genomics_ora.MAX_TERM_SIZE_DEFAULT
+    elif max_term_size_raw in (None, ""):
+        max_term_size = None
+    else:
+        try:
+            max_term_size = int(max_term_size_raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Max term size must be numeric.")
+
+    config = {
+        "databases": databases,
+        "msigdb_collections": msigdb_collections,
+        "metric": metric,
+        "min_term_size": min_term_size,
+        "max_term_size": max_term_size,
+        "include_iea": bool(payload.get("include_iea", True)),
+        "use_background": bool(payload.get("use_background", False)),
+    }
+    session["proteomics"]["quant_config"] = config
+    session["proteomics"]["quant_results"] = None
+    return {"config": config}
+
+
+@app.post("/api/proteomics/quant/run")
+def proteomics_quant_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["proteomics"]["quant_config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_run_proteomics_quant, session)
+    return {"job_id": job_id}
+
+
+@app.get("/api/proteomics/quant/download")
+def proteomics_quant_download(key: str, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    results = session["proteomics"]["quant_results"]
+    if not results:
+        raise HTTPException(status_code=400, detail="No Quantitative Enrichment results available.")
+    block = results["tables"].get(key)
+    if block is None:
+        raise HTTPException(status_code=400, detail=f"Unknown result table: {key!r}")
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
+    return df_to_csv_response(block["table"], f"proteomics_quant_{safe_name}.csv")
 
 
 # ---------------------------------------------------------------------------

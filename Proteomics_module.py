@@ -56,6 +56,7 @@ import re
 import time
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 
 try:
@@ -69,8 +70,9 @@ from Genomics_module import (
     OMISCERA_HEADERS, DEFAULT_TIMEOUT, DEFAULT_RETRIES,
     UNIPROT_SEARCH_URL, UNIPROT_PAGE_SIZE,
     MIN_TERM_SIZE, MAX_TERM_SIZE_DEFAULT, FDR_ALPHA_DEFAULT, ORA_RESULT_COLUMNS,
+    BURDEN_RESULT_COLUMNS,
     benjamini_hochberg, bonferroni, fisher_exact_pvalue, fold_enrichment,
-    _run_fisher_for_namespace,
+    _run_fisher_for_namespace, _run_wilcoxon_for_namespace,
     build_go_universe, build_reactome_universe,
     load_custom_geneset_db, load_user_background_list,
     _fetch_uniprot_annotations_bulk,
@@ -78,7 +80,7 @@ from Genomics_module import (
 )
 from Transcriptomics_module import (
     fetch_msigdb_sets, msigdb_collection_available, MSIGDB_COLLECTIONS,
-    _msigdb_selected_keys,
+    _msigdb_selected_keys, GSEA_RANKING_METRICS, GSEA_MIN_P,
 )
 
 # ---------------------------------------------------------------------------
@@ -122,6 +124,15 @@ DISEASES_LOCAL_NAME = "diseases_knowledge_filtered.tsv"
 DISEASES_REFRESH_DAYS = 30
 DISEASES_HUMAN_TAXON_ID = "9606"
 
+# Quantitative Enrichment's default ranking metric. Deliberately NOT
+# GSEA_RANKING_METRIC_DEFAULT ("signed_log_pvalue" - the right default for
+# permutation-based GSEA, which needs a well-behaved monotonic ranking
+# statistic): Perseus' 1D annotation enrichment, the method this module
+# mirrors, is defined directly on log2FC, so that is the natural default
+# here. GSEA_RANKING_METRICS (the set of valid choices) is still reused
+# unchanged - only the DEFAULT differs.
+QUANT_METRIC_DEFAULT = "log2fc"
+
 # Proteomics renames the shared engine's "Overlapping Genes" column: in a
 # proteomics module these are the measured PROTEINS that fall inside a term,
 # not genes. The rename also fixes a real inconsistency - the same column
@@ -132,6 +143,12 @@ DISEASES_HUMAN_TAXON_ID = "9606"
 OVERLAP_COLUMN = "Overlapping Proteins"
 PROTEOMICS_ORA_RESULT_COLUMNS = [
     OVERLAP_COLUMN if c == "Overlapping Genes" else c for c in ORA_RESULT_COLUMNS
+]
+# Quantitative Enrichment reuses Genomics' Gene-set Burden Test engine
+# (_run_wilcoxon_for_namespace) - same member-column rename as ORA, applied
+# to that engine's own column name ("Genes", not "Overlapping Genes").
+PROTEOMICS_BURDEN_RESULT_COLUMNS = [
+    OVERLAP_COLUMN if c == "Genes" else c for c in BURDEN_RESULT_COLUMNS
 ]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -494,6 +511,143 @@ def build_complex_portal_universe(taxon_id: str, verbose: bool = False, force_re
 # ORA orchestrator
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Shared helper: normalise the overlapping-member column (used by BOTH
+# run_ora and run_quantitative_enrichment - see each caller for what column
+# name their underlying engine produces).
+# ---------------------------------------------------------------------------
+
+def _finalize_member_column(
+    tables: dict, accession_to_symbol: dict, source_col: str, target_columns: "list[str]",
+) -> None:
+    """Normalise the overlapping-member column across every block in
+    `tables`, in place.
+
+    Two problems this fixes, both real and user-reported (see Fix commit
+    for the ORA case, `52ba651`):
+      1. The shared Genomics engines name this column for genes ("Overlapping
+         Genes" in the ORA engine, "Genes" in the Burden Test engine); in a
+         proteomics module these are PROTEINS. `source_col` names whichever
+         one the caller's engine actually produced.
+      2. Its contents silently differ in identifier TYPE depending on the
+         database - UniProt accessions from the 6 accession-keyed sources,
+         bare gene symbols from the 2 symbol-keyed ones (MSigDB, DISEASES) -
+         so the same column could mean different things on different rows of
+         the same results screen.
+
+    Both are normalised to "ACCESSION (SYMBOL)": unambiguous, and readable
+    (P05386 alone tells a reader nothing; RPLP0 alone loses the isoform-level
+    identity that is the whole point of using an accession).
+    """
+    symbol_to_accession: dict = {}
+    for acc, sym in accession_to_symbol.items():
+        if sym:
+            symbol_to_accession.setdefault(sym, acc)
+
+    def _display_member(member: str) -> str:
+        m = member.strip()
+        if not m:
+            return m
+        sym = accession_to_symbol.get(m)          # accession-space member
+        if sym:
+            return f"{m} ({sym})"
+        acc = symbol_to_accession.get(m.upper())  # symbol-space member (MSigDB/DISEASES)
+        if acc:
+            return f"{acc} ({m.upper()})"
+        return m   # unresolvable (e.g. a custom-DB gene never quantified) - left as-is
+
+    for block in tables.values():
+        tbl = block.get("table")
+        if tbl is None:
+            continue
+        if source_col in tbl.columns:
+            if not tbl.empty:
+                tbl[source_col] = tbl[source_col].map(
+                    lambda cell: ", ".join(_display_member(x) for x in str(cell).split(",") if x.strip())
+                )
+            tbl = tbl.rename(columns={source_col: OVERLAP_COLUMN})
+        # Reindex so an empty block still carries the proteomics column set.
+        block["table"] = tbl.reindex(columns=target_columns)
+
+
+def _mean_score_by_key(keys: "list[str]", values: "np.ndarray") -> dict:
+    """Aggregate parallel (key, value) pairs into {key: mean(values)}.
+
+    Needed in two places quantitative enrichment builds a score dict: (a)
+    accession-level, where the SAME resolved accession can legitimately
+    appear on more than one input row (e.g. two uploaded protein-group rows
+    both resolving to the same canonical accession - resolve_protein_table
+    does not deduplicate by accession); (b) the accession->symbol bridge for
+    MSigDB/DISEASES, where distinct accessions (isoforms, paralogs sharing an
+    annotation) can map to the same gene symbol. A naive dict build would
+    silently let the LAST row win, an arbitrary, row-order-dependent choice
+    - the mean is the same aggregation a protein/gene-level rollup normally
+    uses and does not depend on input order.
+    """
+    out: dict = {}
+    counts: dict = {}
+    for k, v in zip(keys, values):
+        if k in out:
+            out[k] += v
+            counts[k] += 1
+        else:
+            out[k] = v
+            counts[k] = 1
+    return {k: out[k] / counts[k] for k in out}
+
+
+def _build_protein_scores(resolved_df: pd.DataFrame, metric: str = QUANT_METRIC_DEFAULT) -> "tuple[dict, int]":
+    """Build an accession -> score dict for Quantitative Enrichment's
+    competitive Wilcoxon test.
+
+    Reuses the SAME four metric formulas as Transcriptomics' GSEA ranking
+    (GSEA_RANKING_METRICS / Transcriptomics_module.build_ranked_list) for
+    consistency across modules, rather than re-deriving them - but is NOT
+    build_ranked_list itself: this is keyed on 'accession' (this module's
+    identifier), does not require a resolved gene_symbol, and returns an
+    unordered dict (the Wilcoxon engine partitions in-set/out-set itself; no
+    ranked ordering is needed).
+
+    Rows with a non-finite score (NaN log2FC/pvalue, or - for
+    signed_log_padj only - a missing padj) are dropped and counted.
+    Duplicate accessions are mean-aggregated (see _mean_score_by_key).
+
+    Returns (score_by_accession, n_dropped).
+    """
+    if metric not in GSEA_RANKING_METRICS:
+        metric = QUANT_METRIC_DEFAULT
+    df = resolved_df[resolved_df["accession"].astype(str).str.strip() != ""].copy()
+    n_input = len(df)
+
+    if metric == "signed_log_padj":
+        df = df[df["padj"].notna()]
+
+    log2fc = df["log2FC"].to_numpy(dtype=float)
+    # sign(0) is 0 in numpy, which would silently strand a protein with
+    # exactly log2FC==0 - define the boundary case as +1 explicitly, same
+    # convention as build_ranked_list.
+    sign = np.where(log2fc >= 0, 1.0, -1.0)
+    pvalue = np.clip(df["pvalue"].to_numpy(dtype=float), GSEA_MIN_P, 1.0)
+
+    if metric == "signed_log_pvalue":
+        values = sign * (-np.log10(pvalue))
+    elif metric == "log2fc":
+        values = log2fc
+    elif metric == "pi_value":
+        values = log2fc * (-np.log10(pvalue))
+    else:  # signed_log_padj
+        padj = np.clip(df["padj"].to_numpy(dtype=float), GSEA_MIN_P, 1.0)
+        values = sign * (-np.log10(padj))
+
+    finite = np.isfinite(values)
+    accs = df["accession"].astype(str).to_numpy()[finite]
+    values = values[finite]
+    n_dropped = n_input - len(accs)
+
+    score_by_acc = _mean_score_by_key(list(accs), values)
+    return score_by_acc, n_dropped
+
+
 def run_ora(
     resolved_df: pd.DataFrame,
     databases: "list[str]",
@@ -813,35 +967,7 @@ def run_ora(
     # unambiguous proteomics identifier while staying readable (P05386 alone
     # tells a reader nothing; RPLP0 alone loses the isoform-level identity
     # that is the whole point of an accession).
-    symbol_to_accession: dict = {}
-    for acc, sym in accession_to_symbol.items():
-        if sym:
-            symbol_to_accession.setdefault(sym, acc)
-
-    def _display_member(member: str) -> str:
-        m = member.strip()
-        if not m:
-            return m
-        sym = accession_to_symbol.get(m)          # accession-space member
-        if sym:
-            return f"{m} ({sym})"
-        acc = symbol_to_accession.get(m.upper())  # symbol-space member (MSigDB/DISEASES)
-        if acc:
-            return f"{acc} ({m.upper()})"
-        return m   # unresolvable (e.g. a custom-DB gene never quantified) - left as-is
-
-    for block in tables.values():
-        tbl = block.get("table")
-        if tbl is None:
-            continue
-        if "Overlapping Genes" in tbl.columns:
-            if not tbl.empty:
-                tbl["Overlapping Genes"] = tbl["Overlapping Genes"].map(
-                    lambda cell: ", ".join(_display_member(x) for x in str(cell).split(",") if x.strip())
-                )
-            tbl = tbl.rename(columns={"Overlapping Genes": OVERLAP_COLUMN})
-        # Reindex so an empty block still carries the proteomics column set.
-        block["table"] = tbl.reindex(columns=PROTEOMICS_ORA_RESULT_COLUMNS)
+    _finalize_member_column(tables, accession_to_symbol, "Overlapping Genes", PROTEOMICS_ORA_RESULT_COLUMNS)
 
     n_deg_before_background = {d: len(select_significant_proteins(resolved_df, padj_cutoff, lfc_cutoff, d)) for d in DIRECTIONS}
     summary = {
@@ -852,5 +978,274 @@ def run_ora(
         "n_sig_up": len(directions["up"]),
         "n_sig_down": len(directions["down"]),
         "n_sig_all_before_background": n_deg_before_background["all"],
+    }
+    return {"tables": tables, "summary": summary}
+
+
+# ---------------------------------------------------------------------------
+# Quantitative Enrichment (1D annotation enrichment / competitive Wilcoxon)
+# ---------------------------------------------------------------------------
+# Why this exists as a SEPARATE analysis from ORA, and why it is not GSEA:
+# ORA only sees proteins that already passed a padj/log2FC cutoff, so a
+# coordinated but individually sub-threshold shift across a whole pathway is
+# invisible to it. The usual answer is GSEA, but GSEA assumes a long, dense
+# ranked list (~20k genes for RNA-seq); shotgun proteomics quantifies far
+# fewer proteins (3-8k) AND its missing values are missing-NOT-at-random
+# (undetected because low-abundance, not at random), biasing one end of any
+# ranking. Perseus - proteomics' de facto standard tool - instead uses "1D
+# annotation enrichment": for each term, a Mann-Whitney/Wilcoxon rank-sum
+# test asking whether the log2FC values of proteins INSIDE the term are
+# shifted relative to every other quantified protein. No thresholding, uses
+# every quantified protein, no ranked-list assumption. That is exactly what
+# Genomics' Gene-set Burden Test (_run_wilcoxon_for_namespace) already
+# computes, extended here to alternative="two-sided" (see that function's
+# docstring) because log2FC is signed - a downward shift is exactly as
+# interesting as an upward one, and Genomics' own one-sided default would
+# silently miss every down-shifted term.
+#
+# Structural differences from run_ora, both deliberate:
+#   - No up/down/all split. The signed score already encodes direction and
+#     the test is two-sided, so there is exactly ONE family per database
+#     instead of three - a materially smaller multiple-testing burden, and
+#     the honest structure (splitting would just be re-adding a threshold
+#     through the back door).
+#   - No padj/log2FC cutoff. Every quantified protein with a finite score
+#     contributes; that is the entire point of a threshold-free test.
+
+def run_quantitative_enrichment(
+    resolved_df: pd.DataFrame,
+    databases: "list[str]",
+    taxon_id: str,
+    taxon_name: str,
+    metric: str = QUANT_METRIC_DEFAULT,
+    min_term_size: int = MIN_TERM_SIZE,
+    max_term_size=MAX_TERM_SIZE_DEFAULT,
+    include_iea: bool = True,
+    force_refresh: bool = False,
+    custom_db: "dict | None" = None,
+    background_accessions: "set | None" = None,
+    msigdb_collections: "list[str] | None" = None,
+    progress_callback=None,
+    verbose: bool = False,
+) -> dict:
+    """Run Quantitative (1D annotation) Enrichment for the requested
+    databases against the resolved protein table. See module comment above
+    for why this differs from run_ora (Wilcoxon vs Fisher, one family per
+    database instead of three, no significance cutoff).
+
+    databases: subset of PROTEOMICS_ORA_DATABASES (same database set as ORA;
+        PANTHER is excluded for the same reason - see module docstring).
+    metric: one of GSEA_RANKING_METRICS - the per-protein score the Wilcoxon
+        test compares inside vs. outside each term. Reuses Transcriptomics'
+        GSEA metric definitions (signed_log_pvalue default, log2fc, pi_value,
+        signed_log_padj) for cross-module consistency.
+    msigdb_collections: required (non-empty) when "MSigDB" is selected.
+    custom_db: required when "Custom database" is selected.
+    background_accessions: optional UniProt-accession set restricting the
+        universe for every database (from load_user_background_list).
+    """
+    def _progress(step, total, label):
+        if progress_callback:
+            try:
+                progress_callback(step, total, label)
+            except Exception:
+                pass
+
+    universe_df = resolved_df[resolved_df["accession"].astype(str).str.strip() != ""]
+    universe_accessions_all = set(universe_df["accession"].astype(str))
+    n_universe_before_background = len(universe_accessions_all)
+    if background_accessions:
+        universe_accessions_all = universe_accessions_all & {str(a).strip() for a in background_accessions}
+
+    accession_to_symbol = dict(zip(
+        universe_df["accession"].astype(str), universe_df["gene_symbol"].astype(str).str.upper(),
+    ))
+
+    score_by_acc_all, n_score_dropped = _build_protein_scores(universe_df, metric)
+    # Scores restricted to the (possibly background-narrowed) universe, same
+    # ALWAYS-narrow rule run_ora applies to every database's gene set below.
+    score_by_acc = {a: s for a, s in score_by_acc_all.items() if a in universe_accessions_all}
+
+    n_msigdb_selected = len(_msigdb_selected_keys(msigdb_collections))
+    # One family per database (no x3 direction multiplier, unlike run_ora) -
+    # GO still counts once per NAMESPACE (3), MSigDB once per SELECTED
+    # COLLECTION, mirroring run_ora's identical, already-documented reasoning
+    # for why a plain len(databases) undercounts both.
+    steps_total = max(
+        sum(
+            3 if db == "GO" else
+            n_msigdb_selected if db == "MSigDB" else
+            1
+            for db in databases
+        ),
+        1,
+    )
+    step = 0
+    tables: dict = {}
+
+    def _empty_block(note: str) -> dict:
+        return {
+            "table": pd.DataFrame(columns=PROTEOMICS_BURDEN_RESULT_COLUMNS),
+            "n_terms_tested": 0, "n_terms_excluded_min_size": 0,
+            "universe_size": 0, "n_input_in_universe": 0, "n_input_dropped": 0,
+            "note": note, "caveat": None,
+        }
+
+    def _run_family(result_key: str, term_to_genes: dict, universe_genes: set, scores: dict, caveat=None):
+        nonlocal step
+        step += 1
+        _progress(step, steps_total, result_key)
+        if not scores:
+            tables[result_key] = _empty_block("No quantified proteins with a valid score at the current metric.")
+            return
+        block = _run_wilcoxon_for_namespace(
+            term_to_genes, scores, universe_genes, True, min_term_size, max_term_size,
+            alternative="two-sided",
+        )
+        if caveat:
+            block["caveat"] = caveat
+        tables[result_key] = block
+
+    if "GO" in databases:
+        go_universe = build_go_universe(taxon_id, include_iea=include_iea, verbose=verbose, force_refresh=force_refresh)
+        for ns in ("biological_process", "molecular_function", "cellular_component"):
+            ns_label = ns.replace("_", " ").title()
+            ns_genes: set = set()
+            for info in go_universe[ns].values():
+                ns_genes |= info["genes"]
+            ns_genes &= universe_accessions_all  # ALWAYS - see run_ora's identical comment
+            _run_family(f"GO: {ns_label}", go_universe[ns], ns_genes, score_by_acc, go_universe.get("caveat"))
+
+    if "Reactome" in databases:
+        if not taxon_name.strip():
+            step += 1
+            tables["Reactome"] = _empty_block(
+                "Organism name unavailable; Reactome's file cannot be filtered by species.")
+        else:
+            reactome_universe = build_reactome_universe(taxon_id, taxon_name=taxon_name, include_iea=include_iea, verbose=verbose)
+            r_genes: set = set()
+            for info in reactome_universe["pathways"].values():
+                r_genes |= info["genes"]
+            r_genes &= universe_accessions_all
+            _run_family("Reactome", reactome_universe["pathways"], r_genes, score_by_acc)
+
+    if "UniProt (disease)" in databases:
+        disease_universe = build_uniprot_disease_universe(taxon_id, verbose=verbose, force_refresh=force_refresh)
+        d_genes: set = set()
+        for info in disease_universe["terms"].values():
+            d_genes |= info["genes"]
+        d_genes &= universe_accessions_all
+        _run_family("UniProt disease", disease_universe["terms"], d_genes, score_by_acc)
+
+    if "UniProt (keywords)" in databases:
+        kw_universe = build_uniprot_keyword_universe(taxon_id, verbose=verbose, force_refresh=force_refresh)
+        k_genes: set = set()
+        for info in kw_universe["terms"].values():
+            k_genes |= info["genes"]
+        k_genes &= universe_accessions_all
+        _run_family("UniProt keywords", kw_universe["terms"], k_genes, score_by_acc)
+
+    if "InterPro" in databases:
+        ipr_universe = build_interpro_universe(taxon_id, verbose=verbose, force_refresh=force_refresh)
+        i_genes: set = set()
+        for info in ipr_universe["terms"].values():
+            i_genes |= info["genes"]
+        i_genes &= universe_accessions_all
+        _run_family("InterPro", ipr_universe["terms"], i_genes, score_by_acc)
+
+    if "Complex Portal" in databases:
+        cpx_universe = build_complex_portal_universe(taxon_id, verbose=verbose, force_refresh=force_refresh)
+        c_genes: set = set()
+        for info in cpx_universe["terms"].values():
+            c_genes |= info["genes"]
+        c_genes &= universe_accessions_all
+        _run_family("Complex Portal", cpx_universe["terms"], c_genes, score_by_acc, cpx_universe.get("caveat"))
+
+    # Symbol-space bridge for the 2 symbol-keyed databases (MSigDB,
+    # DISEASES) - mirrors run_ora's identical bridge, but aggregates scores
+    # (not just accession identity) into per-symbol scores via
+    # _mean_score_by_key, since more than one accession can map to the same
+    # symbol (see that helper's docstring).
+    symbol_universe_all: set = set()
+    score_by_symbol: dict = {}
+    if "MSigDB" in databases or "DISEASES" in databases:
+        symbol_universe_all = {accession_to_symbol[a] for a in universe_accessions_all if accession_to_symbol.get(a)}
+        sym_keys, sym_vals = [], []
+        for acc, val in score_by_acc.items():
+            sym = accession_to_symbol.get(acc)
+            if sym:
+                sym_keys.append(sym)
+                sym_vals.append(val)
+        score_by_symbol = _mean_score_by_key(sym_keys, np.array(sym_vals, dtype=float)) if sym_keys else {}
+
+    if "DISEASES" in databases:
+        dis_universe = build_diseases_universe(taxon_id, verbose=verbose, force_refresh=force_refresh)
+        dis_annotated: set = set()
+        for info in dis_universe["terms"].values():
+            dis_annotated |= info["genes"]
+        dis_symbol_universe = symbol_universe_all & dis_annotated
+        step += 1
+        _progress(step, steps_total, "DISEASES")
+        if not dis_universe["terms"]:
+            tables["DISEASES"] = _empty_block(dis_universe.get("caveat") or "No DISEASES data available for this run.")
+        elif not score_by_symbol:
+            tables["DISEASES"] = _empty_block("No quantified proteins with a valid score at the current metric.")
+        else:
+            block = _run_wilcoxon_for_namespace(
+                dis_universe["terms"], score_by_symbol, dis_symbol_universe, True, min_term_size, max_term_size,
+                alternative="two-sided",
+            )
+            if dis_universe.get("caveat"):
+                block["caveat"] = dis_universe["caveat"]
+            tables["DISEASES"] = block
+
+    if "MSigDB" in databases:
+        selected = _msigdb_selected_keys(msigdb_collections)
+        for coll_key in selected:
+            coll_label = MSIGDB_COLLECTIONS.get(coll_key, {}).get("label", coll_key)
+            result_key = f"MSigDB: {coll_label}"
+            if not msigdb_collection_available(coll_key, taxon_id):
+                step += 1
+                tables[result_key] = _empty_block(f"MSigDB {coll_label} is not available for this organism.")
+                continue
+            fetched = fetch_msigdb_sets(coll_key, taxon_id, verbose=verbose, force_refresh=force_refresh)
+            msigdb_sets = {
+                name: {"name": info["name"], "genes": set(info["genes"])}
+                for name, info in fetched.get("sets", {}).items()
+            }
+            msigdb_annotated_symbols: set = set()
+            for info in msigdb_sets.values():
+                msigdb_annotated_symbols |= info["genes"]
+            symbol_universe = symbol_universe_all & msigdb_annotated_symbols
+            step += 1
+            _progress(step, steps_total, result_key)
+            if fetched.get("fetch_failed"):
+                tables[result_key] = _empty_block(f"Could not fetch MSigDB {coll_label} for this run. Re-run to retry.")
+                continue
+            if not score_by_symbol:
+                tables[result_key] = _empty_block("No quantified proteins with a valid score at the current metric.")
+                continue
+            block = _run_wilcoxon_for_namespace(
+                msigdb_sets, score_by_symbol, symbol_universe, True, min_term_size, max_term_size,
+                alternative="two-sided",
+            )
+            tables[result_key] = block
+
+    if "Custom database" in databases and custom_db:
+        custom_genes: set = set()
+        for info in custom_db["terms"].values():
+            custom_genes |= info["genes"]
+        custom_genes &= universe_accessions_all
+        _run_family("Custom database", custom_db["terms"], custom_genes, score_by_acc)
+
+    _finalize_member_column(tables, accession_to_symbol, "Genes", PROTEOMICS_BURDEN_RESULT_COLUMNS)
+
+    summary = {
+        "n_universe": len(universe_accessions_all),
+        "n_universe_before_background": n_universe_before_background,
+        "background_applied": bool(background_accessions),
+        "n_scored": len(score_by_acc),
+        "n_scored_dropped": n_score_dropped,
+        "metric": metric if metric in GSEA_RANKING_METRICS else QUANT_METRIC_DEFAULT,
     }
     return {"tables": tables, "summary": summary}
