@@ -1162,6 +1162,10 @@ def _run_fisher_for_namespace(
     # Counts terms excluded by the size gate (too small OR, if set, too large) so
     # they never enter the BH-FDR family. Field name kept for API/UI compatibility.
     n_excluded_min_size = 0
+    # Terms excluded for containing none of the input genes (see the k == 0
+    # block below) - counted separately from the size gate so the two
+    # partition cleanly.
+    n_terms_no_overlap = 0
     for term_id, info in term_to_genes.items():
         term_genes = info["genes"] & universe_genes
         K = len(term_genes)
@@ -1170,17 +1174,31 @@ def _run_fisher_for_namespace(
             continue
         overlap = term_genes & n_input_in_universe_set
         k = len(overlap)
-        # Short-circuit the k==0 case: a one-sided ("greater") Fisher test with
-        # zero overlap is exactly p=1.0 (P(X>=0)=1) and fold enrichment 0, so we
-        # skip the scipy call. This is a big speedup when many terms don't
-        # overlap the input at all (e.g. per-module enrichment of small modules
-        # against the whole GO ontology), and changes no result.
-        if n <= 0:
-            p_val, fold = float("nan"), float("nan")
-        elif k == 0:
-            p_val, fold = 1.0, 0.0
-        else:
-            p_val, fold = fisher_exact_pvalue(k, n, K, N), fold_enrichment(k, n, K, N)
+        # Terms with ZERO overlapping input genes never enter the p-value/FDR
+        # family - they are not "tested", they are skipped. Matches
+        # clusterProfiler (the standard reference), and the identical fix
+        # already present in Transcriptomics_module._run_ora_for_sets and
+        # Proteomics_module._drop_zero_overlap.
+        #
+        # An earlier version of THIS function kept them as p=1.0 rows, which
+        # inflated the BH family size m for every real test beside them.
+        # Measured live 2026-08-24, real 58-accession input vs GO:Biological
+        # Process: 10,318 terms entered the family but only 383 had ANY
+        # overlap, so every FDR came out ~27x too large and 46 genuine
+        # discoveries were missed at FDR<0.05 (206 reported vs 252 correct).
+        # Note the failure mode was CONSERVATIVE - BH still controlled the
+        # FDR, so nothing previously reported was invalid; real findings were
+        # being lost, not false ones invented.
+        #
+        # This also removes the old n <= 0 NaN rows: if no input gene is in
+        # this universe at all then overlap is necessarily empty too, so those
+        # rows are skipped here instead of reaching benjamini_hochberg - where
+        # min(1.0, nan) == 1.0 silently flattened a whole table's FDRs to 1.0
+        # (the same trap Transcriptomics_module._run_ora_for_sets documents).
+        if k == 0:
+            n_terms_no_overlap += 1
+            continue
+        p_val, fold = fisher_exact_pvalue(k, n, K, N), fold_enrichment(k, n, K, N)
         rows.append({
             "Term ID": term_id,
             "Term Name": info["name"],
@@ -1211,6 +1229,7 @@ def _run_fisher_for_namespace(
         "table": table,
         "n_terms_tested": len(rows),
         "n_terms_excluded_min_size": n_excluded_min_size,
+        "n_terms_no_overlap": n_terms_no_overlap,
         "universe_size": N,
         "n_input_in_universe": n,
         "n_input_dropped": n_input_dropped,

@@ -111,21 +111,34 @@ check(block_all["n_terms_no_overlap"] == 1 + len(background_only),
       f"n_terms_no_overlap correctly counts SET_NOISE + all filler terms "
       f"(got {block_all['n_terms_no_overlap']}, expected {1 + len(background_only)})")
 
-print("=== SENSITIVITY: prove the fix is not vacuous by reverting it ===")
-# Directly exercise the OLD (buggy) behaviour this fix replaced: call
-# Genomics_module._run_fisher_for_namespace WITHOUT the pre-filter, on the
-# exact same fixture, and confirm it genuinely inflates the family - i.e.
-# that the check above would have gone red against the pre-fix code.
+print("=== the SHARED Genomics runner now excludes zero-overlap terms too ===")
+# HISTORY: this check used to assert the OPPOSITE. When Proteomics was
+# built, Genomics_module._run_fisher_for_namespace still kept zero-overlap
+# terms as p=1.0 rows inside the BH family, so Proteomics filtered them out
+# itself (_drop_zero_overlap) rather than reach across module boundaries.
+# That defect was fixed in Genomics on 2026-08-24 after measuring its real
+# cost there (a 58-accession GO:BP run: 10,318 terms in the family but only
+# 383 with any overlap, every FDR ~27x too large, 46 genuine discoveries
+# missed at FDR<0.05). So the assertion is inverted: the shared runner must
+# now do the right thing on its own, and this guards against regressing it.
+# Proteomics' own _drop_zero_overlap is deliberately KEPT - it still owns
+# the min/max term-size gate and the counts this module reports, so the two
+# are complementary, not redundant, and the double filter is a no-op.
 sig_set = set(sig_all["accession"])
 universe_set = set(resolved_df["accession"])
 unfiltered_terms = {tid: {"name": info["name"], "genes": info["genes"]} for tid, info in custom_db["terms"].items()}
-unfiltered_block = genomics_ora._run_fisher_for_namespace(
+shared_block = genomics_ora._run_fisher_for_namespace(
     unfiltered_terms, sig_set, universe_set, 0.05, True, 1, None,
 )
-check(unfiltered_block["n_terms_tested"] == 3 + len(background_only),
-      f"confirmed: calling Genomics' shared runner WITHOUT the pre-filter reproduces the original bug "
-      f"(all {3 + len(background_only)} terms enter the family, not just the 2 with real overlap) - "
-      f"this is the exact defect Proteomics_module.py's _drop_zero_overlap fixes")
+check(shared_block["n_terms_tested"] == 2,
+      f"Genomics' shared runner, called with the FULL {3 + len(background_only)}-term fixture and no "
+      f"pre-filtering, now tests only the 2 terms with real overlap "
+      f"(got {shared_block['n_terms_tested']})")
+check(shared_block.get("n_terms_no_overlap") == 1 + len(background_only),
+      f"and reports the {1 + len(background_only)} skipped zero-overlap terms in its own "
+      f"n_terms_no_overlap field (got {shared_block.get('n_terms_no_overlap')})")
+check((shared_block["table"]["k"] > 0).all(),
+      "no k=0 row survives into the shared runner's result table")
 
 
 # =============================================================================
