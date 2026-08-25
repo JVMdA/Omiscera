@@ -1,10 +1,13 @@
 ===========================================================================
-OMISCERA TEST SUITE - Transcriptomics (TF / Regulon, ORA, GSEA, MSigDB,
-Network / Module Detection)
+OMISCERA TEST SUITE - Transcriptomics, Genomics and Proteomics
 ===========================================================================
 
 These scripts were written while building and auditing the Transcription
-Factor / Regulon module, then extended when MSigDB was added to ORA/GSEA.
+Factor / Regulon module, then extended when MSigDB was added to ORA/GSEA,
+again for Transcriptomics Network / Module Detection, and again for the
+Proteomics module (Over-Representation Analysis). A few also cover Genomics
+screens and shared, app-wide code (the table renderer, organism-state
+guards, the Python<->JS allowlist mirrors).
 They are plain Python scripts, NOT pytest: each one
 does its own PASS/FAIL bookkeeping, prints one line per check, and exits 0
 (all passed) or 1 (something failed). Run any of them directly:
@@ -337,6 +340,49 @@ test_reactome_module_organism_filter.py  8 checks. A real bug found while
                                 red. Direct function calls against the real,
                                 local Reactome bulk file - no server needed.
 
+test_proteomics_retriever.py    31 checks. Proteomics_module_retriever.py -
+                                the three behaviours a proteomics upload
+                                needs that no transcriptomics one does:
+                                protein-GROUP parsing (leading accession from
+                                "P04637;P04637-2"), isoform-suffix stripping,
+                                and MaxQuant contaminant/decoy filtering by
+                                BOTH mechanisms at once (CON__/REV__ id
+                                prefix AND "+"-flagged QC columns). Three
+                                sensitivity checks, one of which reproduces
+                                the SHAPE of a real bug found during
+                                development - filtering a frame that never
+                                carried the flag columns silently finds zero
+                                flagged rows - plus a dedupe tie-break check
+                                run twice with the row order REVERSED, so it
+                                cannot pass by accidental first-wins. Ends
+                                with a small live UniProt ID Mapping round
+                                trip (real network, no local server) proving
+                                a secondary accession (Q15086) resolves to
+                                its current primary (P04637/TP53).
+
+test_proteomics_ora.py          21 checks. Proteomics_module.run_ora's own
+                                logic, entirely offline via a synthetic
+                                Custom-database fixture (no live database
+                                fetch): direction semantics, independent
+                                per-direction BH families, honest empty
+                                blocks, and the two statistical defects found
+                                and fixed during development. BOTH are
+                                sensitivity-checked by recomputing the SAME
+                                fixture the pre-fix way and confirming it
+                                genuinely differs: (1) zero-overlap terms
+                                must never enter the BH family (unfiltered:
+                                183 terms tested instead of 2 - the defect
+                                Genomics_module._run_fisher_for_namespace
+                                STILL has, patched only locally here); and
+                                (2) the universe must be the QUANTIFIED
+                                proteins, not every protein the database
+                                annotates - exposed with a fixture whose
+                                terms deliberately contain
+                                annotated-but-never-measured accessions
+                                (pre-fix: K=25 instead of the correct K=5).
+                                The original fixture was blind to (2), since
+                                all of its genes were already quantified.
+
 
 ---------------------------------------------------------------------------
 NEEDS A LIVE SERVER on http://127.0.0.1:8009
@@ -579,6 +625,36 @@ playwright_transcriptomics_network.py  37 checks. The FIRST real-browser
                                 exactly, each check independently gated on
                                 whether that specific caveat is expected to
                                 appear at all.
+playwright_proteomics_ora.py    40 checks. The FIRST real-browser coverage of
+                                the Proteomics module (Milestone 1: the
+                                foundation plus Over-Representation
+                                Analysis). Drives the real flow end to end -
+                                tile -> sub-tile gating (only ORA enabled;
+                                Quantitative Enrichment / PPI Network / PTM
+                                correctly disabled) -> organism -> upload ->
+                                REAL UniProt ID Mapping resolve of all 3500
+                                example accessions -> configure -> run
+                                against real InterPro/Complex Portal/UniProt
+                                fetches -> results. Asserts biology, not just
+                                that panes exist: Complex Portal's top hit
+                                must be one of the six real complexes
+                                actually seeded into the bundled example.
+                                Also covers the messy MaxQuant example's
+                                contaminant count reaching the SCREEN (not
+                                just the payload); DISEASES being present,
+                                enabled for human and correctly greyed out
+                                for mouse; the custom-DB example zip's exact
+                                contents downloaded through the real
+                                endpoint, then re-uploaded and parsed; a
+                                symbol-based custom DB being REJECTED rather
+                                than silently matching nothing; and a
+                                sensitivity check that runs the real
+                                _oraGeneSet against a real result row to
+                                prove the renamed "Overlapping Proteins"
+                                column (formatted "ACCESSION (SYMBOL)") is
+                                still parsed into bare accessions - without
+                                it the protein-concept network's log2FC
+                                colouring would silently stop resolving.
 test_organism_allowlist_mirror.py  7 checks. Guards a drift risk found while
                                 auditing organism generality: several
                                 per-database organism allowlists are
@@ -687,10 +763,11 @@ playwright_msigdb.py            68 checks. Same real-browser approach for
                                 multi-collection run produced a pile of
                                 indistinguishable "... (1).csv" files).
 
-These four (playwright_regulon.py, playwright_genomics_results_cards.py,
-playwright_msigdb.py, playwright_transcriptomics_network.py) make real
-network calls (mygene.info, TRRUST, ChEA3, MSigDB, UniProt, STRING,
-GO/QuickGO) and are not mocked, so they need internet and take a few
+These five (playwright_regulon.py, playwright_genomics_results_cards.py,
+playwright_msigdb.py, playwright_transcriptomics_network.py,
+playwright_proteomics_ora.py) make real network calls (mygene.info, TRRUST,
+ChEA3, MSigDB, UniProt, STRING, GO/QuickGO, InterPro, Complex Portal,
+DISEASES) and are not mocked, so they need internet and take a few
 minutes. test_msigdb_summary_figure.py, test_gsea_null_histogram_range.py,
 and test_organism_allowlist_mirror.py are the exceptions - all three need
 the server only to load app.js, and make no external calls.
@@ -705,8 +782,8 @@ in one never hides another. From the repo root, with the server up:
     Get-ChildItem tests\*.py | ForEach-Object { python $_.FullName }
 
 Expected totals as of the last full run, in file-listing order: 117, 22, 16,
-4, 15, 5, 16, 10, 24, 58, 44, 49, 52, 8, 21, 15, 12, 12, 22, 22, 16, 12, 49,
-90, 13, 37, 7, 4, 15, 68 - all passing (855 checks across 30 files).
+4, 15, 5, 16, 10, 24, 58, 44, 49, 52, 8, 31, 21, 21, 15, 12, 12, 22, 22, 16,
+12, 49, 90, 13, 37, 40, 7, 4, 15, 68 - all passing (947 checks across 33 files).
 
 A NOTE ON WRITING NEW CHECKS HERE. Prefer assertions that can actually fail
 for the reason you care about. A concrete example lives in
