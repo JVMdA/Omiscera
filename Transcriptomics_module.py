@@ -58,6 +58,7 @@ import numpy as np
 import pandas as pd
 
 import go_hierarchy
+from Genomics_module import format_term_name
 
 try:
     import requests as _requests
@@ -1234,7 +1235,7 @@ def _run_ora_for_sets(
         else:
             p_val, fold = hypergeometric_pvalue(k, n, K, N), fold_enrichment(k, n, K, N)
         rows.append({
-            "Term ID": term_id, "Term Name": info.get("name", term_id),
+            "Term ID": term_id, "Term Name": format_term_name(info.get("name", term_id)),
             "k": k, "K": K, "n": n, "N": N,
             "Fold Enrichment": fold, "p-value": p_val,
             # Comma-joined (not "; ") to match the frontend's shared _oraGeneSet
@@ -2161,7 +2162,7 @@ def _run_gsea_for_sets(
     for o, q, bh in zip(observed, q_values, fdr_bh):
         edge_genes = _leading_edge(o["hit_positions"], o["rank_at_max"], o["sign"], symbols_by_position)
         rows.append({
-            "Term ID": o["term_id"], "Term Name": o["name"], "Size": o["size"],
+            "Term ID": o["term_id"], "Term Name": format_term_name(o["name"]), "Size": o["size"],
             "ES": o["es"], "NES": o["nes"], "p-value": o["nominal_p"],
             "FDR q-value": float(q), "FDR (BH)": bh,
             "Leading Edge Size": len(edge_genes),

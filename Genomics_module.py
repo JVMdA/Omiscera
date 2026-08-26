@@ -219,6 +219,55 @@ def bonferroni(pvalues: list) -> list:
     return [min(p * m, 1.0) for p in pvalues]
 
 
+# GO's own naming convention is lowercase-first ("cytoplasmic translation"),
+# and every enrichment engine here just passes each database's published
+# name straight through - reported live as reading badly, 2026-08-26.
+# Measured against every real cached universe in this app: GO is 88.4%
+# lowercase-start (18,580 of 21,028 terms); Reactome/InterPro/UniProt
+# keywords/Complex Portal/DISEASES are 1-8% lowercase-start and already
+# mostly fine.
+#
+# A naive .capitalize() is NOT safe: 787 real names across these same
+# databases start with a scientifically load-bearing lowercase token that
+# capitalizing would corrupt into a DIFFERENT, wrong token - mRNA/tRNA/rRNA/
+# snRNA/miRNA/lncRNA, cAMP/cGMP/dATP/dTDP (nucleotides), eIF2/eIF3/eRF1
+# (eukaryotic initiation/release factors), hnRNP (heterogeneous nuclear
+# ribonucleoprotein), bZIP/bHLH (transcription-factor domains), pH, p53 -
+# capitalizing any of these turns them into a different acronym or, for
+# cAMP and pH, an entirely different real gene/domain name (CAMP is the
+# cathelicidin gene; PH is the pleckstrin-homology domain). Every one of
+# these 787 names was individually eyeballed while building this pattern -
+# zero false positives found, so the regex below is not a guess.
+_LOWERCASE_SIGNIFICANT_TOKEN_RE = re.compile(r"^[a-z]{1,3}[A-Z0-9]")
+# MSigDB's own SCREAMING_SNAKE_CASE convention (HALLMARK_TNFA_SIGNALING_VIA_
+# NFKB): underscores hurt readability but the CAPS must survive untouched -
+# TNFA and NFKB are real gene symbols a case change would corrupt.
+_ALL_CAPS_UNDERSCORE_RE = re.compile(r"^[A-Z0-9_]+$")
+
+
+def format_term_name(name: str) -> str:
+    """Capitalize a database's term/pathway name for display, guarding
+    against the lowercase-significant scientific tokens documented above.
+
+    Applied once, where each engine builds its "Term Name" column/field, so
+    every consumer (result table, every chart, every CSV download) shows the
+    same text automatically - there is no separate frontend formatting step
+    to keep in sync.
+    """
+    if not name:
+        return name
+    s = str(name)
+    if not s:
+        return s
+    if "_" in s and _ALL_CAPS_UNDERSCORE_RE.match(s):
+        return s.replace("_", " ")
+    if _LOWERCASE_SIGNIFICANT_TOKEN_RE.match(s):
+        return s
+    if s[0].islower():
+        return s[0].upper() + s[1:]
+    return s
+
+
 # ---------------------------------------------------------------------------
 # Shared UniProt bulk-fetch (cursor-paginated) — now used ONLY by
 # _taxon_symbol_to_accession_map, which is available for future analyses that
@@ -1201,7 +1250,7 @@ def _run_fisher_for_namespace(
         p_val, fold = fisher_exact_pvalue(k, n, K, N), fold_enrichment(k, n, K, N)
         rows.append({
             "Term ID": term_id,
-            "Term Name": info["name"],
+            "Term Name": format_term_name(info["name"]),
             "k": k, "K": K, "n": n, "N": N,
             "Fold Enrichment": fold,
             "p-value": p_val,
@@ -1509,7 +1558,7 @@ def _run_wilcoxon_for_namespace(
         mean_out = sum(out_scores) / len(out_scores)
         rows.append({
             "Term ID": term_id,
-            "Term Name": info["name"],
+            "Term Name": format_term_name(info["name"]),
             "Genes in set": K,
             "Scored genes (universe)": n,
             "Mean score (set)": mean_in,

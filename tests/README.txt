@@ -427,6 +427,45 @@ test_proteomics_quant.py        31 checks. Proteomics_module.
                                 `alternative` kwarg reproduces the explicit
                                 "greater" call exactly).
 
+test_format_term_name.py        49 checks. Genomics_module.format_term_name -
+                                pathway/term names rendered lowercase-first
+                                ("cytoplasmic translation") across every
+                                module's tables and figures, user-reported
+                                2026-08-26. Root cause: GO's OWN naming
+                                convention is lowercase-first (88.4% of
+                                21,028 real cached GO terms); every engine
+                                just passed the published name straight
+                                through. A naive capitalize() is NOT safe -
+                                787 real names across GO/Reactome/InterPro/
+                                UniProt keywords/Complex Portal/DISEASES
+                                start with a scientifically load-bearing
+                                lowercase token (mRNA, cAMP, pH, eIF3,
+                                hnRNP, bZIP, ...) that capitalizing would
+                                corrupt into a DIFFERENT, real, wrong token
+                                (cAMP -> CAMP is a different human gene; pH
+                                -> PH is a different protein domain).
+                                Verified against the REAL cached GO corpus,
+                                not a fixture: exactly 18,228 of 21,028 real
+                                terms get capitalized, exactly 352 are
+                                hazard-preserved, zero false positives.
+                                MSigDB's SCREAMING_SNAKE_CASE names get
+                                underscores replaced with spaces, caps kept
+                                (TNFA/NFKB are real gene symbols). A
+                                sensitivity check proves a naive single-
+                                character capitalize() - the realistic
+                                accidental implementation this replaced -
+                                really would corrupt 'mRNA' into 'MRNA' and
+                                'pH' into 'PH'. Also integration-tests the
+                                fix is actually WIRED IN, not just correct
+                                in isolation: calls Genomics_module.
+                                _run_fisher_for_namespace (ORA) and
+                                _run_wilcoxon_for_namespace (Burden Test /
+                                Proteomics Quantitative Enrichment, which
+                                reuses it) and Transcriptomics_module.
+                                _run_ora_for_sets directly and confirms both
+                                a normal name and a hazard name come out
+                                correctly in the real result table.
+
 
 ---------------------------------------------------------------------------
 NEEDS A LIVE SERVER on http://127.0.0.1:8009
@@ -863,9 +902,9 @@ in one never hides another. From the repo root, with the server up:
     Get-ChildItem tests\*.py | ForEach-Object { python $_.FullName }
 
 Expected totals as of the last full run, in file-listing order: 117, 22, 16,
-4, 15, 5, 16, 10, 24, 58, 44, 49, 52, 8, 31, 23, 31, 21, 15, 12, 12, 22, 22,
-16, 12, 49, 90, 13, 37, 40, 41, 7, 4, 15, 68 - all passing (1021 checks
-across 35 files).
+4, 15, 5, 16, 10, 24, 58, 44, 49, 52, 8, 31, 23, 31, 49, 21, 15, 12, 12, 22,
+22, 16, 12, 49, 90, 13, 37, 40, 41, 7, 4, 15, 68 - all passing (1070 checks
+across 36 files).
 
 A NOTE ON WRITING NEW CHECKS HERE. Prefer assertions that can actually fail
 for the reason you care about. A concrete example lives in
