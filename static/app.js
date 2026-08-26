@@ -3931,6 +3931,19 @@ function renderProteomicsQuantResultsScreen() {
     alphaRow.appendChild(alphaInput);
     wrap.appendChild(alphaRow);
 
+    // The config screen explains the method, but that text is gone by the
+    // time results render - a real gap reported live 2026-08-25 ("what is
+    // new here, because im seeing only this"). Restate it briefly here so a
+    // reader who jumped straight to results still knows what they are
+    // looking at, and in particular that Effect (mean difference) - not a
+    // hit count - is the column that carries the biology.
+    wrap.appendChild(el("div", { class: "caption" },
+        "Quantitative Enrichment compares each term's proteins against every OTHER quantified protein " +
+        "(a competitive Wilcoxon rank-sum test, two-sided) - unlike ORA, there is no significance " +
+        "cutoff and no up/down split, so a term shifted DOWN is exactly as detectable as one shifted " +
+        "UP. Effect (mean difference) carries the direction: positive means the term's proteins score " +
+        "higher (by the chosen ranking metric) than the rest of the quantified proteome, negative means lower."));
+
     wrap.appendChild(el("div", { class: "caption" },
         "Each database (and each selected MSigDB collection) is independently Benjamini-Hochberg " +
         "corrected - there is no correction ACROSS these families. Scanning every table and reporting " +
@@ -4001,7 +4014,62 @@ function renderProteomicsQuantResultsScreen() {
         const hasSigRows = (block.table.rows || []).some(row =>
             row["FDR"] !== null && row["FDR"] !== "" && isFinite(Number(row["FDR"])) && Number(row["FDR"]) < alpha
         );
-        if (!hasSigRows) { nav.finish(); return; }
+        if (!hasSigRows) {
+            // A genuinely empty result used to hide the "Charts" section
+            // entirely - not just show it empty, ABSENT from the nav rail -
+            // which for a threshold-free test is actively misleading: unlike
+            // ORA, "nothing significant" here does not mean "nothing to look
+            // at". The volcano plot draws every tested term regardless of
+            // significance (buildBurdenVolcanoPlot uses the full table, not
+            // _burdenTopRows' alpha filter), so it stays informative with
+            // zero hits - show that one figure plus an explanation, instead
+            // of a blank the user has to interpret as "not implemented yet".
+            overviewPane.appendChild(alertBox("info",
+                `No term passed FDR < ${alpha} (${block.n_terms_tested} tested) - see the "Charts" ` +
+                `section for a volcano plot of every term. The significance threshold is adjustable ` +
+                `above; the other figures (dot/bar/enrichment map/protein-concept network) only draw ` +
+                `significant terms, so they have nothing to show until one passes.`));
+            const overview = nav.pane("Protein set overview", { group: "Charts" });
+            const emptyControls = el("div", { class: "chart-toggle-row" });
+            const emptyArea = el("div", { class: "chart-pair" });
+            overview.appendChild(el("div", { class: "ora-chart-threshold-note" },
+                `No term passed FDR < ${alpha} - every OTHER figure here needs at least one significant ` +
+                `term to draw. The volcano plot below is the exception: it is threshold-free by ` +
+                `construction, plotting every tested term's Effect (mean difference) regardless of FDR.`));
+            overview.appendChild(emptyControls);
+            overview.appendChild(emptyArea);
+            let emptyFontSize = 12;
+            let emptyVolcanoY = "p";
+            const volcanoChartId = _oraChartId("volcano", slug, null);
+            const volcanoDiv = el("div", { id: volcanoChartId, class: "chart-container" });
+            emptyArea.appendChild(volcanoDiv);
+            function renderEmptyVolcano() {
+                buildBurdenVolcanoPlot(volcanoDiv, block.table, slug, null, alpha, { fontSize: emptyFontSize, volcanoY: emptyVolcanoY });
+            }
+            const fsControl = el("label", { class: "chart-option-control" });
+            fsControl.appendChild(el("span", { class: "chart-option-label" }, "Font size"));
+            const fsSelect = el("select", { class: "chart-option-select" });
+            [["10", "10"], ["12", "12"], ["14", "14"], ["16", "16"], ["18", "18"]].forEach(([label, value]) => {
+                fsSelect.appendChild(el("option", { value }, label));
+            });
+            fsSelect.value = String(emptyFontSize);
+            fsSelect.addEventListener("change", () => { emptyFontSize = Number(fsSelect.value); renderEmptyVolcano(); });
+            fsControl.appendChild(fsSelect);
+            emptyControls.appendChild(fsControl);
+            const yControl = el("label", { class: "chart-option-control" });
+            yControl.appendChild(el("span", { class: "chart-option-label" }, "Volcano y-axis"));
+            const ySelect = el("select", { class: "chart-option-select" });
+            [["-log10(p-value)", "p"], ["-log10(FDR)", "fdr"]].forEach(([label, value]) => {
+                ySelect.appendChild(el("option", { value }, label));
+            });
+            ySelect.value = emptyVolcanoY;
+            ySelect.addEventListener("change", () => { emptyVolcanoY = ySelect.value; renderEmptyVolcano(); });
+            yControl.appendChild(ySelect);
+            emptyControls.appendChild(yControl);
+            renderEmptyVolcano();
+            nav.finish();
+            return;
+        }
 
         function makeChartPane(title) {
             const p = nav.pane(title, { group: "Charts" });

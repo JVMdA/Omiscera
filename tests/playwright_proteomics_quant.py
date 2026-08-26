@@ -4,13 +4,13 @@ Genomics' Gene-set Burden Test engine extended to alternative="two-sided").
 
 Drives the REAL flow end to end: tile -> organism selector -> upload the
 bundled example -> resolve (real UniProt ID Mapping) -> continue to
-Quantitative Enrichment -> configure -> run (real GO/InterPro/Complex Portal
-fetches) -> results, then checks the member-column fix to _burdenGeneSet
-(the one genuine frontend correctness fix this milestone needed - see
-app.js) actually works against a real row.
+Quantitative Enrichment -> configure -> run (real InterPro/Complex
+Portal/UniProt keywords fetches) -> results, then checks the member-column
+fix to _burdenGeneSet (the one genuine frontend correctness fix this
+milestone needed - see app.js) actually works against a real row.
 
-Needs a live server and real network access - not mocked, takes a few
-minutes (GO's QuickGO fetch + hierarchy propagation is the slow part).
+Needs a live server and real network access - not mocked, takes a couple of
+minutes.
 """
 import os
 
@@ -86,17 +86,18 @@ with sync_playwright() as p:
     default_metric_value = page.evaluate("STATE.proteomics._quantDraft.metric")
     check(default_metric_value == "log2fc", f"default metric is log2fc (got {default_metric_value!r})")
 
-    # GO is included (not just the 3 fast databases) specifically so the
-    # chart-rendering section below has a REAL significant term to exercise:
-    # the bundled example's GO: Cellular Component family reliably clears
-    # FDR<0.05 (verified live 2026-08-25) - InterPro/Complex Portal/UniProt
-    # keywords alone do not, which would otherwise leave every chart check
-    # below permanently skipped rather than actually run.
-    for db_name in ["GO", "InterPro", "Complex Portal", "UniProt (keywords)"]:
+    # Complex Portal alone now reliably clears FDR<0.05 on the bundled
+    # example (fixed 2026-08-25: the generator used to draw each seeded
+    # protein's up/down sign independently, so a complex's own members
+    # cancelled out under a SIGNED, direction-aware test like this one - see
+    # generate_proteomics_examples.py's complex_sign for the fix). GO is no
+    # longer needed just to reach a significant result, so the fast three
+    # databases are enough here.
+    for db_name in ["InterPro", "Complex Portal", "UniProt (keywords)"]:
         page.locator("label.ora-db-pill", has_text=db_name).locator("input[type=checkbox]").check()
     page.wait_for_timeout(100)
     run_btn = page.locator("button.ora-run-btn")
-    check(not run_btn.is_disabled(), "Run button enabled with 4 databases selected")
+    check(not run_btn.is_disabled(), "Run button enabled with 3 databases selected")
     run_btn.click()
     page.wait_for_timeout(300)
     check(page.evaluate("STATE.aaPage") == "proteomics_quant_results", "navigated to the Quant results screen")
@@ -151,9 +152,10 @@ with sync_playwright() as p:
           "those parsed ids genuinely match resolved-table accessions, so gene-concept-network log2FC coloring resolves")
 
     print("=== figures render on a REAL significant term (all 5 Burden-shaped chart builders) ===")
-    # Find whichever GO namespace actually has a significant term this run
-    # (Cellular Component, live-verified 2026-08-25, but don't hardcode it -
-    # assert on the real payload instead of assuming a specific namespace).
+    # Find whichever selected database actually has a significant term this
+    # run (Complex Portal, live-verified 2026-08-25 after the example fix,
+    # but don't hardcode it - assert on the real payload instead of assuming
+    # a specific database).
     sig_key = None
     for key, block in tables.items():
         rows = block.get("table", {}).get("rows", [])

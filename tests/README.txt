@@ -710,7 +710,7 @@ playwright_proteomics_quant.py  41 checks. Milestone 2 - the first real-
                                 configure (asserts NO padj/log2FC cutoff
                                 fields on this screen, and that the ranking-
                                 metric selector defaults to log2fc) -> run
-                                against GO/InterPro/Complex Portal/UniProt
+                                against InterPro/Complex Portal/UniProt
                                 keywords -> results, asserting result keys
                                 carry NO direction suffix (unlike ORA's
                                 "(all)/(up)/(down)") and no ORA-style
@@ -724,9 +724,13 @@ playwright_proteomics_quant.py  41 checks. Milestone 2 - the first real-
                                 have silently returned empty, breaking the
                                 enrichment map and protein-concept network's
                                 edges with no error. Also selects whichever
-                                GO namespace actually came back significant
-                                this run (Cellular Component, live-verified
-                                2026-08-25) and exercises all 5 Burden-shaped
+                                selected database actually came back
+                                significant this run (Complex Portal,
+                                live-verified 2026-08-25 after fixing the
+                                bundled example's per-protein-random-
+                                direction generation bug - see
+                                generate_proteomics_examples.py) and
+                                exercises all 5 Burden-shaped
                                 chart builders (dot, bar, volcano, enrichment
                                 map, protein-concept network) for real
                                 rendered Plotly figures, plus the CSV download
