@@ -388,7 +388,7 @@ test_proteomics_ora.py          23 checks. Proteomics_module.run_ora's own
                                 instead of documenting a defect Genomics
                                 still had - guards against regressing it.
 
-test_proteomics_quant.py        27 checks. Proteomics_module.
+test_proteomics_quant.py        31 checks. Proteomics_module.
                                 run_quantitative_enrichment's own logic,
                                 entirely offline via a synthetic Custom-
                                 database fixture with a real continuous
@@ -398,7 +398,19 @@ test_proteomics_quant.py        27 checks. Proteomics_module.
                                 formulas, NaN-score dropping, duplicate-
                                 accession mean-aggregation, and the
                                 Overlapping Proteins member-column rename/
-                                format shared with ORA. The LOAD-BEARING
+                                format shared with ORA. A real bug caught in
+                                post-milestone review: n_dropped originally
+                                counted dropped ROWS, not dropped PROTEINS -
+                                for a duplicate accession with one valid row
+                                and one NaN row (resolve_protein_table does
+                                not deduplicate), it overcounted, and could
+                                double-count a fully-NaN duplicate as 2
+                                missing proteins instead of 1. Fixed to count
+                                DISTINCT accessions with no score at all;
+                                sensitivity-checked by reproducing the OLD
+                                row-based formula on the same fixture and
+                                confirming it genuinely gives 3, not the
+                                correct 1. The LOAD-BEARING
                                 check: a DOWN-shifted term must be AS
                                 significant as an UP-shifted one under the
                                 two-sided Wilcoxon test this milestone added
@@ -847,8 +859,8 @@ in one never hides another. From the repo root, with the server up:
     Get-ChildItem tests\*.py | ForEach-Object { python $_.FullName }
 
 Expected totals as of the last full run, in file-listing order: 117, 22, 16,
-4, 15, 5, 16, 10, 24, 58, 44, 49, 52, 8, 31, 23, 27, 21, 15, 12, 12, 22, 22,
-16, 12, 49, 90, 13, 37, 40, 41, 7, 4, 15, 68 - all passing (1017 checks
+4, 15, 5, 16, 10, 24, 58, 44, 49, 52, 8, 31, 23, 31, 21, 15, 12, 12, 22, 22,
+16, 12, 49, 90, 13, 37, 40, 41, 7, 4, 15, 68 - all passing (1021 checks
 across 35 files).
 
 A NOTE ON WRITING NEW CHECKS HERE. Prefer assertions that can actually fail

@@ -609,15 +609,20 @@ def _build_protein_scores(resolved_df: pd.DataFrame, metric: str = QUANT_METRIC_
     ranked ordering is needed).
 
     Rows with a non-finite score (NaN log2FC/pvalue, or - for
-    signed_log_padj only - a missing padj) are dropped and counted.
-    Duplicate accessions are mean-aggregated (see _mean_score_by_key).
+    signed_log_padj only - a missing padj) are dropped. Duplicate accessions
+    are mean-aggregated (see _mean_score_by_key) - so an accession with ONE
+    valid row and one NaN row still ends up scored, not dropped. n_dropped
+    counts DISTINCT accessions left with no score at all, not dropped rows:
+    a row-level count would overstate the true number of un-scored proteins
+    whenever a duplicate accession has some (or all) rows non-finite, since
+    each such row would count separately even though it is the SAME protein.
 
     Returns (score_by_accession, n_dropped).
     """
     if metric not in GSEA_RANKING_METRICS:
         metric = QUANT_METRIC_DEFAULT
     df = resolved_df[resolved_df["accession"].astype(str).str.strip() != ""].copy()
-    n_input = len(df)
+    input_accessions = set(df["accession"].astype(str))
 
     if metric == "signed_log_padj":
         df = df[df["padj"].notna()]
@@ -642,9 +647,9 @@ def _build_protein_scores(resolved_df: pd.DataFrame, metric: str = QUANT_METRIC_
     finite = np.isfinite(values)
     accs = df["accession"].astype(str).to_numpy()[finite]
     values = values[finite]
-    n_dropped = n_input - len(accs)
 
     score_by_acc = _mean_score_by_key(list(accs), values)
+    n_dropped = len(input_accessions) - len(score_by_acc)
     return score_by_acc, n_dropped
 
 

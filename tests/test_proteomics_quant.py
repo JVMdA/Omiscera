@@ -126,6 +126,48 @@ check(scores_p["P00000"] != scores["P00000"], "pi_value differs from log2fc for 
 
 
 # =============================================================================
+# n_dropped counts DISTINCT PROTEINS with no score, not dropped ROWS - a real
+# bug caught in review: resolve_protein_table does NOT deduplicate by
+# accession, so an accession can have one valid row and one NaN row (partial
+# duplicate). A row-level count would report that as 1 dropped, even though
+# the protein IS scored (via its surviving row) and 0 proteins were actually
+# lost - or, worse, it could report 2 dropped for a fully-NaN duplicate that
+# is really only 1 missing protein. Both must be counted per DISTINCT
+# accession, matching "Proteins scored" (also distinct-accession-based) so
+# the two summary numbers the UI shows side by side are on the same basis.
+# =============================================================================
+print("=== n_dropped counts distinct un-scored PROTEINS, not dropped rows ===")
+dup_rows = pd.DataFrame([
+    {"accession": "DUPA", "log2FC": 2.0, "pvalue": 0.01, "padj": 0.05},   # DUPA: 1 valid + 1 NaN row
+    {"accession": "DUPA", "log2FC": float("nan"), "pvalue": float("nan"), "padj": float("nan")},
+    {"accession": "DUPB", "log2FC": float("nan"), "pvalue": float("nan"), "padj": float("nan")},  # DUPB: both rows NaN
+    {"accession": "DUPB", "log2FC": float("nan"), "pvalue": float("nan"), "padj": float("nan")},
+    {"accession": "SOLO", "log2FC": 1.0, "pvalue": 0.02, "padj": 0.05},   # SOLO: single valid row
+])
+dup_scores, dup_dropped = pm._build_protein_scores(dup_rows, metric="log2fc")
+check(set(dup_scores.keys()) == {"DUPA", "SOLO"},
+      f"DUPA is scored via its surviving row, DUPB has no score at all (got {sorted(dup_scores.keys())})")
+check(dup_dropped == 1,
+      f"exactly 1 DISTINCT protein (DUPB) has no score - NOT 3, which is what a row-level count "
+      f"(DUPA's 1 NaN row + DUPB's 2 NaN rows) would wrongly report (got n_dropped={dup_dropped})")
+check(len(dup_scores) + dup_dropped == dup_rows["accession"].nunique(),
+      "scored + dropped exactly partitions the distinct accessions - the invariant the UI's "
+      "'Proteins scored' / 'Dropped' metric cards rely on")
+
+print("=== SENSITIVITY: the old row-level formula genuinely overcounts on this fixture ===")
+# Reproduce the OLD (buggy) formula directly: n_input (valid-accession ROWS)
+# minus the count of ROWS surviving the finite-score filter - exactly what
+# _build_protein_scores computed before this fix.
+n_input_rows = len(dup_rows)
+n_finite_rows = dup_rows["log2FC"].apply(lambda v: v == v).sum()  # v == v is False for NaN, no numpy import needed here
+old_style_n_dropped = n_input_rows - n_finite_rows
+check(old_style_n_dropped == 3,
+      f"confirmed: the OLD row-based formula gives 3 (1 from DUPA's NaN row + 2 from DUPB's) on this "
+      f"fixture, not the correct 1 - proving the fix changed a real, reachable result "
+      f"(got {old_style_n_dropped})")
+
+
+# =============================================================================
 # run_quantitative_enrichment: the two-sided fix is load-bearing
 # =============================================================================
 print("=== run_quantitative_enrichment: UP and DOWN both detected ===")
@@ -217,7 +259,8 @@ print("=== no cutoff: n_scored reflects ALL finite-score proteins, not a signifi
 check(result["summary"]["n_scored"] == len(scores),
       f"summary n_scored matches _build_protein_scores' own count (got {result['summary']['n_scored']})")
 check(result["summary"]["n_scored_dropped"] == 3,
-      f"summary n_scored_dropped reports the 3 NaN-score rows (got {result['summary']['n_scored_dropped']})")
+      f"summary n_scored_dropped reports the 3 un-scored proteins, counted per DISTINCT accession "
+      f"not per row (see the dedicated check above) (got {result['summary']['n_scored_dropped']})")
 check(result["summary"]["metric"] == "log2fc", "summary echoes back the requested metric")
 
 
