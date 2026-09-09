@@ -27,6 +27,7 @@ if __name__ == "__main__":
 
 import hashlib
 import io
+import html
 import json
 import os
 import re
@@ -76,8 +77,43 @@ UNIPROT_SPARQL_URL = "https://sparql.uniprot.org/sparql"
 UNIPROT_TAXONOMY_URL = "https://rest.uniprot.org/taxonomy"
 UNICHEM_INCHIKEY_URL = "https://www.ebi.ac.uk/unichem/rest/inchikey"
 NPATLAS_API_URL = "https://www.npatlas.org/api/v1"
+KEGG_LIST_ORGANISM_URL = "https://rest.kegg.jp/list/organism"
+# list/organism started returning HTTP 400 (confirmed with and without headers,
+# so it is not header-related); list/genome carries the same T-number/org-code/
+# name data (verified: 11,946 rows, "T01001\thsa; Homo sapiens (human)") and is
+# tried as a fast REST fallback before the slow full-HTML-page scrape below.
+KEGG_LIST_GENOME_URL = "https://rest.kegg.jp/list/genome"
+KEGG_ORGANISM_HTML_FALLBACK_URL = "https://www.genome.jp/kegg/tables/br08606.html"
+KEGG_LIST_PATHWAY_URL = "https://rest.kegg.jp/list/pathway/{organism}"
+KEGG_LINK_ENZYME_CPD_URL = "https://rest.kegg.jp/link/enzyme/cpd:{compound_id}"
+KEGG_GET_REACTION_URL = "https://rest.kegg.jp/get/{reaction_ids}"
+KEGG_LINK_ENZYME_RN_URL = "https://rest.kegg.jp/link/enzyme/rn:{reaction_id}"
+KEGG_LINK_REACTION_CPD_URL = "https://rest.kegg.jp/link/reaction/cpd:{compound_id}"
+KEGG_LINK_ENZYME_ORG_URL = "https://rest.kegg.jp/link/enzyme/{organism}"
+KEGG_LIST_EC_URL = "https://rest.kegg.jp/list/ec:{ec_value}"
+KEGG_LINK_PATHWAY_EC_URL = "https://rest.kegg.jp/link/pathway/ec:{ec_value}"
+# KEGG's documented per-request cap on "get" - batching reaction-equation
+# fetches against this (instead of one call per reaction, as the original
+# implementation did) cuts the Role column's cost roughly 10x: a compound
+# in ~100 reactions needs ~10 batched calls instead of ~100 single ones.
+KEGG_GET_BATCH_SIZE = 10
+# KEGG's documented request-rate guidance (~3/s) - a shared throttle so a
+# single compound's Role lookup (which can issue dozens of calls) does not
+# hammer the API, and so this stays true of the tool once distributed to
+# many independent users rather than run from one server.
+KEGG_MIN_REQUEST_INTERVAL_SECONDS = 0.34
+_KEGG_LAST_REQUEST_TIME = [0.0]  # single-element list: mutable module-level state
+# KEGG "Global and overview maps" (BRITE 1.0) - present in nearly every
+# organism, so their presence is not evidence of species-specific occurrence
+# the way a normal metabolic pathway's presence is; excluded from
+# get_kegg_enzyme_pathways_in_species's output.
+KEGG_OVERVIEW_PATHWAY_NUMBERS = frozenset({
+    "01100", "01110", "01120", "01200", "01210", "01212", "01220", "01230",
+    "01232", "01240", "01250", "01310", "01320",
+})
 
 SUPPORTED_DATABASES = [
+    "KEGG",
     "LOTUS",
     "HMDB",
     "Rhea + UniProt",
@@ -85,6 +121,7 @@ SUPPORTED_DATABASES = [
 ]
 
 _CANONICAL_NAMES = {
+    "kegg": "KEGG",
     "lotus": "LOTUS",
     "hmdb": "HMDB",
     "hmdb import": "HMDB",
@@ -115,6 +152,21 @@ def canonical_database_name(database_name: str) -> str:
 def get_database_metadata() -> Dict[str, Dict[str, Any]]:
     """Return metadata describing each supported database."""
     return {
+        "KEGG": {
+            "display_name": "KEGG",
+            "required_identifiers": ["KEGG ID"],
+            "preferred_identifier_order": ["KEGG ID"],
+            "context_type": "organism",
+            "context_label": "KEGG organism code",
+            "online_supported": True,
+            "local_data_supported": False,
+            "notes": (
+                "KEGG organism contexts can be retrieved online using KEGG REST. "
+                "Compound-linked enzymes come from KEGG's direct compound->enzyme link "
+                "(link/enzyme/cpd:); substrate/product Role is a separate traversal "
+                "through the compound's reactions, used only to label rows."
+            ),
+        },
         "LOTUS": {
             "display_name": "LOTUS",
             "required_identifiers": ["SMILES", "InChIKey"],
@@ -171,6 +223,17 @@ def get_database_metadata() -> Dict[str, Dict[str, Any]]:
 def get_database_retrieval_capabilities() -> Dict[str, Dict[str, Any]]:
     """Return truthful retrieval/lookup implementation status for each database."""
     return {
+        "KEGG": {
+            "database": "KEGG",
+            "context_list_status": "implemented",
+            "context_search_status": "implemented",
+            "context_retrieval_status": "implemented",
+            "compound_lookup_status": "implemented",
+            "context_source": "KEGG REST organism list",
+            "compound_lookup_source": "KEGG REST compound-to-enzyme link and organism enzyme set",
+            "context_search_notes": "KEGG organism contexts are listed once, then searched locally with exact ID matches ranked first.",
+            "reason": "KEGG organism context retrieval and enzyme-presence lookup are implemented.",
+        },
         "LOTUS": {
             "database": "LOTUS",
             "context_list_status": "not_implemented",
@@ -270,6 +333,20 @@ def get_best_available_identifier(compound_row: Any, database_name: str) -> Dict
     """Return the best available identifier for the selected database."""
     canonical = canonical_database_name(database_name)
     row = _as_dict(compound_row)
+
+    if canonical == "KEGG":
+        value = normalize_text(row.get("KEGG ID", ""))
+        if value:
+            return {
+                "identifier_type": "KEGG ID",
+                "identifier_value": value,
+                "status": "available",
+            }
+        return {
+            "identifier_type": None,
+            "identifier_value": "",
+            "status": "missing",
+        }
 
     if canonical == "HMDB":
         for identifier_type in ("HMDB ID", "Name", "InChIKey"):
@@ -817,6 +894,13 @@ def get_available_contexts(
 ) -> pd.DataFrame:
     """Return available contexts for the selected database."""
     canonical = canonical_database_name(database_name)
+    if canonical == "KEGG":
+        return list_kegg_organisms(
+            allow_online=allow_online,
+            use_memory_cache=use_memory_cache,
+            force_refresh=force_refresh,
+            verbose=verbose,
+        )
     if canonical == "LOTUS":
         return list_lotus_contexts(
             allow_online=allow_online,
@@ -865,6 +949,29 @@ def probe_database_access(
 ) -> Dict[str, Any]:
     """Lightly test whether a database has a usable online access path."""
     canonical = canonical_database_name(database_name)
+
+    if canonical == "KEGG":
+        if not allow_online:
+            return _build_probe_result(canonical, "not_available", False, False,
+                                       "Online probing disabled.", KEGG_LIST_ORGANISM_URL, None)
+        frame = list_kegg_organisms(allow_online=True, verbose=verbose)
+        tested_url = frame.attrs.get("tested_url", KEGG_LIST_ORGANISM_URL)
+        if frame.attrs.get("html_fallback_attempted"):
+            source = "HTML fallback"
+        elif tested_url == KEGG_LIST_GENOME_URL:
+            source = "REST (genome fallback)"
+        else:
+            source = "REST"
+        return _build_probe_result(
+            canonical,
+            "partial" if not frame.empty else "not_available",
+            not frame.empty,
+            not frame.empty,
+            f"KEGG organism contexts loaded from {source}." if not frame.empty
+            else frame.attrs.get("reason", "KEGG organism list could not be loaded."),
+            tested_url,
+            frame.attrs.get("status_code"),
+        )
 
     if canonical == "LOTUS":
         frame = search_lotus_contexts_online("Theobroma", allow_online=allow_online, verbose=verbose)
@@ -1300,6 +1407,854 @@ def search_hmdb_compound(
         source="User-imported HMDB table",
         extra={"checked_fields": [f for f, _ in checkable]},
     )
+
+
+# ── KEGG ─────────────────────────────────────────────────────────────────────
+
+def _kegg_throttle() -> None:
+    """Enforce KEGG's documented request-rate guidance (~3/s) across every
+    KEGG call in this module, regardless of which function issues it - a
+    single compound's Role lookup alone can issue dozens of calls, and once
+    this app is distributed to many independent users each one's own KEGG
+    traffic should stay polite on its own."""
+    elapsed = time.monotonic() - _KEGG_LAST_REQUEST_TIME[0]
+    remaining = KEGG_MIN_REQUEST_INTERVAL_SECONDS - elapsed
+    if remaining > 0:
+        time.sleep(remaining)
+    _KEGG_LAST_REQUEST_TIME[0] = time.monotonic()
+
+
+def _build_kegg_context_dataframe(rows: list, source: str) -> pd.DataFrame:
+    """Build a normalized in-memory KEGG context dataframe."""
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return get_empty_context_dataframe("KEGG organism list was empty.")
+
+    expected_columns: list = [
+        "database",
+        "context_id",
+        "context_name",
+        "context_type",
+        "source",
+        "reason",
+    ]
+    optional_columns = ["taxonomy_or_lineage", "kegg_taxon_id"]
+    for column in expected_columns + optional_columns:
+        if column not in frame.columns:
+            frame[column] = ""
+    frame["source"] = source
+    return cast(pd.DataFrame, frame.loc[:, expected_columns + optional_columns])
+
+
+def _strip_html_tags(value: str) -> str:
+    """Remove simple HTML markup and decode entities."""
+    value = re.sub(r"<[^>]+>", " ", value)
+    return normalize_text(html.unescape(value))
+
+
+def _parse_kegg_rest_organisms(response_text: str) -> pd.DataFrame:
+    """Parse KEGG REST organism rows into a context dataframe."""
+    lines = [line.strip() for line in response_text.splitlines() if line.strip()]
+    rows = []
+    for raw_line in lines:
+        if "\t" in raw_line:
+            parts = raw_line.split("\t")
+            if len(parts) < 3:
+                continue
+            kegg_taxon_id = parts[0].strip()
+            context_id = parts[1].strip()
+            context_name = parts[2].strip()
+            taxonomy_or_lineage = parts[3].strip() if len(parts) > 3 else ""
+        else:
+            parts = raw_line.split()
+            if len(parts) < 3:
+                continue
+            kegg_taxon_id = parts[0].strip()
+            context_id = parts[1].strip()
+            context_name = parts[2]
+            taxonomy_or_lineage = " ".join(parts[3:]) if len(parts) > 3 else ""
+
+        if not context_id:
+            continue
+        rows.append(
+            {
+                "database": "KEGG",
+                "context_id": context_id,
+                "context_name": context_name,
+                "context_type": "organism",
+                "source": "KEGG REST",
+                "reason": "",
+                "taxonomy_or_lineage": taxonomy_or_lineage,
+                "kegg_taxon_id": kegg_taxon_id,
+            }
+        )
+    return _build_kegg_context_dataframe(rows, "KEGG REST")
+
+
+def _parse_kegg_rest_genome(response_text: str) -> pd.DataFrame:
+    """Parse KEGG REST list/genome rows ("T-number\\tcode; Name") into a context dataframe.
+
+    Fallback source for the organism list when list/organism itself fails
+    (see KEGG_LIST_GENOME_URL) - same data, different field layout: code and
+    name share one tab-separated field, joined by "; ", instead of list/
+    organism's three separate tab-separated fields.
+    """
+    lines = [line.strip() for line in response_text.splitlines() if line.strip()]
+    rows = []
+    for raw_line in lines:
+        if "\t" not in raw_line:
+            continue
+        kegg_taxon_id, remainder = raw_line.split("\t", 1)
+        kegg_taxon_id = kegg_taxon_id.strip()
+        remainder = remainder.strip()
+        if ";" in remainder:
+            context_id, context_name = remainder.split(";", 1)
+        else:
+            parts = remainder.split(None, 1)
+            if len(parts) < 2:
+                continue
+            context_id, context_name = parts[0], parts[1]
+        context_id = context_id.strip()
+        context_name = context_name.strip()
+        if not context_id:
+            continue
+        rows.append(
+            {
+                "database": "KEGG",
+                "context_id": context_id,
+                "context_name": context_name,
+                "context_type": "organism",
+                "source": "KEGG REST (genome)",
+                "reason": "",
+                "taxonomy_or_lineage": "",
+                "kegg_taxon_id": kegg_taxon_id,
+            }
+        )
+    return _build_kegg_context_dataframe(rows, "KEGG REST (genome)")
+
+
+_KEGG_NON_ORGANISM_TOKENS = frozenset({"kgb"})
+
+
+def _parse_kegg_organism_html(response_text: str) -> pd.DataFrame:
+    """Parse KEGG organism rows from the HTML catalog without cross-row matching."""
+    rows: list = []
+    seen_context_ids: set = set()
+
+    def is_code(value: str) -> bool:
+        return bool(re.fullmatch(r"[a-z][a-z0-9]{2,4}", normalize_text(value).lower()))
+
+    def looks_like_organism_name(value: str) -> bool:
+        value = normalize_text(value)
+        if not value:
+            return False
+        if is_code(value) or re.fullmatch(r"T\d+", value):
+            return False
+        if len(value) <= 4 and value.upper() == value:
+            return False
+        return bool(re.search(r"\b[A-Z][a-z]+ [a-z][a-z.-]+", value))
+
+    def clean_name(value: str, context_id: str) -> str:
+        value = normalize_text(value)
+        value = re.sub(rf"^\s*{re.escape(context_id)}\b\s*[:;-]?\s*", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s+", " ", value).strip(" :-;")
+        return value
+
+    def add_row(context_id: str, context_name: str) -> None:
+        context_id = normalize_text(context_id).lower()
+        if context_id in _KEGG_NON_ORGANISM_TOKENS:
+            return
+        context_name = clean_name(context_name, context_id)
+        if not context_id or context_id in seen_context_ids:
+            return
+        if not is_code(context_id):
+            return
+        if not looks_like_organism_name(context_name):
+            return
+        seen_context_ids.add(context_id)
+        rows.append(
+            {
+                "database": "KEGG",
+                "context_id": context_id,
+                "context_name": context_name,
+                "context_type": "organism",
+                "source": "KEGG organism HTML fallback",
+                "reason": "",
+                "taxonomy_or_lineage": "",
+                "kegg_taxon_id": "",
+            }
+        )
+
+    link_code_pattern = re.compile(
+        r"""href=["'][^"']*(?:/entry/|show_organism\?(?:org=)?)([a-z][a-z0-9]{2,4})(?=[^a-z0-9]|["'])[^"']*["']""",
+        flags=re.IGNORECASE,
+    )
+
+    for table_row in re.findall(r"<tr\b[^>]*>(.*?)</tr>", response_text, flags=re.IGNORECASE | re.DOTALL):
+        cells = re.findall(r"<td\b[^>]*>(.*?)</td>", table_row, flags=re.IGNORECASE | re.DOTALL)
+        if not cells:
+            continue
+
+        plain_cells = [_strip_html_tags(cell) for cell in cells]
+        code_hits: list = []
+        for index, raw_cell in enumerate(cells):
+            for match in link_code_pattern.finditer(raw_cell):
+                code_hits.append((match.group(1).lower(), index))
+
+        for index, cell in enumerate(plain_cells):
+            cell_text = normalize_text(cell)
+            if is_code(cell_text) and cell_text == cell_text.lower():
+                code_hits.append((cell_text.lower(), index))
+                continue
+            prefix_match = re.match(r"^\s*([a-z][a-z0-9]{2,4})\s+(.+)$", cell_text)
+            if prefix_match and looks_like_organism_name(prefix_match.group(2)):
+                code_hits.append((prefix_match.group(1).lower(), index))
+
+        row_seen_codes: set = set()
+        for context_id, code_cell_index in code_hits:
+            if context_id in row_seen_codes:
+                continue
+            row_seen_codes.add(context_id)
+
+            context_name = ""
+            code_cell = plain_cells[code_cell_index]
+            same_cell_name = clean_name(code_cell, context_id)
+            if same_cell_name != code_cell and looks_like_organism_name(same_cell_name):
+                context_name = same_cell_name
+
+            if not context_name:
+                adjacent_cells = plain_cells[code_cell_index + 1:] + plain_cells[:code_cell_index]
+                for candidate in adjacent_cells:
+                    candidate = clean_name(candidate, context_id)
+                    if looks_like_organism_name(candidate):
+                        context_name = candidate
+                        break
+
+            add_row(context_id, context_name)
+
+    frame = _build_kegg_context_dataframe(rows, "KEGG organism HTML fallback")
+    if frame.empty:
+        frame.attrs["reason"] = "KEGG HTML fallback failed: no organism rows parsed."
+        return frame
+
+    hsa_rows = frame[frame["context_id"] == "hsa"]
+    if hsa_rows.empty:
+        frame = get_empty_context_dataframe("KEGG HTML fallback failed: hsa was not parsed from organism table.")
+        return frame
+    hsa_name = normalize_text(hsa_rows.iloc[0].get("context_name", ""))
+    if "homo sapiens" not in hsa_name.lower():
+        frame = get_empty_context_dataframe(
+            f"KEGG HTML fallback failed sanity check: hsa parsed as \'{hsa_name}\'."
+        )
+        return frame
+
+    return frame
+
+
+def list_kegg_organisms(
+    allow_online: bool = True,
+    use_memory_cache: bool = True,
+    force_refresh: bool = False,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """Retrieve or reuse the KEGG organism list from online KEGG sources."""
+    if not allow_online:
+        return get_empty_context_dataframe("Online access disabled.")
+    if not ENABLE_ONLINE_APIS:
+        return get_empty_context_dataframe("Online APIs disabled by environment variable.")
+
+    cache_key = make_memory_cache_key("kegg_organisms")
+    if use_memory_cache and not force_refresh and cache_key in _MEMORY_CACHE:
+        cached = _MEMORY_CACHE[cache_key]
+        if isinstance(cached, pd.DataFrame):
+            return cached.copy()
+
+    _kegg_throttle()
+    response = safe_request_text(
+        KEGG_LIST_ORGANISM_URL,
+        headers=OMISCERA_HEADERS,
+        timeout=DEFAULT_TIMEOUT,
+        retries=DEFAULT_RETRIES,
+        verbose=verbose,
+    )
+    status_code = response.get("status_code")
+    response_text = normalize_text(response.get("text", ""))
+    if response["success"] and response_text:
+        frame = _parse_kegg_rest_organisms(response["text"])
+        if not frame.empty:
+            frame.attrs["rest_reason"] = ""
+            frame.attrs["html_fallback_attempted"] = False
+            frame.attrs["tested_url"] = KEGG_LIST_ORGANISM_URL
+            frame.attrs["status_code"] = status_code
+            if use_memory_cache:
+                _MEMORY_CACHE[cache_key] = frame.copy()
+            return frame
+        rest_reason = f"KEGG REST failed with HTTP {status_code}: no organism rows parsed."
+    else:
+        rest_reason = f"KEGG REST failed with HTTP {status_code}."
+        if response["success"] and not response_text:
+            rest_reason = f"KEGG REST failed with HTTP {status_code}: empty response text."
+
+    _kegg_throttle()
+    genome_response = safe_request_text(
+        KEGG_LIST_GENOME_URL,
+        headers=OMISCERA_HEADERS,
+        timeout=DEFAULT_TIMEOUT,
+        retries=DEFAULT_RETRIES,
+        verbose=verbose,
+    )
+    genome_status = genome_response.get("status_code")
+    genome_text = normalize_text(genome_response.get("text", ""))
+    if genome_response["success"] and genome_text:
+        frame = _parse_kegg_rest_genome(genome_response["text"])
+        if not frame.empty:
+            frame.attrs["rest_reason"] = rest_reason
+            frame.attrs["html_fallback_attempted"] = False
+            frame.attrs["tested_url"] = KEGG_LIST_GENOME_URL
+            frame.attrs["status_code"] = genome_status
+            if use_memory_cache:
+                _MEMORY_CACHE[cache_key] = frame.copy()
+            return frame
+        rest_reason = f"{rest_reason} KEGG REST (genome) failed with HTTP {genome_status}: no organism rows parsed."
+    else:
+        rest_reason = f"{rest_reason} KEGG REST (genome) failed with HTTP {genome_status}."
+
+    if verbose:
+        print(rest_reason)
+        print("KEGG HTML fallback attempted: yes")
+
+    _kegg_throttle()
+    html_response = safe_request_text(
+        KEGG_ORGANISM_HTML_FALLBACK_URL,
+        headers=OMISCERA_HEADERS,
+        timeout=DEFAULT_TIMEOUT,
+        retries=DEFAULT_RETRIES,
+        verbose=verbose,
+    )
+    html_text = normalize_text(html_response.get("text", ""))
+    html_parse_reason = ""
+    if html_response["success"] and html_text:
+        frame = _parse_kegg_organism_html(html_response["text"])
+        if not frame.empty:
+            frame.attrs["rest_reason"] = rest_reason
+            frame.attrs["html_fallback_attempted"] = True
+            frame.attrs["reason"] = ""
+            frame.attrs["tested_url"] = KEGG_ORGANISM_HTML_FALLBACK_URL
+            frame.attrs["status_code"] = html_response.get("status_code")
+            if use_memory_cache:
+                _MEMORY_CACHE[cache_key] = frame.copy()
+            return frame
+        html_parse_reason = normalize_text(frame.attrs.get("reason", ""))
+
+    html_status = html_response.get("status_code")
+    if html_response["success"] and not html_text:
+        html_reason = f"KEGG HTML fallback failed with HTTP {html_status}: empty response text."
+    elif html_parse_reason:
+        html_reason = html_parse_reason
+    elif html_response["success"]:
+        html_reason = f"KEGG HTML fallback failed with HTTP {html_status}: no organism rows parsed."
+    else:
+        html_reason = f"KEGG HTML fallback failed with HTTP {html_status}."
+
+    combined_reason = f"{rest_reason} {html_reason}"
+    if verbose:
+        print(html_reason)
+
+    frame = get_empty_context_dataframe(combined_reason)
+    frame.attrs["rest_reason"] = rest_reason
+    frame.attrs["html_fallback_attempted"] = True
+    frame.attrs["tested_url"] = KEGG_ORGANISM_HTML_FALLBACK_URL
+    frame.attrs["status_code"] = html_status
+    return frame
+
+
+def get_kegg_organism_pathways(
+    org: str,
+    allow_online: bool = True,
+    verbose: bool = False,
+) -> Optional[Dict[str, str]]:
+    """Return pathway number to name mappings for a KEGG organism code."""
+    organism = normalize_text(org).lower()
+    if not organism or not allow_online or not ENABLE_ONLINE_APIS:
+        return None
+
+    cache_key = make_memory_cache_key("kegg_organism_pathways", organism)
+    if cache_key in _MEMORY_CACHE:
+        cached = _MEMORY_CACHE[cache_key]
+        if isinstance(cached, dict):
+            return dict(cached)
+
+    _kegg_throttle()
+    response = safe_request_text(
+        KEGG_LIST_PATHWAY_URL.format(organism=organism),
+        headers=OMISCERA_HEADERS,
+        timeout=DEFAULT_TIMEOUT,
+        retries=DEFAULT_RETRIES,
+        verbose=verbose,
+    )
+    if not response.get("success"):
+        return None
+
+    pathways: Dict[str, str] = {}
+    for raw_line in response.get("text", "").splitlines():
+        if "\t" not in raw_line:
+            continue
+        pathway_id, pathway_name = raw_line.split("\t", 1)
+        match = re.search(r"(\d{5})$", normalize_text(pathway_id))
+        if match:
+            pathways[match.group(1)] = normalize_text(pathway_name)
+
+    _MEMORY_CACHE[cache_key] = dict(pathways)
+    return pathways
+
+
+def _parse_kegg_ec_numbers(text: str) -> list:
+    """Extract EC numbers (after 'ec:') from a KEGG link response, ordered + de-duped."""
+    ecs: list = []
+    seen = set()
+    for line in text.splitlines():
+        if "ec:" not in line:
+            continue
+        ec = line.split("ec:", 1)[1].strip()
+        if ec and ec not in seen:
+            seen.add(ec)
+            ecs.append(ec)
+    return ecs
+
+
+def get_kegg_compound_enzymes(
+    kegg_id: str,
+    allow_online: bool = True,
+    verbose: bool = False,
+) -> Optional[list]:
+    """Return EC numbers of the enzymes acting on a KEGG compound (direct
+    compound->enzyme link - NOT routed through reactions; that traversal is
+    a separate, parallel one used only to label Role, see
+    get_kegg_compound_enzyme_roles)."""
+    compound_id = normalize_text(kegg_id)
+    if compound_id.lower().startswith("cpd:"):
+        compound_id = compound_id.split(":", 1)[1]
+    if not compound_id or not allow_online or not ENABLE_ONLINE_APIS:
+        return None
+
+    cache_key = make_memory_cache_key("kegg_compound_enzymes", compound_id)
+    if cache_key in _MEMORY_CACHE:
+        cached = _MEMORY_CACHE[cache_key]
+        if isinstance(cached, list):
+            return list(cached)
+
+    _kegg_throttle()
+    response = safe_request_text(
+        KEGG_LINK_ENZYME_CPD_URL.format(compound_id=compound_id),
+        headers=OMISCERA_HEADERS,
+        timeout=DEFAULT_TIMEOUT,
+        retries=DEFAULT_RETRIES,
+        verbose=verbose,
+    )
+    if not response.get("success"):
+        return None
+
+    ecs = _parse_kegg_ec_numbers(response.get("text", ""))
+    _MEMORY_CACHE[cache_key] = list(ecs)
+    return ecs
+
+
+def _parse_kegg_reaction_ids(text: str) -> list:
+    """Extract reaction IDs (rn:R#####) from a KEGG link response."""
+    rids: list = []
+    seen: set = set()
+    for line in text.splitlines():
+        if "rn:" not in line:
+            continue
+        parts = line.split("rn:", 1)
+        if len(parts) < 2:
+            continue
+        rid = parts[1].strip().split()[0]
+        if rid and rid not in seen:
+            seen.add(rid)
+            rids.append(rid)
+    return rids
+
+
+def get_kegg_reaction_equations_batch(
+    rids: list,
+    allow_online: bool = True,
+    verbose: bool = False,
+) -> Dict[str, str]:
+    """Return EQUATION text for many KEGG reaction IDs, batched up to
+    KEGG_GET_BATCH_SIZE per request (KEGG's documented cap on "get") - a
+    compound in ~100 reactions needs ~10 batched calls here instead of the
+    ~100 single-reaction calls the original implementation made.
+
+    Each returned entry is matched to its reaction ID by parsing that
+    entry's OWN "ENTRY" line, never by response position - verified live
+    that KEGG SILENTLY DROPS an invalid ID from a batched response rather
+    than returning an empty placeholder in its place, which would corrupt
+    a positional (zip-style) match and silently attribute one reaction's
+    equation to a different one.
+    """
+    reaction_ids: list = []
+    seen: set = set()
+    for rid in rids:
+        r = normalize_text(rid).upper()
+        if r and r not in seen:
+            seen.add(r)
+            reaction_ids.append(r)
+    if not reaction_ids or not allow_online or not ENABLE_ONLINE_APIS:
+        return {}
+
+    result: Dict[str, str] = {}
+    to_fetch: list = []
+    for rid in reaction_ids:
+        cache_key = make_memory_cache_key("kegg_reaction_equation", rid)
+        if cache_key in _MEMORY_CACHE:
+            cached = _MEMORY_CACHE[cache_key]
+            if isinstance(cached, str):
+                result[rid] = cached
+                continue
+        to_fetch.append(rid)
+
+    for batch_start in range(0, len(to_fetch), KEGG_GET_BATCH_SIZE):
+        batch = to_fetch[batch_start:batch_start + KEGG_GET_BATCH_SIZE]
+        entries = "+".join(f"rn:{rid}" for rid in batch)
+        _kegg_throttle()
+        response = safe_request_text(
+            KEGG_GET_REACTION_URL.format(reaction_ids=entries),
+            headers=OMISCERA_HEADERS,
+            timeout=DEFAULT_TIMEOUT,
+            retries=DEFAULT_RETRIES,
+            verbose=verbose,
+        )
+        if not response.get("success"):
+            continue
+
+        for chunk in response.get("text", "").split("///"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            entry_match = re.match(r"ENTRY\s+(\S+)", chunk)
+            if not entry_match:
+                continue
+            chunk_rid = entry_match.group(1)
+            equation = ""
+            for line in chunk.splitlines():
+                if line.startswith("EQUATION"):
+                    equation = line.split("EQUATION", 1)[1].strip()
+                    break
+            result[chunk_rid] = equation
+            _MEMORY_CACHE[make_memory_cache_key("kegg_reaction_equation", chunk_rid)] = equation
+
+    return result
+
+
+def get_kegg_reaction_enzymes(
+    rid: str,
+    allow_online: bool = True,
+    verbose: bool = False,
+) -> Optional[list]:
+    """Return EC numbers linked to a KEGG reaction ID."""
+    reaction_id = normalize_text(rid).upper()
+    if not reaction_id or not allow_online or not ENABLE_ONLINE_APIS:
+        return None
+
+    cache_key = make_memory_cache_key("kegg_reaction_enzymes", reaction_id)
+    if cache_key in _MEMORY_CACHE:
+        cached = _MEMORY_CACHE[cache_key]
+        if isinstance(cached, list):
+            return list(cached)
+
+    _kegg_throttle()
+    response = safe_request_text(
+        KEGG_LINK_ENZYME_RN_URL.format(reaction_id=reaction_id),
+        headers=OMISCERA_HEADERS,
+        timeout=DEFAULT_TIMEOUT,
+        retries=DEFAULT_RETRIES,
+        verbose=verbose,
+    )
+    if not response.get("success"):
+        return None
+
+    ecs = _parse_kegg_ec_numbers(response.get("text", ""))
+    _MEMORY_CACHE[cache_key] = list(ecs)
+    return ecs
+
+
+def get_kegg_compound_enzyme_roles(
+    kegg_id: str,
+    allow_online: bool = True,
+    verbose: bool = False,
+) -> Optional[dict]:
+    """Return a dict mapping EC -> role (substrate/product/both/unknown) for a compound.
+
+    Role is determined by whether the compound appears on the left (substrate) or
+    right (product) side of the EQUATION line across all reactions that link to the
+    compound. An enzyme appearing on both sides across reactions gets role 'both'.
+    Equations are fetched via get_kegg_reaction_equations_batch, not one at a
+    time - see that function for why.
+    """
+    compound_id = normalize_text(kegg_id)
+    if compound_id.lower().startswith("cpd:"):
+        compound_id = compound_id.split(":", 1)[1]
+    if not compound_id or not allow_online or not ENABLE_ONLINE_APIS:
+        return None
+
+    cache_key = make_memory_cache_key("kegg_compound_enzyme_roles", compound_id)
+    if cache_key in _MEMORY_CACHE:
+        cached = _MEMORY_CACHE[cache_key]
+        if isinstance(cached, dict):
+            return dict(cached)
+
+    _kegg_throttle()
+    response = safe_request_text(
+        KEGG_LINK_REACTION_CPD_URL.format(compound_id=compound_id),
+        headers=OMISCERA_HEADERS,
+        timeout=DEFAULT_TIMEOUT,
+        retries=DEFAULT_RETRIES,
+        verbose=verbose,
+    )
+    if not response.get("success"):
+        return None
+
+    reaction_ids = _parse_kegg_reaction_ids(response.get("text", ""))
+    if not reaction_ids:
+        _MEMORY_CACHE[cache_key] = {}
+        return {}
+
+    cid_bare = compound_id.upper()
+    equations = get_kegg_reaction_equations_batch(reaction_ids, allow_online, verbose)
+
+    ec_roles: dict = {}  # EC -> set of "substrate" | "product"
+    for rid in reaction_ids:
+        equation = equations.get(rid, "")
+        if not equation or "<=>" not in equation:
+            continue
+        left, right = equation.split("<=>", 1)
+
+        on_left = bool(re.search(r"\b" + re.escape(cid_bare) + r"\b", left.upper()))
+        on_right = bool(re.search(r"\b" + re.escape(cid_bare) + r"\b", right.upper()))
+        if not on_left and not on_right:
+            continue
+
+        role_for_reaction = "both" if (on_left and on_right) else ("substrate" if on_left else "product")
+
+        ecs = get_kegg_reaction_enzymes(rid, allow_online, verbose) or []
+        for ec in ecs:
+            if ec not in ec_roles:
+                ec_roles[ec] = set()
+            if role_for_reaction == "both":
+                ec_roles[ec].update({"substrate", "product"})
+            else:
+                ec_roles[ec].add(role_for_reaction)
+
+    result = {}
+    for ec, roles_set in ec_roles.items():
+        if "substrate" in roles_set and "product" in roles_set:
+            result[ec] = "both"
+        elif "substrate" in roles_set:
+            result[ec] = "substrate"
+        elif "product" in roles_set:
+            result[ec] = "product"
+        else:
+            result[ec] = "unknown"
+
+    _MEMORY_CACHE[cache_key] = result
+    return result
+
+
+def get_kegg_organism_enzymes(
+    org: str,
+    allow_online: bool = True,
+    verbose: bool = False,
+) -> Optional[set]:
+    """Return the set of EC numbers present in a KEGG organism's genome."""
+    organism = normalize_text(org).lower()
+    if not organism or not allow_online or not ENABLE_ONLINE_APIS:
+        return None
+
+    cache_key = make_memory_cache_key("kegg_organism_enzymes", organism)
+    if cache_key in _MEMORY_CACHE:
+        cached = _MEMORY_CACHE[cache_key]
+        if isinstance(cached, set):
+            return set(cached)
+
+    _kegg_throttle()
+    response = safe_request_text(
+        KEGG_LINK_ENZYME_ORG_URL.format(organism=organism),
+        headers=OMISCERA_HEADERS,
+        timeout=DEFAULT_TIMEOUT,
+        retries=DEFAULT_RETRIES,
+        verbose=verbose,
+    )
+    if not response.get("success"):
+        return None
+
+    ecs = set(_parse_kegg_ec_numbers(response.get("text", "")))
+    _MEMORY_CACHE[cache_key] = set(ecs)
+    return ecs
+
+
+def get_kegg_enzyme_name(
+    ec: str,
+    allow_online: bool = True,
+    verbose: bool = False,
+) -> str:
+    """Return the primary name of a KEGG enzyme (EC number); '' if unavailable."""
+    ec_value = normalize_text(ec)
+    if ec_value.lower().startswith("ec:"):
+        ec_value = ec_value.split(":", 1)[1]
+    if not ec_value or not allow_online or not ENABLE_ONLINE_APIS:
+        return ""
+
+    cache_key = make_memory_cache_key("kegg_enzyme_name", ec_value)
+    if cache_key in _MEMORY_CACHE:
+        cached = _MEMORY_CACHE[cache_key]
+        if isinstance(cached, str):
+            return cached
+
+    _kegg_throttle()
+    response = safe_request_text(
+        KEGG_LIST_EC_URL.format(ec_value=ec_value),
+        headers=OMISCERA_HEADERS,
+        timeout=DEFAULT_TIMEOUT,
+        retries=DEFAULT_RETRIES,
+        verbose=verbose,
+    )
+    if not response.get("success"):
+        return ""
+
+    name = ""
+    for raw_line in response.get("text", "").splitlines():
+        if "\t" not in raw_line:
+            continue
+        _, description = raw_line.split("\t", 1)
+        name = normalize_text(description.split(";", 1)[0])
+        break
+
+    _MEMORY_CACHE[cache_key] = name
+    return name
+
+
+def get_kegg_enzyme_pathways(
+    ec: str,
+    allow_online: bool = True,
+    verbose: bool = False,
+) -> Optional[set]:
+    """Return reference pathway numbers an enzyme (EC number) operates in."""
+    ec_value = normalize_text(ec)
+    if ec_value.lower().startswith("ec:"):
+        ec_value = ec_value.split(":", 1)[1]
+    if not ec_value or not allow_online or not ENABLE_ONLINE_APIS:
+        return None
+
+    cache_key = make_memory_cache_key("kegg_enzyme_pathways", ec_value)
+    if cache_key in _MEMORY_CACHE:
+        cached = _MEMORY_CACHE[cache_key]
+        if isinstance(cached, set):
+            return set(cached)
+
+    _kegg_throttle()
+    response = safe_request_text(
+        KEGG_LINK_PATHWAY_EC_URL.format(ec_value=ec_value),
+        headers=OMISCERA_HEADERS,
+        timeout=DEFAULT_TIMEOUT,
+        retries=DEFAULT_RETRIES,
+        verbose=verbose,
+    )
+    if not response.get("success"):
+        return None
+
+    pathways: set = set()
+    for line in response.get("text", "").splitlines():
+        if "path:" not in line:
+            continue
+        pathway_token = line.split("path:", 1)[1]
+        match = re.search(r"(\d{5})$", pathway_token.strip())
+        if match:
+            pathways.add(match.group(1))
+
+    _MEMORY_CACHE[cache_key] = set(pathways)
+    return pathways
+
+
+def get_kegg_enzyme_pathways_in_species(
+    ec: str,
+    org: str,
+    allow_online: bool = True,
+    verbose: bool = False,
+) -> list:
+    """Pathway names an enzyme operates in within a species, excluding overview maps."""
+    enzyme_paths = get_kegg_enzyme_pathways(ec, allow_online, verbose)
+    org_paths = get_kegg_organism_pathways(org, allow_online, verbose)
+    if not enzyme_paths or not org_paths:
+        return []
+    numbers = (enzyme_paths & set(org_paths.keys())) - KEGG_OVERVIEW_PATHWAY_NUMBERS
+    return sorted(org_paths[number] for number in numbers)
+
+
+def build_kegg_enzyme_rows(
+    compound_row: Any,
+    kegg_org: str,
+    allow_online: bool = True,
+    verbose: bool = False,
+    org_enzymes: Optional[set] = None,
+) -> list:
+    """Build this compound's KEGG enzyme-presence rows for the given organism.
+
+    Mirrors build_rhea_uniprot_enzyme_rows's shape (Name/Enzyme/Role/Enzyme
+    presence), plus a Pathway column KEGG's own data supports and Rhea's
+    does not. The enzyme list comes from a DIRECT compound->enzyme link
+    (get_kegg_compound_enzymes); Role comes from a SEPARATE traversal
+    through the compound's reactions (get_kegg_compound_enzyme_roles) used
+    only to label rows - an EC present in the first but missing from the
+    second is labelled "Unknown", never dropped.
+
+    org_enzymes: pass a precomputed get_kegg_organism_enzymes(kegg_org, ...)
+    result to avoid re-fetching it once per compound in a rank.
+    """
+    row = _as_dict(compound_row)
+    compound_name = normalize_text(row.get("Name", ""))
+    kegg_id = normalize_text(row.get("KEGG ID", ""))
+
+    if not kegg_id:
+        return [{
+            "Name": compound_name,
+            "Enzyme": "No KEGG ID resolved for this compound",
+            "Role": "",
+            "Enzyme presence": "Not_evaluated",
+            "Pathway": "",
+        }]
+
+    if org_enzymes is None:
+        org_enzymes = get_kegg_organism_enzymes(kegg_org, allow_online, verbose)
+
+    compound_enzymes = get_kegg_compound_enzymes(kegg_id, allow_online, verbose)
+    if not compound_enzymes:
+        note = "Lookup failed" if compound_enzymes is None else "No enzyme linked in KEGG"
+        return [{
+            "Name": compound_name,
+            "Enzyme": note,
+            "Role": "",
+            "Enzyme presence": "Not_evaluated",
+            "Pathway": "",
+        }]
+
+    roles_map = get_kegg_compound_enzyme_roles(kegg_id, allow_online, verbose) or {}
+
+    rows = []
+    for ec in compound_enzymes:
+        presence = "Not_evaluated" if org_enzymes is None else ("Found" if ec in org_enzymes else "Not_found")
+        name = get_kegg_enzyme_name(ec, allow_online, verbose)
+        enzyme_label = f"{ec} - {name}" if name else ec
+        pathways = get_kegg_enzyme_pathways_in_species(ec, kegg_org, allow_online, verbose)
+        role = roles_map.get(ec, "unknown").capitalize()
+        rows.append({
+            "Name": compound_name,
+            "Enzyme": enzyme_label,
+            "Role": role,
+            "Enzyme presence": presence,
+            "Pathway": "; ".join(pathways),
+        })
+    return rows
 
 
 # ── Rhea + UniProt ─────────────────────────────────────────────────────────────
@@ -2127,6 +3082,12 @@ def search_compound_in_database(
 ) -> Dict[str, Any]:
     """Dispatch compound lookup to the implemented database-specific search."""
     canonical = canonical_database_name(database_name)
+    if canonical == "KEGG":
+        return build_standard_lookup_result(
+            "KEGG",
+            "not_evaluated",
+            "KEGG is evaluated separately via the enzyme presence table",
+        )
     if canonical == "HMDB":
         return search_hmdb_compound(compound_row, context_selection, imported_table, verbose, allow_online)
     if canonical == "LOTUS":
@@ -2217,6 +3178,17 @@ def validate_database_catalog_contract(allow_online: bool = True) -> dict:
         "npatlas_compound_in_taxon",
         "search_npatlas_compound",
         "_npatlas_taxon_has_producers",
+        "list_kegg_organisms",
+        "get_kegg_organism_pathways",
+        "get_kegg_compound_enzymes",
+        "get_kegg_reaction_equations_batch",
+        "get_kegg_reaction_enzymes",
+        "get_kegg_compound_enzyme_roles",
+        "get_kegg_organism_enzymes",
+        "get_kegg_enzyme_name",
+        "get_kegg_enzyme_pathways",
+        "get_kegg_enzyme_pathways_in_species",
+        "build_kegg_enzyme_rows",
     ]
     missing_functions = [
         function_name
@@ -2228,7 +3200,7 @@ def validate_database_catalog_contract(allow_online: bool = True) -> dict:
     summary["required_functions_checked"] = len(required_functions)
     summary["missing_functions"] = missing_functions
 
-    expected_databases = ["LOTUS", "HMDB", "Rhea + UniProt", "NPAtlas"]
+    expected_databases = ["KEGG", "LOTUS", "HMDB", "Rhea + UniProt", "NPAtlas"]
     try:
         supported = get_supported_databases()
         summary["supported_databases"] = supported
@@ -2277,7 +3249,7 @@ def validate_database_catalog_contract(allow_online: bool = True) -> dict:
                 errors.append(f"{database_name} has invalid context retrieval status: {context_status}")
             if compound_status not in valid_statuses:
                 errors.append(f"{database_name} has invalid compound lookup status: {compound_status}")
-        for database_name in ["LOTUS", "Rhea + UniProt", "NPAtlas"]:
+        for database_name in ["KEGG", "LOTUS", "Rhea + UniProt", "NPAtlas"]:
             frame = get_available_contexts(database_name, allow_online=False)
             if not frame.empty:
                 errors.append(f"{database_name} returned contexts although real retrieval is not implemented.")
@@ -2294,7 +3266,9 @@ def validate_database_catalog_contract(allow_online: bool = True) -> dict:
         "SMILES": "C1=CC(=CC=C1C2=CC(=O)C3=C(O2)C=C(C=C3O)O)O",
         "InChIKey": "KZNIFHPLKGYRTM-UHFFFAOYSA-N",
     }
+    kegg_row = {"KEGG ID": "C00031"}
     identifier_examples = {
+        "KEGG": (kegg_row, "KEGG ID"),
         "LOTUS": (structure_row, "SMILES"),
         "Rhea + UniProt": (glucose_row, "InChIKey"),
         "NPAtlas": (glucose_row, "InChIKey"),
@@ -2315,6 +3289,7 @@ def validate_database_catalog_contract(allow_online: bool = True) -> dict:
     summary["identifier_selection"] = identifier_summary
 
     context_search_examples = {
+        "KEGG": ["human", "arabidopsis"],
         "LOTUS": ["arabidopsis", "salvia"],
         "Rhea + UniProt": ["arabidopsis", "salvia"],
         "NPAtlas": ["streptomyces", "penicillium"],
@@ -2388,6 +3363,10 @@ def validate_database_catalog_contract(allow_online: bool = True) -> dict:
         "not_implemented",
     }
     lookup_contract_examples = {
+        "KEGG": (
+            kegg_row,
+            {"context_id": "hsa", "context_name": "Homo sapiens (human)", "context_type": "organism"},
+        ),
         "LOTUS": (
             structure_row,
             {"context_id": "user_defined_taxon", "context_name": "User-defined taxon", "context_type": "taxon_or_species"},

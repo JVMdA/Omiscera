@@ -71,6 +71,17 @@ try:
 except ImportError:
     _scipy_mannwhitneyu = None
 
+# Reuse database_catalog's KEGG throttle rather than a second, independent one -
+# it owns the process-global last-request-time, so two throttles would double
+# the app's real KEGG request rate past KEGG's ~3/s guidance. Guarded because
+# this module tolerates a missing `requests` (see above) while database_catalog
+# imports it unconditionally, and several tests/*.py import this module directly.
+try:
+    from database_catalog import _kegg_throttle
+except Exception:
+    def _kegg_throttle() -> None:
+        time.sleep(0.34)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -115,6 +126,32 @@ GWAS_ASSOC_FILENAME = "gwas-catalog-associations_ontology-annotated-full.zip"
 GWAS_LOCAL_TSV_NAME = "gwas_catalog_associations.tsv"
 GWAS_REFRESH_DAYS = 30
 GWAS_HUMAN_TAXON_ID = "9606"
+
+# KEGG PATHWAY — three bulk REST calls per organism (native KEGG source).
+# taxon_id in this module's per-database sense carries a KEGG organism code
+# (e.g. "hsa"), never an NCBI taxon ID - KEGG has no numeric-taxon endpoint
+# that reliably resolves one (verified live: find/genome/9606 returns an
+# unrelated bacterium matching the T-number, not the taxon). The organism is
+# instead picked from KEGG's own organism list via database_catalog.search_contexts.
+KEGG_LIST_PATHWAY_URL = "https://rest.kegg.jp/list/pathway/{org}"
+KEGG_LINK_PATHWAY_URL = "https://rest.kegg.jp/link/pathway/{org}"
+KEGG_CONV_UNIPROT_URL = "https://rest.kegg.jp/conv/uniprot/{org}"
+# Used by build_kegg_gene_map (identity/lookup), not by build_kegg_universe's
+# pathway sets: conv/ncbi-geneid bridges a resolved gene's NCBI Gene ID to its
+# KEGG gene ID (KEGG gene IDs ARE Entrez IDs for RefSeq-sourced organisms,
+# verified live), and list/{org} carries each KEGG gene's symbol aliases.
+KEGG_CONV_NCBI_GENEID_URL = "https://rest.kegg.jp/conv/ncbi-geneid/{org}"
+KEGG_LIST_GENES_URL = "https://rest.kegg.jp/list/{org}"
+# Versioned the same way as Reactome (mutate the string; this cache layer has
+# no TTL) so a future parsing fix can invalidate old blobs by bumping this.
+# Bumped 1 -> 2: pathway sets are now keyed on KEGG gene IDs, not UniProt
+# accessions (see build_kegg_universe's docstring) - a v1 blob has the wrong
+# shape entirely and must never be served to the new code.
+KEGG_UNIVERSE_CACHE_VERSION = 2
+# Separate cache "database" for build_kegg_gene_map's lookup tables - a
+# different shape and purpose from the pathway universe above, so it gets its
+# own version lever rather than sharing KEGG_UNIVERSE_CACHE_VERSION.
+KEGG_GENEMAP_CACHE_VERSION = 1
 
 MIN_TERM_SIZE = 3
 # clusterProfiler's own maxGSSize default. With GO ancestor propagation now
@@ -1097,6 +1134,397 @@ def build_gwas_universe(taxon_id: str, verbose: bool = False, force_refresh: boo
 
 
 # ---------------------------------------------------------------------------
+# KEGG PATHWAY universe builder (native KEGG source, via KEGG REST)
+# ---------------------------------------------------------------------------
+
+def _kegg_safe_get(url: str, verbose: bool = False) -> "tuple[str, str]":
+    """GET a KEGG REST URL with retry. Returns (status, text).
+
+    status is one of:
+      "ok"     - HTTP 200 (text may legitimately be empty - "no rows").
+      "nodata" - HTTP 400/404 - KEGG's way of saying this organism/query has
+                 no data for this endpoint (verified live: link/pathway and
+                 conv/uniprot both 400 for an organism with no data there,
+                 e.g. "vg"). NOT retried - retrying a genuine "no data"
+                 response wastes KEGG's rate budget for nothing.
+      "error"  - transport failure or a retryable HTTP status (429/5xx),
+                 exhausted after DEFAULT_RETRIES.
+    """
+    if HTTP_SESSION is None:
+        return "error", "requests not installed"
+    headers = dict(OMISCERA_HEADERS)
+    headers["Accept"] = "text/plain"
+    last_error = ""
+    for attempt in range(DEFAULT_RETRIES + 1):
+        try:
+            _kegg_throttle()
+            resp = HTTP_SESSION.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
+            if resp.status_code == 200:
+                return "ok", resp.text
+            if resp.status_code in (400, 404):
+                return "nodata", ""
+            last_error = f"HTTP {resp.status_code}"
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < DEFAULT_RETRIES:
+                time.sleep(2.0)
+                continue
+            break
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < DEFAULT_RETRIES:
+                time.sleep(1.0)
+    if verbose:
+        print(f"[KEGG] request failed: {url} -> {last_error}")
+    return "error", last_error
+
+
+def _parse_kegg_pathway_list(text: str) -> dict:
+    """Parse list/pathway/{org} rows into {pathway_id: name}.
+
+    KEGG suffixes every name with " - <Organism name>" - but several REAL
+    pathway names also contain an internal " - " (e.g. "Glycosaminoglycan
+    biosynthesis - keratan sulfate", "Drug metabolism - cytochrome P450"), so
+    a naive rsplit(" - ", 1) would mangle them (verified live against the
+    real human pathway list). Instead, compute the single most-common
+    " - <tail>" across all rows for this organism and strip only that exact
+    literal - and only where a name actually ends with it.
+    """
+    raw: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "\t" not in line:
+            continue
+        pid, name = line.split("\t", 1)
+        pid = pid.strip()
+        name = name.strip()
+        if pid and name:
+            raw[pid] = name
+    if not raw:
+        return {}
+
+    tail_counts: dict = {}
+    for name in raw.values():
+        if " - " in name:
+            tail = " - " + name.rsplit(" - ", 1)[1]
+            tail_counts[tail] = tail_counts.get(tail, 0) + 1
+
+    modal_tail = ""
+    if tail_counts:
+        modal_tail, count = max(tail_counts.items(), key=lambda item: item[1])
+        if count / len(raw) < 0.5:
+            modal_tail = ""
+
+    names: dict = {}
+    for pid, name in raw.items():
+        if modal_tail and name.endswith(modal_tail):
+            names[pid] = name[: -len(modal_tail)].strip()
+        else:
+            names[pid] = name
+    return names
+
+
+def _parse_kegg_gene_pathway_links(text: str) -> "list[tuple[str, str]]":
+    """Parse link/pathway/{org} rows into [(gene, pathway_id), ...], stripping "path:"."""
+    links = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "\t" not in line:
+            continue
+        gene, pid = line.split("\t", 1)
+        gene = gene.strip()
+        pid = pid.strip()
+        if pid.startswith("path:"):
+            pid = pid[5:]
+        if gene and pid:
+            links.append((gene, pid))
+    return links
+
+
+def _parse_kegg_uniprot_conv(text: str) -> dict:
+    """Parse conv/uniprot/{org} rows into {kegg_gene: {accession, ...}}, stripping "up:".
+
+    One KEGG gene can map to several accessions (verified live: hsa:1 ->
+    P04217 AND V9HWD8 - a canonical/secondary fan-out). Every accession is
+    kept; see build_kegg_universe's docstring for why.
+    """
+    conv: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "\t" not in line:
+            continue
+        gene, acc = line.split("\t", 1)
+        gene = gene.strip()
+        acc = acc.strip()
+        if acc.startswith("up:"):
+            acc = acc[3:]
+        if gene and acc:
+            conv.setdefault(gene, set()).add(acc)
+    return conv
+
+
+def _parse_kegg_ncbi_geneid_conv(text: str) -> dict:
+    """Parse conv/ncbi-geneid/{org} rows into {kegg_gene: entrez_id}, stripping "ncbi-geneid:".
+
+    KEGG gene IDs are themselves NCBI Entrez Gene IDs for RefSeq-sourced
+    organisms (verified live: hsa:1 -> ncbi-geneid:1, cam:101488213 ->
+    ncbi-geneid:101488213 - the numeric part is identical), but this parses
+    the real conversion rather than assuming that identity holds for every
+    organism.
+    """
+    conv: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "\t" not in line:
+            continue
+        gene, entrez = line.split("\t", 1)
+        gene = gene.strip()
+        entrez = entrez.strip()
+        if entrez.startswith("ncbi-geneid:"):
+            entrez = entrez[len("ncbi-geneid:"):]
+        if gene and entrez:
+            conv[gene] = entrez
+    return conv
+
+
+def _parse_kegg_gene_symbols(text: str) -> dict:
+    """Parse list/{org} rows into {kegg_gene: [symbol, ...]}.
+
+    Each row has 4 tab-separated fields; the 4th is either "SYM1, SYM2;
+    description" (symbols present) or a bare description (no symbols - the
+    common case for a non-model organism, e.g. "uncharacterized protein").
+    Requires the ";" separator and rejects any candidate token containing a
+    space or failing a strict symbol-shape check - this is what stops a
+    description that happens to contain ";" but carries no real symbols from
+    being misread as one.
+    """
+    symbols_by_gene: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        gene = parts[0].strip()
+        field4 = parts[3]
+        if not gene or ";" not in field4:
+            continue
+        candidate_part = field4.split(";", 1)[0]
+        tokens = [t.strip() for t in candidate_part.split(",") if t.strip()]
+        if not tokens or len(tokens) > 5:
+            continue
+        if not all(re.fullmatch(r"[A-Za-z0-9_.\-]{1,20}", t) for t in tokens):
+            continue
+        symbols_by_gene[gene] = tokens
+    return symbols_by_gene
+
+
+def _kegg_invert_unique(forward: dict) -> dict:
+    """Invert {gene: key-or-keys} into {key: gene}, dropping any key claimed by >1 gene.
+
+    Shared by build_kegg_gene_map for both the accession and Entrez bridges -
+    a lookup TABLE must return at most one answer, unlike build_kegg_universe's
+    pathway sets, which legitimately keep every accession of a gene.
+    """
+    claim_count: dict = {}
+    owner: dict = {}
+    for gene, keys in forward.items():
+        iterable = keys if isinstance(keys, (set, list, tuple)) else [keys]
+        for key in iterable:
+            claim_count[key] = claim_count.get(key, 0) + 1
+            owner[key] = gene
+    return {key: gene for key, gene in owner.items() if claim_count[key] == 1}
+
+
+def build_kegg_gene_map(
+    organism_code: str,
+    verbose: bool = False,
+    force_refresh: bool = False,
+) -> dict:
+    """Build lookup maps from UniProt accession / NCBI Entrez ID / gene symbol
+    to the KEGG gene ID they identify, for one KEGG organism (native KEGG
+    source, via conv/uniprot, conv/ncbi-geneid and list/{org}).
+
+    Used by the retriever to assign each resolved gene a KEGG gene ID - the
+    identifier build_kegg_universe's pathway sets are keyed on (see that
+    function's docstring for why accession space was abandoned).
+
+    Any key that maps to MORE than one KEGG gene is dropped from its map
+    entirely, never guessed at (via _kegg_invert_unique / the symbol
+    collision check below) - an ambiguous key silently picking one of several
+    paralogs would inject a wrong match into the statistics.
+
+    conv/uniprot is the only CORE call (it also backs build_kegg_universe's
+    own accession-space needs elsewhere); conv/ncbi-geneid and list/{org} are
+    OPTIONAL - some organisms genuinely have no Entrez cross-reference or no
+    curated symbols, which is a real, permanent property (has_entrez /
+    has_symbols below), not a transient failure.
+
+    Returns {"acc_to_gene": {accession: kegg_gene}, "entrez_to_gene":
+    {entrez_id: kegg_gene}, "symbol_to_gene": {SYMBOL_UPPER: kegg_gene},
+    "has_entrez": bool, "has_symbols": bool, "fetched_at": iso8601 str,
+    "caveat": str|None}.
+    """
+    org = str(organism_code).strip().lower()
+    if not org:
+        return {
+            "acc_to_gene": {}, "entrez_to_gene": {}, "symbol_to_gene": {},
+            "has_entrez": False, "has_symbols": False,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "caveat": "No KEGG organism code was provided.",
+        }
+
+    cache_db = f"KEGG_GENEMAP_v{KEGG_GENEMAP_CACHE_VERSION}"
+    if not force_refresh:
+        cached = _load_universe_cache(cache_db, org)
+        if cached is not None:
+            return cached
+
+    if verbose:
+        print(f"[KEGG gene map] org={org!r}: fetching gene->UniProt conversion...")
+    conv_status, conv_text = _kegg_safe_get(KEGG_CONV_UNIPROT_URL.format(org=org), verbose=verbose)
+
+    if verbose:
+        print(f"[KEGG gene map] org={org!r}: fetching gene->NCBI GeneID conversion...")
+    geneid_status, geneid_text = _kegg_safe_get(KEGG_CONV_NCBI_GENEID_URL.format(org=org), verbose=verbose)
+
+    if verbose:
+        print(f"[KEGG gene map] org={org!r}: fetching gene list (for symbols)...")
+    genes_status, genes_text = _kegg_safe_get(KEGG_LIST_GENES_URL.format(org=org), verbose=verbose)
+
+    fetch_failed = conv_status == "error"
+
+    conv = _parse_kegg_uniprot_conv(conv_text) if conv_status == "ok" else {}
+    geneid_conv = _parse_kegg_ncbi_geneid_conv(geneid_text) if geneid_status == "ok" else {}
+    gene_symbols = _parse_kegg_gene_symbols(genes_text) if genes_status == "ok" else {}
+
+    acc_to_gene = _kegg_invert_unique(conv)
+    entrez_to_gene = _kegg_invert_unique(geneid_conv)
+
+    symbol_to_gene_multi: dict = {}
+    for gene, symbols in gene_symbols.items():
+        for sym in symbols:
+            symbol_to_gene_multi.setdefault(sym.upper(), set()).add(gene)
+    symbol_to_gene = {
+        sym: next(iter(genes)) for sym, genes in symbol_to_gene_multi.items() if len(genes) == 1
+    }
+
+    caveat = None
+    if fetch_failed:
+        caveat = f"Could not reach KEGG REST for organism '{org}'. Re-run to retry."
+    elif not acc_to_gene:
+        caveat = f"KEGG has no UniProt cross-references for organism '{org}'."
+
+    result = {
+        "acc_to_gene": acc_to_gene,
+        "entrez_to_gene": entrez_to_gene,
+        "symbol_to_gene": symbol_to_gene,
+        "has_entrez": bool(entrez_to_gene),
+        "has_symbols": bool(symbol_to_gene),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "caveat": caveat,
+    }
+
+    if acc_to_gene and not fetch_failed:
+        _save_universe_cache(cache_db, org, result)
+    elif verbose:
+        print(f"[KEGG gene map] not caching: {caveat}")
+
+    if verbose:
+        print(f"[KEGG gene map] org={org!r}: acc_to_gene={len(acc_to_gene)}, "
+              f"entrez_to_gene={len(entrez_to_gene)}, symbol_to_gene={len(symbol_to_gene)}")
+    return result
+
+
+def build_kegg_universe(
+    organism_code: str,
+    verbose: bool = False,
+    force_refresh: bool = False,
+) -> dict:
+    """Build the KEGG PATHWAY universe for one KEGG organism code (native KEGG source).
+
+    Two bulk REST calls (list/pathway, link/pathway) - KEGG gene IDs are the
+    identifier space, matching what the retriever assigns via
+    build_kegg_gene_map, NOT UniProt accessions. This is a deliberate change
+    from an earlier accession-keyed version: accession space inflated gene
+    counts via UniProt fan-out (one KEGG gene can have several accessions;
+    verified live for human: N=10,873 accessions vs N=9,424 real genes,
+    hsa00010 K=107 accessions vs K=67 real genes) and could never reach the
+    ~9% of pathway genes with no UniProt cross-reference at all. KEGG gene
+    space has neither problem: every pathway-annotated gene counts exactly
+    once, whether or not it has a UniProt entry.
+
+    No include_iea (KEGG has no evidence codes) and no taxon_name (the
+    organism code is self-sufficient) - unlike build_go_universe/
+    build_reactome_universe.
+
+    Returns {"pathways": {pathway_id: {"name": str, "genes": set[kegg_gene]}},
+             "universe_size": int, "fetched_at": iso8601 str, "caveat": str|None}.
+    """
+    org = str(organism_code).strip().lower()
+    if not org:
+        return {
+            "pathways": {}, "universe_size": 0,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "caveat": "No KEGG organism code was provided.",
+        }
+
+    cache_db = f"KEGG_v{KEGG_UNIVERSE_CACHE_VERSION}"
+    if not force_refresh:
+        cached = _load_universe_cache(cache_db, org)
+        if cached is not None:
+            return cached
+
+    if verbose:
+        print(f"[KEGG universe] org={org!r}: fetching pathway list...")
+    list_status, list_text = _kegg_safe_get(KEGG_LIST_PATHWAY_URL.format(org=org), verbose=verbose)
+
+    if verbose:
+        print(f"[KEGG universe] org={org!r}: fetching gene->pathway links...")
+    link_status, link_text = _kegg_safe_get(KEGG_LINK_PATHWAY_URL.format(org=org), verbose=verbose)
+
+    fetch_failed = "error" in (list_status, link_status)
+
+    names = _parse_kegg_pathway_list(list_text) if list_status == "ok" else {}
+    links = _parse_kegg_gene_pathway_links(link_text) if link_status == "ok" else []
+
+    pathways: dict = {}
+    annotated_genes: set = set()
+    for gene, pid in links:
+        bucket = pathways.setdefault(pid, {"name": names.get(pid, pid), "genes": set()})
+        bucket["genes"].add(gene)
+        annotated_genes.add(gene)
+
+    caveat = None
+    if fetch_failed:
+        caveat = f"Could not reach KEGG REST for organism '{org}'. Re-run to retry."
+    elif not links:
+        caveat = f"KEGG returned no pathway data for organism '{org}'."
+
+    result = {
+        "pathways": pathways,
+        "universe_size": len(annotated_genes),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "caveat": caveat,
+    }
+
+    # Cache only a genuinely complete, non-empty build. Stronger than
+    # Reactome's bare "if pathways:" (a partial failure - e.g. link/pathway
+    # succeeds but the pathway-name call 503s after retries exhaust - would
+    # leave pathways empty too here, but a rarer partial-success shape could
+    # leave a non-empty, incomplete dict that "if pathways:" alone would cache
+    # forever).
+    if pathways and not fetch_failed:
+        _save_universe_cache(cache_db, org, result)
+    elif verbose:
+        print(f"[KEGG universe] not caching: {caveat}")
+
+    if verbose:
+        print(f"[KEGG universe] org={org!r}: {len(pathways)} pathways, "
+              f"{len(annotated_genes)} annotated genes")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # ORA universe cache — one JSON artifact per (database, taxon_id), plus a
 # lightweight CSV index so staleness/existence can be checked without
 # opening every blob. GO/Reactome cache indefinitely (force_refresh=True to
@@ -1109,7 +1537,11 @@ def _ensure_universe_cache_dir() -> None:
 
 def _universe_cache_file_path(database: str, taxon_id: str) -> str:
     safe_db = re.sub(r"[^A-Za-z0-9_-]", "_", database)
-    return os.path.join(ORA_UNIVERSE_CACHE_DIR, f"{safe_db}_{taxon_id}.json")
+    # taxon_id is a numeric NCBI taxon for GO/Reactome/GWAS, but for KEGG it
+    # carries a KEGG organism code chosen from a search result - sanitize it
+    # too so a path segment can never escape ORA_UNIVERSE_CACHE_DIR.
+    safe_taxon = re.sub(r"[^A-Za-z0-9_-]", "_", str(taxon_id))
+    return os.path.join(ORA_UNIVERSE_CACHE_DIR, f"{safe_db}_{safe_taxon}.json")
 
 
 def _universe_to_json_safe(data: dict) -> dict:
@@ -1182,6 +1614,38 @@ def _update_universe_index(database: str, taxon_id: str, path: str, universe_siz
 # ---------------------------------------------------------------------------
 # ORA orchestrator
 # ---------------------------------------------------------------------------
+
+def _relabel_gene_list_column(table: pd.DataFrame, id_to_label: dict, column: str) -> pd.DataFrame:
+    """Replace a comma-joined internal-ID column with the user's own identifiers.
+
+    KEGG is the only database whose test space (KEGG gene IDs, e.g.
+    "cam:101488213") differs from what the user actually uploaded (a gene
+    symbol or Ensembl ID) - GO/Reactome/GWAS already test directly in a space
+    the user recognises. Without this, KEGG's "Overlapping Genes"/"Genes"
+    column would show raw KEGG gene IDs, which are meaningless to read and
+    cannot be cross-referenced against the rest of the app's tables (the
+    gene-concept network in particular colours nodes by matching this column
+    back to the user's own identifiers).
+
+    Falls back to the raw ID for any entry with no known label (should not
+    normally happen, but must never crash or silently drop a gene from the
+    display) and re-sorts alphabetically by the label so raw-ID leftovers
+    don't cluster at the wrong position.
+    """
+    if column not in table.columns or table.empty:
+        return table
+
+    def _relabel(cell: str) -> str:
+        if not cell:
+            return cell
+        ids = [x.strip() for x in str(cell).split(",") if x.strip()]
+        labels = sorted(id_to_label.get(i, i) for i in ids)
+        return ", ".join(labels)
+
+    table = table.copy()
+    table[column] = table[column].apply(_relabel)
+    return table
+
 
 def _run_fisher_for_namespace(
     term_to_genes: dict,
@@ -1299,14 +1763,19 @@ def run_ora_for_database(
     taxon_name: str = "",
     min_term_size: int = MIN_TERM_SIZE,
     max_term_size: "int | None" = None,
+    list_kegg_ids: "list | None" = None,
+    background_kegg_ids: "set | None" = None,
+    kegg_id_labels: "dict | None" = None,
     progress_callback=None,
     verbose: bool = False,
 ) -> dict:
     """Run ORA for one database against the given gene identifier list.
 
     Args:
-        database:            "GO" | "Reactome" | "GWAS Catalog"
-        taxon_id:            NCBI taxon ID for the species choice.
+        database:            "GO" | "Reactome" | "KEGG" | "GWAS Catalog"
+        taxon_id:            NCBI taxon ID for the species choice. EXCEPTION:
+                             for database="KEGG", this carries a KEGG organism
+                             code (e.g. "hsa") instead - see build_kegg_universe.
         list_accessions:     flat list of UniProt accessions (used by GO and Reactome).
         list_symbols:        flat list of gene symbols (used by GWAS Catalog — matched
                              in uppercase against MAPPED_GENE). None or empty => GWAS
@@ -1314,15 +1783,27 @@ def run_ora_for_database(
         fallback_symbols:    gene symbols of input genes that had NO UniProt ID. GO only:
                              recovered to accessions via QuickGO's SYMBOL column so they
                              can still be tested (reported as n_recovered_by_symbol).
-        background_accessions: optional background set (accession space; not used for GWAS).
+        background_accessions: optional background set (accession space; GO/Reactome only).
         include_iea:         when False, exclude electronically-inferred (IEA) annotations
                              from GO and Reactome universes.
         taxon_name:          organism name string (used by Reactome to filter its file).
+        list_kegg_ids:       flat list of KEGG gene IDs (used ONLY by KEGG - a separate,
+                             NOT accession-space, identifier the retriever assigns via
+                             Genomics_module_retriever.resolve_kegg_ids; see
+                             build_kegg_universe for why the KEGG universe is keyed on
+                             KEGG gene IDs rather than UniProt accessions).
+        background_kegg_ids: optional background set in KEGG gene ID space (KEGG only;
+                             the caller is responsible for mapping an uploaded accession
+                             background through the same gene map used for list_kegg_ids).
+        kegg_id_labels:      {kegg_gene_id: user's own identifier} - KEGG only. Without
+                             this the result table's "Overlapping Genes" column would show
+                             raw KEGG gene IDs (e.g. "cam:101488213") instead of the
+                             symbol/Ensembl ID the user actually uploaded.
 
     Returns:
         For database="GO": {"biological_process": <block>, "molecular_function": <block>,
                              "cellular_component": <block>}
-        For Reactome/GWAS Catalog: {"<database_key>": <block>}
+        For Reactome/GWAS Catalog/KEGG: {"<database_key>": <block>}
     """
     list_set = {str(a).strip() for a in list_accessions if str(a).strip()}
     # Uppercase symbol set for GWAS (symbol-native universe)
@@ -1387,6 +1868,27 @@ def run_ora_for_database(
         )
         _progress(1, 1, "Done")
         return {"Reactome": result}
+
+    if database == "KEGG":
+        kegg_set = {str(g).strip() for g in (list_kegg_ids or []) if str(g).strip()}
+        _progress(0, 1, "Building KEGG universe...")
+        universe = build_kegg_universe(taxon_id, verbose=verbose)
+        universe_genes = set()
+        for info in universe["pathways"].values():
+            universe_genes |= info["genes"]
+        if background_kegg_ids:
+            universe_genes &= background_kegg_ids
+        _progress(0, 1, "Testing KEGG pathways")
+        result = _run_fisher_for_namespace(
+            universe["pathways"], kegg_set, universe_genes, fdr_alpha, include_bonferroni,
+            min_term_size, max_term_size,
+        )
+        if kegg_id_labels:
+            result["table"] = _relabel_gene_list_column(result["table"], kegg_id_labels, "Overlapping Genes")
+        if universe.get("caveat"):
+            result["caveat"] = universe["caveat"]
+        _progress(1, 1, "Done")
+        return {"KEGG": result}
 
     if database == "GWAS Catalog":
         # GWAS is symbol-native: test in symbol space, not accession space.
@@ -1605,27 +2107,37 @@ def run_burden_for_database(
     taxon_name: str = "",
     min_term_size: int = MIN_TERM_SIZE,
     max_term_size: "int | None" = None,
+    score_by_kegg_id: "dict | None" = None,
+    kegg_id_labels: "dict | None" = None,
     progress_callback=None,
     verbose: bool = False,
 ) -> dict:
     """Run the competitive Wilcoxon gene-set burden test for one database.
 
     Args:
-        database:      "GO" | "Reactome"
-        taxon_id:      NCBI taxon ID for the species choice.
+        database:      "GO" | "Reactome" | "KEGG"
+        taxon_id:      NCBI taxon ID for the species choice. EXCEPTION: for
+                       database="KEGG", this carries a KEGG organism code
+                       (e.g. "hsa") instead - see build_kegg_universe.
         score_by_acc:  {UniProt accession: float} variant/severity score per
                        gene, already oriented so HIGHER = more burden (the
                        caller negates scores upstream when the user's raw
                        metric runs the other way, e.g. an untransformed
-                       p-value).
+                       p-value). Used by GO and Reactome.
         include_iea:   when False, exclude electronically-inferred (IEA)
                        annotations from GO and Reactome universes.
         taxon_name:    organism name string (used by Reactome to filter its file).
+        score_by_kegg_id: {kegg_gene_id: float} - KEGG only, same orientation
+                       as score_by_acc but keyed on KEGG gene IDs (see
+                       build_kegg_universe for why KEGG is not accession-keyed).
+        kegg_id_labels: {kegg_gene_id: user's own identifier} - KEGG only, so
+                       the result table's "Genes" column shows the user's
+                       symbol/Ensembl ID rather than a raw KEGG gene ID.
 
     Returns:
         For database="GO": {"biological_process": <block>, "molecular_function": <block>,
                              "cellular_component": <block>}
-        For Reactome: {"Reactome": <block>}
+        For Reactome/KEGG: {"<database_key>": <block>}
     """
     def _progress(current, total, label):
         if progress_callback:
@@ -1668,6 +2180,24 @@ def run_burden_for_database(
         )
         _progress(1, 1, "Done")
         return {"Reactome": result}
+
+    if database == "KEGG":
+        _progress(0, 1, "Building KEGG universe...")
+        universe = build_kegg_universe(taxon_id, verbose=verbose)
+        universe_genes = set()
+        for info in universe["pathways"].values():
+            universe_genes |= info["genes"]
+        _progress(0, 1, "Testing KEGG pathways")
+        result = _run_wilcoxon_for_namespace(
+            universe["pathways"], score_by_kegg_id or {}, universe_genes, include_bonferroni,
+            min_term_size, max_term_size,
+        )
+        if kegg_id_labels:
+            result["table"] = _relabel_gene_list_column(result["table"], kegg_id_labels, "Genes")
+        if universe.get("caveat"):
+            result["caveat"] = universe["caveat"]
+        _progress(1, 1, "Done")
+        return {"KEGG": result}
 
     raise ValueError(f"Unknown burden-test database: {database!r}")
 

@@ -15,6 +15,12 @@ Resolution statuses
   user_provided      UniProt ID was already in the input row; no lookup done.
   resolved           Exactly one reviewed (Swiss-Prot) accession found.
   resolved_unreviewed  No reviewed entry; one unreviewed (TrEMBL) accession found.
+  resolved_via_ncbi  UniProt had nothing directly; bridged via an NCBI Entrez
+                     Gene ID lookup (_resolve_via_geneid).
+  resolved_via_kegg  Was ambiguous under UniProt alone; KEGG's own accession
+                     map collapsed the candidates to exactly one gene (see
+                     resolve_kegg_ids - runs only when a KEGG organism was
+                     chosen, after this module's normal resolution).
   resolved_manual    User manually selected one accession from ambiguous candidates.
   ambiguous          Multiple candidates remain after tie-break; needs user choice.
   not_found          Zero results from UniProt (reviewed and unreviewed).
@@ -74,11 +80,18 @@ DEFAULT_TIMEOUT = 20
 DEFAULT_RETRIES = 3
 MAX_RESULTS_PER_QUERY = 10  # enough to detect ambiguity; UniProt rarely returns >2-3 exact matches
 
+# "KEGG ID" is filled by resolve_kegg_ids, a separate opt-in pass that runs
+# AFTER resolve_gene_table (it needs a chosen KEGG organism code, which is
+# independent of - and optional beyond - the taxon used for UniProt
+# resolution). resolve_gene_table always writes it as "" so the column shape
+# is stable whether or not that pass ever runs.
 OUTPUT_COLUMNS_SYMBOL = [
-    "Gene Symbol", "UniProt ID", "Entry Name", "Protein Name", "NCBI Gene ID", "Resolution_status", "Candidates",
+    "Gene Symbol", "UniProt ID", "Entry Name", "Protein Name", "NCBI Gene ID",
+    "KEGG ID", "Resolution_status", "Candidates",
 ]
 OUTPUT_COLUMNS_ENSEMBL = [
-    "Ensembl Gene ID", "UniProt ID", "Entry Name", "Protein Name", "NCBI Gene ID", "Resolution_status", "Candidates",
+    "Ensembl Gene ID", "UniProt ID", "Entry Name", "Protein Name", "NCBI Gene ID",
+    "KEGG ID", "Resolution_status", "Candidates",
 ]
 OUTPUT_COLUMNS_SEQUENCE = [
     "Sequence", "Sequence Type", "UniProt ID", "Entry Name", "Protein Name",
@@ -252,6 +265,14 @@ def _parse_entry(entry: dict) -> dict:
 
 _REF_PROTEOME_CACHE: dict = {}
 
+# Process-local cache for the "harvest an Entrez ID for an ambiguous gene"
+# step below, keyed "symbol|taxon" (or bare ensembl_id). Mirrors
+# _REF_PROTEOME_CACHE's pattern: _set_cache deliberately refuses to persist
+# "ambiguous" results (a stale answer would survive the user's manual fix),
+# so without this an ambiguous gene's NCBI esearch would re-fire on every
+# single run against the same table, not just every process.
+_NCBI_GENEID_CACHE: dict = {}
+
 
 def _get_reference_proteome_ids(taxon_id: str, verbose: bool = False) -> set:
     """Return the set of reference-proteome UPIDs for a taxon.
@@ -407,6 +428,17 @@ def resolve_gene_symbol(symbol: str, taxon_id: str, verbose: bool = False) -> di
 
     if result["Resolution_status"] == "not_found":
         result = _ncbi_fallback_symbol(symbol_clean, taxon_clean, verbose=verbose)
+    elif result["Resolution_status"] == "ambiguous" and not result.get("NCBIGeneID"):
+        # Harvest-only: an Entrez ID here does not resolve the gene (status and
+        # Candidates are untouched), but it enables the KEGG bridge in
+        # build_recovery_bundle / the retriever's KEGG ID column, and costs
+        # nothing extra since _harvest_ncbi_geneid_for_ambiguous is cached.
+        harvested = _harvest_ncbi_geneid_for_ambiguous(
+            f"{symbol_clean}[Gene Name] AND txid{taxon_clean}[Organism:exp]",
+            cache_key, verbose=verbose,
+        )
+        if harvested:
+            result["NCBIGeneID"] = harvested
     _set_cache("gene_symbol", cache_key, result)
     return result
 
@@ -478,6 +510,10 @@ def resolve_ensembl_id(ensembl_id: str, verbose: bool = False) -> dict:
 
     if result["Resolution_status"] == "not_found":
         result = _ncbi_fallback_ensembl(ensembl_clean, verbose=verbose)
+    elif result["Resolution_status"] == "ambiguous" and not result.get("NCBIGeneID"):
+        harvested = _harvest_ncbi_geneid_for_ambiguous(ensembl_clean, cache_key, verbose=verbose)
+        if harvested:
+            result["NCBIGeneID"] = harvested
     _set_cache("ensembl", cache_key, result)
     return result
 
@@ -518,12 +554,41 @@ def _ncbi_gene_search(term: str, verbose: bool = False) -> list:
     return []
 
 
+def _harvest_ncbi_geneid_for_ambiguous(term: str, cache_key: str, verbose: bool = False) -> str:
+    """Best-effort Entrez ID lookup for an AMBIGUOUS gene - harvest only, never override.
+
+    Returns the Entrez ID string, or "" if there was no single unambiguous
+    esearch hit. Deliberately stricter than _ncbi_fallback_symbol/_ensembl
+    (which take gene_ids[0] of up to 5): those fire only after UniProt found
+    NOTHING, so any hit is better than none, but an ambiguous gene is
+    ambiguous precisely because real paralogs likely exist - taking [0] here
+    could inject an arbitrary paralog's ID. Requiring exactly one hit makes
+    this bridge silent rather than wrong.
+
+    The caller's Resolution_status and Candidates are never touched - this
+    only ever adds an NCBIGeneID onto an otherwise-unchanged ambiguous result.
+    """
+    if cache_key in _NCBI_GENEID_CACHE:
+        return _NCBI_GENEID_CACHE[cache_key]
+    ids = _ncbi_gene_search(term, verbose=verbose)
+    entrez_id = ids[0] if len(ids) == 1 else ""
+    _NCBI_GENEID_CACHE[cache_key] = entrez_id
+    return entrez_id
+
+
 def _resolve_via_geneid(entrez_id: str, taxon_for_ref: str = "", verbose: bool = False) -> dict:
     """Bridge an Entrez Gene ID to a UniProt accession via the geneid cross-reference.
 
     Queries UniProt `xref:geneid-{id}` (reviewed first, then TrEMBL) and runs
     the same reference-proteome tie-break as the direct symbol/Ensembl paths.
     On a single hit the status is overridden to resolved_via_ncbi.
+
+    The Entrez ID itself is now kept UNCONDITIONALLY, even when the UniProt
+    bridge fails or stays ambiguous - it is a real, independently-useful piece
+    of information the caller already paid an NCBI query for (KEGG gene IDs
+    ARE Entrez IDs for RefSeq-sourced organisms, so this is what lets a gene
+    with no UniProt match still be matched against KEGG). Previously it was
+    thrown away whenever the bridge did not resolve cleanly.
     """
     query_rev = f"xref:geneid-{entrez_id} AND reviewed:true"
     entries = _safe_uniprot_search(query_rev, verbose=verbose)
@@ -543,7 +608,7 @@ def _resolve_via_geneid(entrez_id: str, taxon_for_ref: str = "", verbose: bool =
 
     if result["Resolution_status"] in ("resolved", "resolved_unreviewed"):
         result["Resolution_status"] = "resolved_via_ncbi"
-        result["NCBIGeneID"] = entrez_id
+    result["NCBIGeneID"] = entrez_id
     return result
 
 
@@ -692,6 +757,7 @@ def resolve_gene_table(
                 "Entry Name": "",
                 "Protein Name": "",
                 "NCBI Gene ID": "",
+                "KEGG ID": "",
                 "Resolution_status": "user_provided",
                 "Candidates": "",
             })
@@ -704,6 +770,7 @@ def resolve_gene_table(
                 "Entry Name": "",
                 "Protein Name": "",
                 "NCBI Gene ID": "",
+                "KEGG ID": "",
                 "Resolution_status": "not_found",
                 "Candidates": "",
             })
@@ -720,12 +787,147 @@ def resolve_gene_table(
             "Entry Name": result.get("EntryName", ""),
             "Protein Name": result.get("ProteinName", ""),
             "NCBI Gene ID": result.get("NCBIGeneID", ""),
+            "KEGG ID": "",
             "Resolution_status": result.get("Resolution_status", "not_found"),
             "Candidates": result.get("Candidates", ""),
         })
 
     save_genomics_cache()
     return pd.DataFrame(rows, columns=output_columns)
+
+
+def resolve_kegg_ids(
+    resolved_df: pd.DataFrame,
+    id_col: str,
+    kegg_organism_code: str,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """Assign a KEGG gene ID to each row of an already-resolved gene table,
+    and use KEGG's own accession map to disambiguate rows UniProt alone could
+    not (native KEGG source, via Genomics_module.build_kegg_gene_map).
+
+    Must run AFTER resolve_gene_table - it reads "UniProt ID", "NCBI Gene ID",
+    id_col and, for ambiguous rows, "Candidates". The KEGG organism is a
+    separate, optional choice from the UniProt taxon (KEGG organism codes and
+    NCBI taxon IDs cannot be derived from one another - verified live).
+
+    Precedence per gene, first hit wins (measured live on chickpea, a real
+    non-model organism, for calibration):
+      1. UniProt ID -> KEGG's acc_to_gene (~92% coverage).
+      2. NCBI Gene ID -> KEGG's entrez_to_gene (KEGG gene IDs ARE Entrez IDs
+         for RefSeq-sourced organisms - an exact, organism-agnostic bridge;
+         this is what makes a gene UniProt alone could not place still
+         reachable, since _resolve_via_geneid/the ambiguous-harvest step
+         above now KEEP the Entrez ID even when the UniProt bridge fails).
+      3. Gene symbol -> KEGG's symbol_to_gene (model-organism only - measured
+         1.6% coverage for chickpea vs 94.1% for human; kept as a low-value
+         last resort, never the primary route).
+
+    AMBIGUOUS rows (empty UniProt ID, JSON candidates in "Candidates") get
+    special handling: each candidate accession is checked against
+    acc_to_gene. If the candidates collapse to EXACTLY ONE KEGG gene, that is
+    not just a KEGG match - it is KEGG's own curated data disambiguating
+    which UniProt accession is real for this organism, something the
+    reference-proteome tie-break could not do (no reference proteome exists
+    for most non-model organisms). The row is promoted: UniProt ID/Entry
+    Name/Protein Name are filled from that one candidate, Resolution_status
+    becomes "resolved_via_kegg", and Candidates is cleared - so the row flows
+    into the normal resolved table through the EXISTING ambiguous/table1_df
+    split with no new UI or manual-selection path required. More than one
+    matching candidate -> left ambiguous, exactly as before; KEGG never guesses.
+
+    Returns a NEW DataFrame (does not mutate resolved_df) with one added
+    column, "KEGG ID" (already present as "" from resolve_gene_table; filled
+    in place here).
+    """
+    import Genomics_module as gm  # local import: keeps this module importable if Genomics_module's heavier deps are unavailable
+
+    df = resolved_df.copy()
+    if "KEGG ID" not in df.columns:
+        df["KEGG ID"] = ""
+
+    org = str(kegg_organism_code).strip().lower()
+    if not org:
+        return df
+
+    gene_map = gm.build_kegg_gene_map(org, verbose=verbose)
+    acc_to_gene = gene_map.get("acc_to_gene", {})
+    entrez_to_gene = gene_map.get("entrez_to_gene", {})
+    symbol_to_gene = gene_map.get("symbol_to_gene", {})
+    try_symbol_bridge = id_col == "Gene Symbol"
+
+    for idx, row in df.iterrows():
+        acc = str(row.get("UniProt ID", "")).strip()
+        entrez = str(row.get("NCBI Gene ID", "")).strip()
+        status = str(row.get("Resolution_status", "")).strip()
+        was_ambiguous = status == "ambiguous"
+
+        # An ambiguous row always has an empty UniProt ID by construction
+        # (_select_unambiguous), so the accession bridge can only ever fire
+        # here for an ALREADY-resolved row; the entrez and symbol bridges,
+        # unlike it, can fire for an ambiguous row too (an ambiguous gene can
+        # still carry a harvested NCBI Gene ID, or a gene symbol regardless
+        # of status) - which is exactly the case the promotion step below
+        # exists to handle.
+        kegg_gene = ""
+        if acc and acc in acc_to_gene:
+            kegg_gene = acc_to_gene[acc]
+        elif entrez and entrez in entrez_to_gene:
+            kegg_gene = entrez_to_gene[entrez]
+        elif try_symbol_bridge:
+            symbol = str(row.get(id_col, "")).strip().upper()
+            if symbol and symbol in symbol_to_gene:
+                kegg_gene = symbol_to_gene[symbol]
+
+        if was_ambiguous and not kegg_gene:
+            # No direct bridge fired - fall back to KEGG's own accession map
+            # disambiguating the pending candidates. Unlike the direct
+            # bridges, this ALSO resolves the UniProt ambiguity itself (it
+            # picks which of several real candidate accessions is correct),
+            # so it fills UniProt ID/Entry Name/Protein Name too, not only
+            # KEGG ID.
+            candidates_raw = str(row.get("Candidates", "") or "")
+            try:
+                candidates = json.loads(candidates_raw) if candidates_raw else []
+            except Exception:
+                candidates = []
+
+            matched_genes: set = set()
+            matched_candidate = None
+            for cand in candidates:
+                cand_acc = str(cand.get("accession", "")).strip()
+                g = acc_to_gene.get(cand_acc)
+                if g:
+                    matched_genes.add(g)
+                    if len(matched_genes) == 1:
+                        matched_candidate = cand
+
+            if len(matched_genes) == 1 and matched_candidate is not None:
+                df.at[idx, "UniProt ID"] = matched_candidate.get("accession", "")
+                df.at[idx, "Entry Name"] = matched_candidate.get("entry_name", "")
+                df.at[idx, "Protein Name"] = matched_candidate.get("protein_name", "")
+                kegg_gene = next(iter(matched_genes))
+
+        if not kegg_gene:
+            continue
+
+        df.at[idx, "KEGG ID"] = kegg_gene
+        if was_ambiguous:
+            # Whatever bridge fired - the entrez bridge directly, or the
+            # accession-candidate disambiguation above - this row must be
+            # promoted OUT of "ambiguous" or it would never reach final_df
+            # at all (table1_df excludes every ambiguous row; a KEGG ID with
+            # no status change would be silently unreachable). When the
+            # entrez bridge is what fired, UniProt ID/Entry Name/Protein Name
+            # stay empty - KEGG placed the gene but UniProt still could not -
+            # which is fine: GO/Reactome/other UniProt-space databases
+            # already skip rows with an empty accession, so this promotion's
+            # only real effect for them is a no-op, while KEGG (and KEGG
+            # alone) can now see the gene.
+            df.at[idx, "Resolution_status"] = "resolved_via_kegg"
+            df.at[idx, "Candidates"] = ""
+
+    return df
 
 
 # ---------------------------------------------------------------------------

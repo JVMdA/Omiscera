@@ -12,15 +12,18 @@ tell you much. The question ORA answers is:
     genes involved in a specific process, pathway, or trait more than I'd
     expect if I'd picked genes at random?"
 
-It answers this against three curated knowledge bases:
+It answers this against four curated knowledge bases:
   - Gene Ontology (GO) — standardized descriptions of what a gene product
     does, where it acts, and what process it participates in.
   - Reactome — curated metabolic and signaling pathways.
+  - KEGG PATHWAY — curated metabolic and signaling pathways from KEGG,
+    complementary to Reactome and with materially better coverage for
+    non-model organisms (see "SPECIES SELECTION" below).
   - GWAS Catalog — genes associated with human traits and diseases in
     published genome-wide association studies.
 
 You can also upload your own custom gene-set database instead of these
-three (see "CUSTOM DATABASE" below).
+four (see "CUSTOM DATABASE" below).
 
 THE SCIENTIFIC QUESTION
 ----------------------------
@@ -57,8 +60,8 @@ thousands), some will look "significant" by chance alone. Omiscera corrects
 for this with:
   - Benjamini-Hochberg FDR (default) — controls the expected proportion of
     false positives among the terms you call significant, applied
-    separately within each term family (GO:BP, GO:MF, GO:CC, Reactome, GWAS
-    Catalog, or your custom database).
+    separately within each term family (GO:BP, GO:MF, GO:CC, Reactome, KEGG,
+    GWAS Catalog, or your custom database).
   - Bonferroni — a stricter, more conservative alternative, also reported.
 
 By default, FDR < 0.05 is treated as significant; adjustable per database.
@@ -77,14 +80,15 @@ classic example is RNA-seq: if your experiment only detected 14,000 of
 your tissue look artificially "enriched," simply because those genes were
 more detectable in your assay, not because your condition favored them.
 
-You can upload your own background/reference gene list (for GO and
-Reactome) to fix this — the universe then narrows to the genes your
+You can upload your own background/reference gene list (for GO, Reactome
+and KEGG) to fix this — the universe then narrows to the genes your
 experiment could actually have observed. This is optional and off by
 default.
 
-(Background upload applies to GO and Reactome only. GWAS Catalog works in
-gene-symbol space natively, and a custom database always defines its own
-universe from the file you upload.)
+(Background upload applies to GO, Reactome and KEGG only — all three test in
+UniProt-accession space. GWAS Catalog works in gene-symbol space natively,
+and a custom database always defines its own universe from the file you
+upload.)
 
 TERM-SIZE FILTERING
 -----------------------
@@ -99,6 +103,44 @@ SPECIES SELECTION
 Choosing your organism tells GO, Reactome, and GWAS Catalog which species'
 data to use, and is also used to match your uploaded genes to the right
 species when the same gene symbol exists in multiple organisms.
+
+KEGG is the exception, in two ways.
+
+First, it identifies organisms by its own organism code (e.g. "hsa" for
+human) rather than the shared taxon ID — a separate, optional choice made
+during retrieval (see "RESOLVING KEGG GENE IDS" below), not on this
+configuration screen. This is also why KEGG's coverage of non-model organisms
+is often the best of the databases here: KEGG maintains pathway annotations
+for thousands of organism genomes on its own, not only a handful of
+well-studied model species.
+
+Second, KEGG tests in its OWN gene-ID space, not UniProt accession space.
+Earlier, KEGG matched by converting its pathways into UniProt accessions —
+that undercounted every gene with more than one UniProt entry (inflating
+term sizes) and could never reach the roughly 9% of a genome's pathway genes
+that have no UniProt cross-reference at all, which hits non-model organisms
+hardest. KEGG's pathways are now counted in real genes, and a dedicated
+retrieval step (see below) assigns each of your genes its own KEGG gene ID
+directly — through your resolved UniProt accession where possible, or
+through an NCBI Entrez Gene ID bridge when UniProt could not place the gene
+on its own. Results are still shown using your own gene symbol or Ensembl
+ID, never a raw KEGG gene ID.
+
+RESOLVING KEGG GENE IDS
+----------------------------
+To use KEGG, first resolve your genes normally (as above), then use the
+"Resolve KEGG gene IDs" box that appears on the retrieval screen once you
+have results: search for and pick a KEGG organism, then click "Resolve KEGG
+gene IDs." This is optional — skip it if you are not using KEGG.
+
+This step can also rescue genes that came back "ambiguous" under UniProt
+alone (common for non-model organisms, which usually have no UniProt
+reference proteome to break the tie between candidates): if KEGG's own data
+can identify the gene uniquely — either because exactly one of the pending
+UniProt candidates is the one KEGG itself recognizes, or via the NCBI Entrez
+bridge — the gene is resolved (shown as "Resolved via KEGG") and becomes
+usable for every database, not just KEGG. KEGG never guesses: a gene stays
+ambiguous if more than one candidate remains plausible even with KEGG's help.
 
 RESULTS AND VISUALIZATION
 -----------------------------
@@ -156,4 +198,19 @@ THINGS TO KEEP IN MIND
     that matches how your gene list was actually generated.
   - FDR is corrected per term family, not globally.
   - Non-human, less-studied organisms will have sparser annotation,
-    especially for GWAS Catalog (essentially human-only).
+    especially for GWAS Catalog (essentially human-only). KEGG is the
+    exception to this pattern — it is usually the STRONGEST option for a
+    non-model organism among the databases here.
+  - KEGG's broad "overview" maps (e.g. "Metabolic pathways") are kept as
+    genuine, testable terms rather than removed — they are usually too large
+    to survive the default term-size cap and are reported as excluded for
+    that reason, the same way an overly generic GO term would be, rather
+    than being invisibly hidden ahead of time.
+
+KEGG'S REST API AND ACADEMIC USE. KEGG's REST API is intended for
+individual, academic use; its terms restrict systematic bulk downloading
+and commercial redistribution of its data. This module's KEGG requests are
+a handful of bulk calls per organism you actually analyze — cached
+afterward — not an export of KEGG's database. This app is distributed as
+source for you to run yourself, rather than offered as a hosted service
+making KEGG calls on other users' behalf.

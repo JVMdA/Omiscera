@@ -340,6 +340,111 @@ test_reactome_module_organism_filter.py  8 checks. A real bug found while
                                 red. Direct function calls against the real,
                                 local Reactome bulk file - no server needed.
 
+test_kegg_universe_parsing.py  23 checks. build_kegg_universe, the KEGG
+                                PATHWAY gene-set source added to Genomics ORA
+                                + Gene-set Burden Test (KEGG PATHWAY only;
+                                Metabolic Connection's separate, earlier KEGG
+                                work covers compound/enzyme lookups, not gene
+                                sets). The universe is keyed on KEGG GENE IDs,
+                                not UniProt accessions - an accession-keyed
+                                first version was superseded (see
+                                test_kegg_gene_map.py) because it inflated
+                                counts via UniProt fan-out (measured: human
+                                N=10,873 accessions vs N=9,424 real genes,
+                                hsa00010 K=107 vs K=67) and could never reach
+                                the ~9% of pathway genes with no UniProt
+                                cross-reference at all. Guards the pathway-
+                                name suffix trap found while building it:
+                                names carry a " - <Organism>" suffix, but
+                                several REAL pathway names ALSO contain an
+                                internal " - " (e.g. "Glycosaminoglycan
+                                biosynthesis - keratan sulfate") - a naive
+                                rsplit(" - ", 1) mangles them, so the fix
+                                strips only the single most-common suffix
+                                across that organism's own rows. Also: a
+                                pathway whose every gene has no link-row entry
+                                is dropped entirely rather than kept empty;
+                                the on-disk universe cache's "genes" key
+                                round-trips list<->set correctly; and both
+                                run_ora_for_database/run_burden_for_database's
+                                KEGG branches produce the correct k/K/n/N and
+                                result shape against a monkeypatched synthetic
+                                universe (no network) - including that their
+                                "Overlapping Genes"/"Genes" columns are
+                                relabeled from raw KEGG gene IDs back to the
+                                caller's own identifiers via kegg_id_labels,
+                                falling back to the raw ID rather than
+                                vanishing when no label is supplied - with
+                                unknown databases still raising. Pure
+                                functions and fixture strings - no server, no
+                                network.
+
+test_kegg_gene_map.py          19 checks. build_kegg_gene_map, the lookup
+                                tables (UniProt accession / NCBI Entrez ID /
+                                gene symbol -> KEGG gene ID) that let the
+                                retriever assign each gene a KEGG gene ID -
+                                the identifier build_kegg_universe's pathway
+                                sets are keyed on. The one invariant a LOOKUP
+                                table needs that a pathway gene-SET does not:
+                                a key claimed by more than one KEGG gene is
+                                dropped from the map entirely in both
+                                directions (accession and Entrez bridges) and
+                                for the symbol bridge - guarded by
+                                _kegg_invert_unique's own sensitivity check
+                                and the builder's end-to-end version.  Also:
+                                _parse_kegg_gene_symbols correctly separates a
+                                real "SYM1, SYM2; description" field from a
+                                bare description that happens to contain a
+                                ";" but carries no genuine symbols (rejects
+                                space-containing and >5-token candidates); the
+                                three maps are JSON-safe plain dicts (not
+                                turned into sets by the shared universe cache
+                                serializer); and an organism with no UniProt
+                                data gets a caveat and is never cached. Pure
+                                functions and a monkeypatched _kegg_safe_get -
+                                no network. Uses fictitious 6+ character
+                                organism codes for its fixtures and cleans up
+                                any cache file it writes, specifically because
+                                an earlier version of this file used the REAL
+                                "cam" organism code under force_refresh=True -
+                                force_refresh skips READING a stale cache, not
+                                WRITING one - and silently poisoned the real
+                                on-disk chickpea gene map with fake data until
+                                caught by hand; this is the regression guard
+                                for that incident, not a hypothetical.
+
+test_kegg_retriever_mapping.py  20 checks. Genomics_module_retriever's KEGG
+                                changes: NCBIGeneID is now kept even when the
+                                UniProt bridge itself stays ambiguous (it used
+                                to be thrown away, which is what made an
+                                Entrez-ID-only KEGG match impossible before);
+                                an ambiguous gene gets a best-effort, harvest-
+                                ONLY Entrez lookup that requires exactly ONE
+                                esearch hit (never gene_ids[0] of up to 5, the
+                                existing not_found-only fallback's choice -
+                                defensible there, but an ambiguous gene is
+                                ambiguous precisely because real paralogs
+                                likely exist); and resolve_kegg_ids's three-
+                                bridge precedence (accession > entrez > symbol)
+                                plus its accession-candidate disambiguation
+                                path. The CRITICAL, headline check: a gene
+                                recovered ONLY via the Entrez bridge (no
+                                UniProt accession at all) must be promoted out
+                                of "ambiguous" to a new status,
+                                "resolved_via_kegg" - a real bug caught by
+                                hand during development, where a KEGG ID got
+                                filled in but the row's status silently stayed
+                                "ambiguous", meaning it could never reach
+                                final_df (table1_df = resolved_df[~ambiguous_
+                                mask] excludes every ambiguous row
+                                unconditionally) and the KEGG ID would have
+                                been permanently unreachable by any analysis.
+                                Also guards the inverse: two DIFFERENT genes
+                                among the disambiguation candidates leaves the
+                                row ambiguous, never guessing. No network -
+                                _safe_uniprot_search / _ncbi_gene_search /
+                                build_kegg_gene_map are all monkeypatched.
+
 test_proteomics_retriever.py    31 checks. Proteomics_module_retriever.py -
                                 the three behaviours a proteomics upload
                                 needs that no transcriptomics one does:
@@ -616,6 +721,62 @@ live_msigdb_urls.py             49 checks. LIVE network test: every pinned
                                 uvicorn server - only real internet access to
                                 MSigDB's release server, same as
                                 smoke_regulon_fetchers.py below.
+
+live_kegg_universe.py           39 checks. LIVE network test for KEGG
+                                PATHWAY in Genomics ORA + Gene-set Burden
+                                Test: build_kegg_universe, build_kegg_gene_map
+                                and Genomics_module_retriever.resolve_kegg_ids
+                                together, against real KEGG/UniProt/NCBI data.
+                                Confirms the universe's re-keying onto real
+                                KEGG genes (human N=9,424, hsa00010 K=67 -
+                                DELIBERATELY down from an earlier accession-
+                                keyed version's inflated 10,873/107, not a
+                                regression - see test_kegg_gene_map.py for
+                                why); chickpea (non-model organism) coverage;
+                                a real total-failure organism (list/pathway
+                                200-empty AND link/pathway HTTP 400); the
+                                measured symbol-coverage asymmetry that ruled
+                                out a GO-style symbol fallback as the primary
+                                fix (human ~94% of genes carry a KEGG symbol,
+                                chickpea ~1.9%); a REAL organism with pathway
+                                data but no NCBI Entrez cross-reference
+                                (Synechocystis/"syn" - has_entrez=False, still
+                                builds and caches); and the identity
+                                assumption this whole feature leans on (a KEGG
+                                gene ID's numeric part equals its Entrez ID)
+                                checked against 200 real chickpea genes, not
+                                assumed. The HEADLINE check: the exact real-
+                                world case that motivated this feature - real
+                                chickpea gene symbols ARF2/ARF6 come back
+                                "ambiguous" under UniProt's own reference-
+                                proteome tie-break (no reference proteome
+                                exists for most non-model organisms) - run
+                                through resolve_gene_table then
+                                resolve_kegg_ids and confirmed EVERY one of 7
+                                real genes ends up with a KEGG gene ID, zero
+                                left ambiguous. A separate KNOWN-ANSWER check
+                                sends 10 real human gene SYMBOLS through the
+                                REAL retriever pipeline (not hand-typed
+                                accessions) into the app's REAL Fisher engine
+                                and confirms hsa00010 "Glycolysis /
+                                Gluconeogenesis" ranks 1 (FDR ~5e-21, all 10
+                                matched, zero dropped, K=67 - the real KEGG
+                                gene count), with "Overlapping Genes" showing
+                                real gene symbols via kegg_id_labels, never a
+                                raw KEGG gene ID, and the "Metabolic pathways"
+                                overview map excluded by max_term_size rather
+                                than a build-time exclusion. Cross-checked
+                                against an INDEPENDENT database in a DIFFERENT
+                                ID space - the same genes, resolved via
+                                UniProt, also top Reactome's own Glycolysis
+                                pathway - and against the Burden Test engine
+                                (with its own "Genes" column relabeling
+                                confirmed) on the same known input. Does NOT
+                                need the app's own uvicorn server - only real
+                                internet access to KEGG's REST API
+                                (rest.kegg.jp) and UniProt/NCBI (via the real
+                                retriever), same pattern as live_msigdb_urls.py
+                                above.
 
 
 ---------------------------------------------------------------------------
@@ -902,9 +1063,9 @@ in one never hides another. From the repo root, with the server up:
     Get-ChildItem tests\*.py | ForEach-Object { python $_.FullName }
 
 Expected totals as of the last full run, in file-listing order: 117, 22, 16,
-4, 15, 5, 16, 10, 24, 58, 44, 49, 52, 8, 31, 23, 31, 49, 21, 15, 12, 12, 22,
-22, 16, 12, 49, 90, 13, 37, 40, 41, 7, 4, 15, 68 - all passing (1070 checks
-across 36 files).
+4, 15, 5, 16, 10, 24, 58, 44, 49, 52, 8, 23, 19, 20, 31, 23, 31, 49, 21, 15,
+12, 12, 22, 22, 16, 12, 49, 39, 90, 13, 37, 40, 41, 7, 4, 15, 68 - all passing
+(1171 checks across 40 files).
 
 A NOTE ON WRITING NEW CHECKS HERE. Prefer assertions that can actually fail
 for the reason you care about. A concrete example lives in

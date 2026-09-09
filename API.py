@@ -68,6 +68,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DISPLAY_COLUMNS = [
     "Name",
+    "KEGG ID",
     "PubChem ID",
     "SMILES",
     "InChIKey",
@@ -75,8 +76,8 @@ DISPLAY_COLUMNS = [
     "Formula",
     "Mapping_status",
 ]
-EXPECTED_INPUT_COLUMNS = ["Name", "PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula"]
-USEFUL_DUPLICATE_FIELDS = ["PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula"]
+EXPECTED_INPUT_COLUMNS = ["Name", "KEGG ID", "PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula"]
+USEFUL_DUPLICATE_FIELDS = ["KEGG ID", "PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula"]
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +115,8 @@ def standardize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
 
         if key == "name":
             rename_map[col] = "Name"
+        elif key in ("keggid", "kegg"):
+            rename_map[col] = "KEGG ID"
         elif key in ("pubchemid", "pubchem"):
             rename_map[col] = "PubChem ID"
         elif key == "smiles":
@@ -382,23 +385,31 @@ def run_connection_analysis(
     for rank_name, settings in rank_settings.items():
         rank_letter = str(rank_name).replace("Rank", "").strip()
         hmdb_table = hmdb_import_by_rank.get(rank_letter)
-        _enzyme_dbs = {"Rhea + UniProt"}
+        _enzyme_dbs = {"Rhea + UniProt", "KEGG"}
         table1_databases = [
             db for db in settings if dc.canonical_database_name(db) not in _enzyme_dbs
         ]
 
         rhea_taxon_id = ""
+        kegg_org = ""
         for db, db_settings in settings.items():
-            if dc.canonical_database_name(db) == "Rhea + UniProt":
+            canonical_db = dc.canonical_database_name(db)
+            if canonical_db == "Rhea + UniProt":
                 rhea_taxon_id = str(db_settings.get("context_id", "")).strip()
-                break
+            elif canonical_db == "KEGG":
+                kegg_org = str(db_settings.get("context_id", "")).strip()
         rhea_taxon_reactions = (
             dc.get_uniprot_taxon_rhea_reactions(rhea_taxon_id, allow_online)
             if rhea_taxon_id else None
         )
+        kegg_org_enzymes = (
+            dc.get_kegg_organism_enzymes(kegg_org, allow_online)
+            if kegg_org else None
+        )
 
         table1_rows = []
         rhea_enzyme_rows = []
+        kegg_enzyme_rows = []
 
         for _, compound in filtered_df.iterrows():
             compound_name = str(compound.get("Name", "")).strip()
@@ -434,6 +445,13 @@ def run_connection_analysis(
                 )
                 rhea_enzyme_rows.extend(rhea_rows)
 
+            if kegg_org:
+                kegg_rows = dc.build_kegg_enzyme_rows(
+                    compound, kegg_org, allow_online,
+                    org_enzymes=kegg_org_enzymes,
+                )
+                kegg_enzyme_rows.extend(kegg_rows)
+
         if table1_databases:
             table1 = pd.DataFrame(table1_rows) if table1_rows else pd.DataFrame(columns=["Name"] + table1_databases)
         else:
@@ -452,7 +470,21 @@ def run_connection_analysis(
                 .reset_index(drop=True)
             )
 
-        results[rank_name] = {"table1": table1, "table2": table2, "selections": settings}
+        table3 = pd.DataFrame(
+            kegg_enzyme_rows,
+            columns=["Name", "Enzyme", "Role", "Enzyme presence", "Pathway"],
+        )
+        if not table3.empty:
+            _presence_order = {"Found": 0, "Not_evaluated": 1, "Not_found": 2}
+            table3 = (
+                table3
+                .assign(_rank=table3["Enzyme presence"].map(_presence_order).fillna(99))
+                .sort_values(by="_rank", kind="stable")
+                .drop(columns="_rank")
+                .reset_index(drop=True)
+            )
+
+        results[rank_name] = {"table1": table1, "table2": table2, "table3": table3, "selections": settings}
 
     return results
 
@@ -697,6 +729,7 @@ def _job_run_analysis(job_id: str, session: dict, rank_settings: dict) -> dict:
             "selections": sel_rows,
             "table1": df_payload(result.get("table1")),
             "table2": df_payload(result.get("table2")),
+            "table3": df_payload(result.get("table3")),
         }
     return payload
 
@@ -754,6 +787,77 @@ def _job_resolve_genes(job_id: str, session: dict, identifier_type: str, taxon_i
         "metrics": metrics,
         "ambiguous": ambiguous_list,
         "auto_final": auto_final,
+    }
+
+
+def _job_resolve_kegg_ids(job_id: str, session: dict, kegg_organism_code: str) -> dict:
+    """Optional, opt-in second retrieval pass: assigns each gene a KEGG gene
+    ID (Genomics_module_retriever.resolve_kegg_ids), a SEPARATE identifier
+    from UniProt ID that only Genomics ORA/Burden's KEGG database matches on
+    (see build_kegg_universe's docstring for why KEGG is not accession-keyed).
+
+    Runs on top of whatever /api/ora/genes/resolve already produced - it can
+    ALSO resolve genes that were "ambiguous" under UniProt alone (KEGG's own
+    accession map disambiguating pending candidates, or an NCBI Entrez ID
+    bridge), which is why this re-derives table1_df/ambiguous_df exactly like
+    _job_resolve_genes rather than only adding a column.
+    """
+    update_job(job_id, message=f"Resolving KEGG gene IDs for organism '{kegg_organism_code}'...")
+    resolved_df = session["ora"].get("resolved_df")
+    id_col = session["ora"].get("id_col")
+    if resolved_df is None or not id_col:
+        raise ValueError("Resolve gene identifiers first.")
+
+    mapped_df = gene_resolver.resolve_kegg_ids(resolved_df, id_col, kegg_organism_code, verbose=False)
+    session["ora"]["resolved_df"] = mapped_df
+    session["ora"]["kegg_organism_code"] = kegg_organism_code
+
+    ambiguous_mask = mapped_df["Resolution_status"] == "ambiguous"
+    table1_df = mapped_df[~ambiguous_mask].copy()
+    ambiguous_df = mapped_df[ambiguous_mask].copy()
+    display_cols = [c for c in mapped_df.columns if c != "Candidates"]
+
+    session["ora"]["table1_df"] = table1_df[display_cols].copy()
+    session["ora"]["display_cols"] = display_cols
+
+    status_counts = table1_df["Resolution_status"].value_counts().to_dict()
+    metrics = {
+        "resolved": status_counts.get("resolved", 0),
+        "resolved_unreviewed": status_counts.get("resolved_unreviewed", 0),
+        "resolved_via_ncbi": status_counts.get("resolved_via_ncbi", 0),
+        "resolved_via_kegg": status_counts.get("resolved_via_kegg", 0),
+        "user_provided": status_counts.get("user_provided", 0),
+        "not_found": status_counts.get("not_found", 0),
+    }
+
+    ambiguous_list = []
+    for _, amb_row in ambiguous_df.iterrows():
+        gene_id = str(amb_row.get(id_col, ""))
+        candidates_raw = str(amb_row.get("Candidates", ""))
+        try:
+            candidates_list = json.loads(candidates_raw) if candidates_raw else []
+        except Exception:
+            candidates_list = []
+        ambiguous_list.append({"gene_id": gene_id, "candidates": candidates_list})
+
+    auto_final = None
+    if ambiguous_df.empty:
+        final_df = table1_df[display_cols].copy()
+        session["ora"]["final_df"] = final_df
+        auto_final = df_payload(final_df)
+    else:
+        # KEGG resolution can change which rows are ambiguous, so any final_df
+        # set BEFORE this step is now stale (it could miss newly-recovered
+        # rows) - clear it; the user re-applies selections / discard-all on
+        # the updated ambiguous set.
+        session["ora"]["final_df"] = None
+
+    return {
+        "resolved_table": df_payload(table1_df[display_cols]),
+        "metrics": metrics,
+        "ambiguous": ambiguous_list,
+        "auto_final": auto_final,
+        "n_kegg_mapped": int((mapped_df["KEGG ID"] != "").sum()),
     }
 
 
@@ -1338,6 +1442,26 @@ def _job_run_ora(job_id: str, session: dict) -> dict:
     if "Ensembl Gene ID" in final_df.columns:
         ensembl_ids = [e for e in final_df["Ensembl Gene ID"].astype(str).tolist() if e.strip()]
 
+    # KEGG gene IDs are available only after Genomics_module_retriever.resolve_kegg_ids
+    # has run (an opt-in step after the normal UniProt/Ensembl resolution - see
+    # /api/ora/genes/resolve-kegg). KEGG matches on THESE, never on UniProt ID -
+    # see build_kegg_universe's docstring for why the universe is KEGG-gene-ID-keyed.
+    kegg_ids: list = []
+    kegg_id_labels: dict = {}
+    if "KEGG ID" in final_df.columns:
+        label_col = "Gene Symbol" if "Gene Symbol" in final_df.columns else (
+            "Ensembl Gene ID" if "Ensembl Gene ID" in final_df.columns else None
+        )
+        for _, row in final_df.iterrows():
+            kid = str(row.get("KEGG ID", "")).strip()
+            if not kid:
+                continue
+            kegg_ids.append(kid)
+            if label_col:
+                label = str(row.get(label_col, "")).strip()
+                if label:
+                    kegg_id_labels[kid] = label
+
     config = session["ora"]["ora_config"]
     databases = config["databases"]
     per_database = config["per_database"]
@@ -1383,9 +1507,20 @@ def _job_run_ora(job_id: str, session: dict) -> dict:
         taxon_id = db_cfg["taxon_id"]
         taxon_name = db_cfg.get("taxon_name", "")
         include_iea = bool(db_cfg.get("include_iea", True))
-        # User-supplied background list (GO/Reactome only) lives in the session,
+        # User-supplied background list (GO/Reactome/KEGG) lives in the session,
         # keyed by database; None -> use the whole annotated-genome universe.
+        # Always uploaded/parsed as UniProt accessions (load_user_background_list),
+        # so for KEGG it must be mapped into KEGG gene-ID space through the SAME
+        # gene map resolve_kegg_ids used - a raw accession background would
+        # silently match nothing against a KEGG-gene-ID-keyed universe.
         background = set(background_by_db.get(db) or []) or None
+        background_kegg_ids = None
+        if db == "KEGG" and background:
+            kegg_org_for_bg = session["ora"].get("kegg_organism_code", "")
+            if kegg_org_for_bg:
+                bg_gene_map = genomics_ora.build_kegg_gene_map(kegg_org_for_bg)
+                bg_acc_to_gene = bg_gene_map.get("acc_to_gene", {})
+                background_kegg_ids = {bg_acc_to_gene[a] for a in background if a in bg_acc_to_gene} or None
 
         # Defensive gate: GWAS needs symbols; skip gracefully if unavailable.
         if db == "GWAS Catalog" and not symbols:
@@ -1398,6 +1533,27 @@ def _job_run_ora(job_id: str, session: dict) -> dict:
                 "n_input_in_universe": 0,
                 "n_input_dropped": 0,
                 "caveat": "GWAS Catalog requires Gene Symbol input. No symbols available for this run.",
+            }}
+            continue
+
+        # Defensive gate: KEGG needs a "KEGG ID" per gene, a SEPARATE opt-in
+        # step from normal resolution (see /api/ora/genes/resolve-kegg). A
+        # user who selected KEGG without ever running that step gets a clear,
+        # actionable caveat here rather than a silently-empty KEGG table.
+        if db == "KEGG" and not kegg_ids:
+            empty_table = pd.DataFrame(columns=genomics_ora.ORA_RESULT_COLUMNS)
+            all_results[db] = {"KEGG": {
+                "table": empty_table,
+                "n_terms_tested": 0,
+                "n_terms_excluded_min_size": 0,
+                "universe_size": 0,
+                "n_input_in_universe": 0,
+                "n_input_dropped": 0,
+                "caveat": (
+                    "KEGG requires KEGG gene IDs, resolved separately from UniProt. "
+                    "Go back to the retrieval step, choose a KEGG organism and resolve "
+                    "KEGG IDs, then re-run."
+                ),
             }}
             continue
 
@@ -1416,6 +1572,9 @@ def _job_run_ora(job_id: str, session: dict) -> dict:
             taxon_name=taxon_name,
             min_term_size=min_ts,
             max_term_size=max_ts,
+            list_kegg_ids=kegg_ids,
+            background_kegg_ids=background_kegg_ids,
+            kegg_id_labels=kegg_id_labels,
             progress_callback=_progress,
             verbose=False,
         )
@@ -1533,6 +1692,27 @@ def _job_run_burden(job_id: str, session: dict) -> dict:
         score_by_symbol = _aggregate(sym_pairs)
         score_by_ensembl = _aggregate(ens_pairs)
 
+    # KEGG gene IDs are available only after resolve_kegg_ids has run (see
+    # _job_run_ora's identical block for the full rationale). Built the same
+    # way as the accession/symbol/ensembl maps above: one score per KEGG gene,
+    # aggregated if the same KEGG gene ID somehow appears on more than one row.
+    score_by_kegg_id: dict = {}
+    kegg_id_labels: dict = {}
+    if "KEGG ID" in final_df.columns and id_col:
+        kegg_series = final_df["KEGG ID"].astype(str).str.strip()
+        gid_series_for_kegg = final_df[id_col].astype(str).str.strip()
+        uid_series_for_kegg = final_df["UniProt ID"].astype(str).str.strip()
+        kegg_pairs = []
+        for kid, gid, uid in zip(kegg_series.tolist(), gid_series_for_kegg.tolist(), uid_series_for_kegg.tolist()):
+            if not kid:
+                continue
+            gid_key = gid.lower()
+            if gid_key and gid_key in variant_scores:
+                kegg_pairs.append((kid, variant_scores[gid_key]))
+            if gid:
+                kegg_id_labels[kid] = gid
+        score_by_kegg_id = _aggregate(kegg_pairs)
+
     config = session["ora"]["burden_config"]
     databases = config["databases"]
     per_database = config["per_database"]
@@ -1581,9 +1761,30 @@ def _job_run_burden(job_id: str, session: dict) -> dict:
         taxon_id = db_cfg["taxon_id"]
         taxon_name = db_cfg.get("taxon_name", "")
         include_iea = bool(db_cfg.get("include_iea", True))
+
+        # Defensive gate: KEGG needs a "KEGG ID" per gene (see _job_run_ora's
+        # identical gate for the full rationale) - a separate opt-in step from
+        # normal resolution.
+        if db == "KEGG" and not score_by_kegg_id:
+            gene_scores_by_db[db] = {}
+            all_results[db] = {"KEGG": {
+                "table": pd.DataFrame(columns=genomics_ora.BURDEN_RESULT_COLUMNS),
+                "n_terms_tested": 0,
+                "n_terms_excluded_min_size": 0,
+                "universe_size": 0,
+                "n_input_in_universe": 0,
+                "n_input_dropped": 0,
+                "caveat": (
+                    "KEGG requires KEGG gene IDs, resolved separately from UniProt. "
+                    "Go back to the retrieval step, choose a KEGG organism and resolve "
+                    "KEGG IDs, then re-run."
+                ),
+            }}
+            continue
+
         # GO/Reactome are accession-space, so their gene-node scores come from
-        # score_by_acc.
-        gene_scores_by_db[db] = score_by_acc
+        # score_by_acc; KEGG is KEGG-gene-ID-space, so it uses score_by_kegg_id.
+        gene_scores_by_db[db] = score_by_kegg_id if db == "KEGG" else score_by_acc
 
         def _progress(current, total, label, _db=db, _i=i):
             frac = (_i + current / max(total, 1)) / len(databases)
@@ -1597,6 +1798,8 @@ def _job_run_burden(job_id: str, session: dict) -> dict:
             taxon_name=taxon_name,
             min_term_size=min_ts,
             max_term_size=max_ts,
+            score_by_kegg_id=score_by_kegg_id,
+            kegg_id_labels=kegg_id_labels,
             progress_callback=_progress,
             verbose=False,
         )
@@ -2166,13 +2369,15 @@ def mc_download_result(rank: str, table: str, x_session_id: Optional[str] = Head
     result = results.get(rank)
     if result is None:
         raise HTTPException(status_code=404, detail="No results available for this rank.")
-    if table not in ("table1", "table2"):
+    if table not in ("table1", "table2", "table3"):
         raise HTTPException(status_code=400, detail="Invalid table key.")
     df = result.get(table)
     if df is None or df.empty:
         raise HTTPException(status_code=400, detail="This table has no data to download.")
     safe_rank = rank.replace(" ", "_")
     suffix = "compound_hits" if table == "table1" else "enzyme_presence"
+    if table == "table3":
+        suffix = "kegg_enzyme_presence"
     return df_to_csv_response(df, f"{safe_rank}_{suffix}.csv")
 
 
@@ -2359,6 +2564,26 @@ def ora_genes_resolve(payload: dict, x_session_id: Optional[str] = Header(defaul
     return {"job_id": job_id}
 
 
+@app.post("/api/ora/genes/resolve-kegg")
+def ora_genes_resolve_kegg(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    """Optional second pass on top of /api/ora/genes/resolve: assigns each
+    already-resolved gene a KEGG gene ID (a separate identifier from UniProt
+    ID; only Genomics ORA/Burden's KEGG database matches on it). The KEGG
+    organism is chosen independently from the UniProt taxon - KEGG organism
+    codes and NCBI taxon IDs cannot be derived from one another (verified:
+    KEGG's own organism hierarchy carries no taxon IDs).
+    """
+    session = session_dep(x_session_id)
+    if session["ora"].get("resolved_df") is None:
+        raise HTTPException(status_code=400, detail="Resolve gene identifiers first.")
+    kegg_organism_code = str(payload.get("kegg_organism_code", "")).strip()
+    if not kegg_organism_code:
+        raise HTTPException(status_code=400, detail="Select a KEGG organism before resolving KEGG IDs.")
+
+    job_id = submit_job(_job_resolve_kegg_ids, session, kegg_organism_code)
+    return {"job_id": job_id}
+
+
 @app.post("/api/ora/genes/discard-all")
 def ora_genes_discard_all(x_session_id: Optional[str] = Header(default=None)):
     session = session_dep(x_session_id)
@@ -2494,16 +2719,16 @@ async def ora_background_upload(
     """Store a user-supplied background (reference) gene list for one database.
 
     Background lives in UniProt-accession space, so it is only meaningful for
-    the accession-space databases (GO, Reactome). GWAS is symbol-native and the
-    custom database carries its own universe, so those are rejected here.
-    The list restricts the ORA universe to |annotated universe ∩ background|.
+    the accession-space databases (GO, Reactome, KEGG). GWAS is symbol-native
+    and the custom database carries its own universe, so those are rejected
+    here. The list restricts the ORA universe to |annotated universe ∩ background|.
     """
     session = session_dep(x_session_id)
     db = str(database).strip()
-    if db not in ("GO", "Reactome"):
+    if db not in ("GO", "Reactome", "KEGG"):
         raise HTTPException(
             status_code=400,
-            detail="A custom background applies only to GO and Reactome (UniProt-accession space).",
+            detail="A custom background applies only to GO, Reactome and KEGG (UniProt-accession space).",
         )
     raw_bytes = await file.read()
     try:

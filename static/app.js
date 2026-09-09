@@ -1,5 +1,5 @@
 const PUBLIC_PAGES = ["Home", "Information", "Contact", "References", "Citation"];
-const DISPLAY_COLUMNS = ["Name", "PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula", "Mapping_status"];
+const DISPLAY_COLUMNS = ["Name", "KEGG ID", "PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula", "Mapping_status"];
 
 const STATE = {
     view: "public",
@@ -40,6 +40,14 @@ function freshOraState() {
         resolved: null,
         ambiguousChoices: {},
         finalTable: null,
+        // Optional, opt-in second retrieval pass: assigns each gene a KEGG
+        // gene ID (a separate identifier from UniProt ID; only the KEGG
+        // database in ORA/Burden matches on it). Independent choice from
+        // taxonId/taxonName above - KEGG organism codes and NCBI taxon IDs
+        // cannot be derived from one another.
+        keggOrganismId: "",
+        keggOrganismName: "",
+        keggMapped: null,
         blast: { selection: {} },
         // ORA statistical analysis (downstream of finalTable; works the same
         // regardless of which identifierType produced finalTable).
@@ -225,10 +233,11 @@ const TRANSCRIPTOMICS_EXAMPLE_FILENAMES = {
 // Databases enabled in the ORA config screen. Extended as each database's
 // universe builder is implemented and verified (Reactome, then GWAS Catalog).
 const ORA_CUSTOM_DB_LABEL = "Custom database";
-const ORA_AVAILABLE_DATABASES = ["GO", "Reactome", "GWAS Catalog", ORA_CUSTOM_DB_LABEL];
+const ORA_AVAILABLE_DATABASES = ["GO", "Reactome", "KEGG", "GWAS Catalog", ORA_CUSTOM_DB_LABEL];
 const ORA_DATABASE_CAPTIONS = {
     "GO": "Gene Ontology. Produces three independent result tables: Biological Process, Molecular Function, Cellular Component. Each is tested and FDR-corrected separately.",
     "Reactome": "Pathway over-representation using UniProt's Reactome cross-references, tested with our own Fisher's exact + BH-FDR pipeline.",
+    "KEGG": "KEGG PATHWAY over-representation. Organism is picked from KEGG's own organism list (e.g. hsa), not an NCBI taxon. KEGG gene IDs are converted to UniProt accessions via KEGG's own REST API; genes with no UniProt cross-reference are excluded (about 9% of human pathway genes). Tested with the same Fisher's exact + BH-FDR pipeline. KEGG's broad overview maps (e.g. \"Metabolic pathways\") are kept but usually exceed the max term size and are reported as size-excluded, same as an overly generic GO term.",
     "GWAS Catalog": "Trait associations from the EBI GWAS Catalog. Works only with Gene Symbol input - matches your original gene symbols directly against the catalog. Coverage is overwhelmingly human; non-human species selections will likely return few or zero results.",
     "Custom database": "Upload your own gene sets (GMT or a tidy term/gene table) and test against them with the same Fisher's exact + BH-FDR pipeline.",
 };
@@ -241,10 +250,11 @@ const ORA_GO_NAMESPACE_LABELS = {
 // Gene-set Burden Test: same three families as ORA minus GWAS Catalog (an
 // unconventional/circular unit for a variant-burden test) and no background
 // upload option (not applicable to a competitive rank test).
-const BURDEN_AVAILABLE_DATABASES = ["GO", "Reactome", ORA_CUSTOM_DB_LABEL];
+const BURDEN_AVAILABLE_DATABASES = ["GO", "Reactome", "KEGG", ORA_CUSTOM_DB_LABEL];
 const BURDEN_DATABASE_CAPTIONS = {
     "GO": "Gene Ontology. Produces three independent result tables: Biological Process, Molecular Function, Cellular Component. Each is tested and FDR-corrected separately.",
     "Reactome": "Pathway burden test using UniProt's Reactome cross-references, tested with a competitive Wilcoxon rank-sum + BH-FDR pipeline.",
+    "KEGG": "KEGG PATHWAY burden test. Organism is picked from KEGG's own organism list (e.g. hsa), not an NCBI taxon. KEGG gene IDs are converted to UniProt accessions via KEGG's own REST API; genes with no UniProt cross-reference are excluded (about 9% of human pathway genes). Tested with a competitive Wilcoxon rank-sum + BH-FDR pipeline.",
     "Custom database": "Upload your own gene sets (GMT or a tidy term/gene table) and test against them with the same competitive Wilcoxon + BH-FDR pipeline.",
 };
 const ORA_DOT_COLOR_SCALES = [
@@ -905,7 +915,7 @@ async function ensureMcStep3Loaded(panel) {
             const data = await apiJson("/api/databases");
             STATE.mc.databases = data.databases;
         } catch (err) {
-            STATE.mc.databases = ["LOTUS", "Rhea + UniProt", "NPAtlas", "HMDB Import"];
+            STATE.mc.databases = ["KEGG", "LOTUS", "Rhea + UniProt", "NPAtlas", "HMDB Import"];
         }
     }
     if (STATE.mc._contractWarning === null) {
@@ -973,6 +983,7 @@ function renderStep3Panel(panel) {
 }
 
 const DB_CONTEXT_CAPTIONS = {
+    "KEGG": "Context is a KEGG organism code (e.g. hsa for human). Enter a species name or its KEGG organism code for an exact match. Enzyme presence is checked against the organism's full KEGG gene set; results (with pathway and substrate/product role) appear in a separate table below the others.",
     "LOTUS": "Context selection uses Wikidata taxon search as a taxonomic helper. Enter an organism name or - preferably - its Wikidata Q-code for an exact match. Note: several entities can share the same name, so a name search may surface the wrong one; when unsure, verify the taxon on Wikidata and LOTUS and paste its Q-code.",
     "Rhea + UniProt": "Context is a UniProt taxon. Enter a species name or numeric taxon ID for an exact match. Using the numeric taxon ID is recommended to avoid ambiguity - you can look it up at uniprot.org/taxonomy. Enzyme presence is checked against all UniProt entries (reviewed + unreviewed) for the chosen taxon, using exact Rhea reaction IDs.",
     "NPAtlas": "NPAtlas covers microbial natural products (bacteria + fungi). Search by genus or family name to match compounds produced by organisms within that group. You can also type a full species name for an exact species match - select the row labelled with your typed text for direct name matching.",
@@ -1162,6 +1173,20 @@ function renderMcStep4() {
                 dlBtn.addEventListener("click", () => downloadFile(
                     "/api/mc/download/result?rank=" + encodeURIComponent(rankName) + "&table=table2",
                     rankName.replace(/ /g, "_") + "_enzyme_presence.csv",
+                ));
+                body.appendChild(dlBtn);
+                det.appendChild(body);
+                card.appendChild(det);
+            }
+            if (result.table3 && result.table3.rows.length) {
+                const det = el("details", { class: "expander" });
+                det.appendChild(el("summary", {}, "Table 3 - KEGG enzyme presence"));
+                const body = el("div", { class: "expander-body" });
+                body.appendChild(buildTable(result.table3, {}));
+                const dlBtn = el("button", { class: "btn" }, "Download table (CSV)");
+                dlBtn.addEventListener("click", () => downloadFile(
+                    "/api/mc/download/result?rank=" + encodeURIComponent(rankName) + "&table=table3",
+                    rankName.replace(/ /g, "_") + "_kegg_enzyme_presence.csv",
                 ));
                 body.appendChild(dlBtn);
                 det.appendChild(body);
@@ -7674,18 +7699,141 @@ function renderGeneResolveControls() {
     return wrap;
 }
 
-function renderGeneResults() {
+function renderKeggIdSection() {
+    // KEGG identifies organisms by its own organism code, not a UniProt
+    // taxon (verified: the two cannot be derived from one another), so this
+    // is a genuinely separate, optional choice from the organism selector
+    // above - reusing the same debounced-search widget pattern
+    // renderOraSpeciesSearchWidget already established for Metabolic
+    // Connection, pointed at KEGG's own /api/contexts/search.
+    const wrap = el("div", { class: "ora-species-widget", style: { margin: "1rem 0" } });
+    wrap.appendChild(el("div", { class: "section-label" }, "Optional: resolve KEGG gene IDs"));
+    wrap.appendChild(el("div", { class: "caption" },
+        "KEGG's own gene ID is a separate identifier from UniProt ID, needed only if you plan to test " +
+        "against the KEGG database. Resolving it can also recover some genes UniProt alone left ambiguous."));
+
+    const input = el("input", { class: "text-input ora-species-input", type: "text", placeholder: "KEGG organism (name or code)" });
+    const resultsSelect = el("select", { class: "hidden ora-species-select" });
+    const selectedCaption = el("div", { class: "caption" });
+    const statusLine = el("div", { class: "caption" });
+
+    function refreshCaption() {
+        selectedCaption.textContent = STATE.ora.keggOrganismId
+            ? "Selected: " + STATE.ora.keggOrganismName + " (KEGG organism " + STATE.ora.keggOrganismId + ")"
+            : "";
+    }
+    refreshCaption();
+
+    let lastQuery = "";
+    let inFlight = false;
+    let timer = null;
+    input.addEventListener("input", () => {
+        const query = input.value.trim();
+        if (timer) clearTimeout(timer);
+        if (query.length < 3) {
+            resultsSelect.innerHTML = "";
+            resultsSelect.classList.add("hidden");
+            statusLine.textContent = "";
+            return;
+        }
+        timer = setTimeout(async () => {
+            if (query === lastQuery || inFlight) return;
+            lastQuery = query;
+            inFlight = true;
+            // KEGG's organism list has no fast REST source of its own (its
+            // list/organism endpoint 400s server-side, falling back to a
+            // slower HTML scrape) - without this the box can look dead for a
+            // few seconds on the first search per server process.
+            statusLine.textContent = "Searching KEGG organisms…";
+            try {
+                const data = await apiJson("/api/contexts/search?database=" + encodeURIComponent("KEGG") + "&query=" + encodeURIComponent(query) + "&limit=10");
+                resultsSelect.innerHTML = "";
+                resultsSelect.appendChild(el("option", { value: "" }, "Select organism"));
+                (data.results || []).forEach((rec, idx) => {
+                    const label = rec.context_id && rec.context_name ? rec.context_id + " | " + rec.context_name : (rec.context_name || rec.context_id || "");
+                    resultsSelect.appendChild(el("option", { value: String(idx) }, label));
+                });
+                resultsSelect._records = data.results || [];
+                resultsSelect.classList.toggle("hidden", (data.results || []).length === 0);
+                statusLine.textContent = "";
+            } catch (err) {
+                statusLine.textContent = "KEGG search failed - try again.";
+            } finally {
+                inFlight = false;
+            }
+        }, 350);
+    });
+
+    resultsSelect.addEventListener("change", () => {
+        if (resultsSelect.value === "") return;
+        const rec = resultsSelect._records[parseInt(resultsSelect.value, 10)];
+        STATE.ora.keggOrganismId = String(rec.context_id || "");
+        STATE.ora.keggOrganismName = String(rec.context_name || "");
+        render();
+    });
+
+    const resolveBtn = el("button", { class: "btn" }, STATE.ora.keggMapped ? "Re-resolve KEGG IDs" : "Resolve KEGG IDs");
+    resolveBtn.disabled = !STATE.ora.keggOrganismId;
+    resolveBtn.addEventListener("click", async () => {
+        resolveBtn.disabled = true;
+        const spinner = el("div", { class: "caption" }, "Resolving KEGG gene IDs…");
+        wrap.appendChild(spinner);
+        try {
+            const { job_id } = await apiPostJson("/api/ora/genes/resolve-kegg", { kegg_organism_code: STATE.ora.keggOrganismId });
+            pollJob(job_id, {
+                onDone: (result) => {
+                    STATE.ora.keggMapped = { n: result.n_kegg_mapped, organism: STATE.ora.keggOrganismName };
+                    STATE.ora.resolved = result;
+                    STATE.ora.ambiguousChoices = {};
+                    STATE.ora.finalTable = result.auto_final || null;
+                    render();
+                },
+                onError: (err) => { alert(err); render(); },
+            });
+        } catch (err) {
+            alert(err.message);
+            render();
+        }
+    });
+
+    wrap.appendChild(input);
+    wrap.appendChild(statusLine);
+    wrap.appendChild(resultsSelect);
+    wrap.appendChild(selectedCaption);
+    wrap.appendChild(resolveBtn);
+    if (STATE.ora.keggMapped) {
+        wrap.appendChild(el("div", { class: "caption" },
+            STATE.ora.keggMapped.n + " gene(s) matched to a KEGG gene ID in " + STATE.ora.keggMapped.organism + "."));
+    }
+    return wrap;
+}
+
+function renderGeneResults(showKeggSection) {
+    // showKeggSection: KEGG resolution is offered ONLY on the two screens
+    // that actually have a KEGG-matching database (Genomics ORA, Gene-set
+    // Burden Test) - Gene Function Annotation and Network Propagation share
+    // this same retrieval UI but have no KEGG database to use it with, so
+    // they must explicitly opt OUT (the default) rather than opt in, or the
+    // KEGG picker would silently leak onto screens where it does nothing.
     const wrap = el("div", {});
     const resolved = STATE.ora.resolved;
     wrap.appendChild(el("div", { class: "section-label" }, "Resolved genes"));
     wrap.appendChild(buildTable(resolved.resolved_table, {}));
-    wrap.appendChild(metricCards([
+    const metricCardList = [
         ["Resolved", resolved.metrics.resolved],
         ["Resolved (TrEMBL)", resolved.metrics.resolved_unreviewed],
         ["Resolved via NCBI", resolved.metrics.resolved_via_ncbi],
         ["User provided", resolved.metrics.user_provided],
         ["Not found", resolved.metrics.not_found],
-    ], 5));
+    ];
+    // Only shown after a KEGG resolve pass has actually run once (the metric
+    // key is absent from the plain UniProt-only resolve response).
+    if (typeof resolved.metrics.resolved_via_kegg !== "undefined") {
+        metricCardList.push(["Resolved via KEGG", resolved.metrics.resolved_via_kegg]);
+    }
+    wrap.appendChild(metricCards(metricCardList, metricCardList.length));
+
+    if (showKeggSection && STATE.ora.identifierType !== "sequence") wrap.appendChild(renderKeggIdSection());
 
     if (resolved.ambiguous && resolved.ambiguous.length > 0) {
         wrap.appendChild(el("div", { class: "section-label" }, "Ambiguous genes"));
@@ -7745,7 +7893,11 @@ function renderGeneResults() {
         const dlBtn = el("button", { class: "btn" }, "Download resolved genes table");
         dlBtn.addEventListener("click", () => downloadFile("/api/ora/download/genes.csv", "genes_resolved.csv"));
         wrap.appendChild(dlBtn);
-        wrap.appendChild(renderContinueToAnalysisButton());
+        // renderContinueToAnalysisButton returns null when its gate isn't met
+        // yet (e.g. Burden Test's score column not chosen) - appendChild(null)
+        // throws, so it must be guarded, never passed straight through.
+        const continueBtn1 = renderContinueToAnalysisButton();
+        if (continueBtn1) wrap.appendChild(continueBtn1);
     }
 
     return wrap;
@@ -7756,6 +7908,10 @@ function renderContinueToAnalysisButton() {
     // (a confirmed UniProt ID list), regardless of whether it came from Gene
     // Symbol, Ensembl, or BLAST resolution. Routes to whichever analysis
     // (ORA or Gene-set Burden Test) the active genomics module is.
+    // Returns null ONLY when there is nothing at all to say yet (no confirmed
+    // table) - once a table exists, every other gate below returns an
+    // explanatory caption instead of null, so "nothing rendered" never
+    // silently reads as "the option disappeared."
     if (!STATE.ora.finalTable || !STATE.ora.finalTable.rows.length) return null;
     const module = STATE.genomicsModuleName;
     const isBurden = module === "Gene-set Burden Test";
@@ -7763,7 +7919,10 @@ function renderContinueToAnalysisButton() {
     const isAnnotation = module === "Gene Function Annotation";
     // Burden requires a confirmed score column; netprop's and annotation's
     // scores/params are optional/have defaults, so neither needs such a gate.
-    if (isBurden && !STATE.ora.scoreSummary) return null;
+    if (isBurden && !STATE.ora.scoreSummary) {
+        return el("div", { class: "caption", style: { marginTop: "0.8rem", fontWeight: "700" } },
+            "Set a variant score column above (\"Set score column\") before continuing to analysis.");
+    }
     const pageByModule = isBurden ? "genomics_burden_config"
         : isNetprop ? "genomics_netprop_config"
         : isAnnotation ? "genomics_annotation_config"
@@ -7923,7 +8082,8 @@ function renderBlastResults() {
         const dlConfirmedBtn = el("button", { class: "btn" }, "Download confirmed selection");
         dlConfirmedBtn.addEventListener("click", () => downloadFile("/api/ora/download/blast_confirmed.csv", "sequences_blast_confirmed.csv"));
         wrap.appendChild(dlConfirmedBtn);
-        wrap.appendChild(renderContinueToAnalysisButton());
+        const continueBtn2 = renderContinueToAnalysisButton();
+        if (continueBtn2) wrap.appendChild(continueBtn2);
     }
 
     return wrap;
@@ -7970,7 +8130,7 @@ function renderGenomicsOraScreen() {
 
     if (STATE.ora.resolved) {
         if (STATE.ora.identifierType === "sequence") wrap.appendChild(renderBlastResults());
-        else wrap.appendChild(renderGeneResults());
+        else wrap.appendChild(renderGeneResults(true));
     }
 
     wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
@@ -8020,7 +8180,7 @@ function renderGenomicsBurdenScreen() {
     wrap.appendChild(renderGeneResolveControls());
 
     if (STATE.ora.resolved) {
-        wrap.appendChild(renderGeneResults());
+        wrap.appendChild(renderGeneResults(true));
     }
 
     wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
@@ -8241,7 +8401,8 @@ function renderAnnotationSingleGeneSection() {
             ? "Using UniProt accession " + res.uniprot_id + " directly (resolution skipped)."
             : "Resolved to UniProt accession " + res.uniprot_id + ".";
         wrap.appendChild(alertBox("info", msg));
-        wrap.appendChild(renderContinueToAnalysisButton());
+        const continueBtn3 = renderContinueToAnalysisButton();
+        if (continueBtn3) wrap.appendChild(continueBtn3);
     }
 
     return wrap;
@@ -8788,8 +8949,8 @@ function renderOraConfigPanel(panel) {
             block.appendChild(ieaRow);
         }
 
-        // Custom background upload - GO/Reactome only (accession space).
-        if (dbName === "GO" || dbName === "Reactome") {
+        // Custom background upload - GO/Reactome/KEGG only (accession space).
+        if (dbName === "GO" || dbName === "Reactome" || dbName === "KEGG") {
             block.appendChild(renderOraBackgroundWidget(dbName, locked));
         }
 
@@ -9223,17 +9384,31 @@ function renderOraSpeciesSearchWidget(dbName, locked, panel, configRoot) {
     const dbCfg = configRoot.perDatabase[dbName] || { taxonId: "", taxonName: "" };
     configRoot.perDatabase[dbName] = dbCfg;
 
-    const input = el("input", { class: "text-input ora-species-input", type: "text", placeholder: dbName + " species (name or UniProt taxon ID)" });
+    // KEGG identifies organisms by its own organism code (e.g. "hsa"), not a
+    // UniProt/NCBI taxon ID, so it searches a different backend database and
+    // gets its own placeholder/caption wording; everything else about this
+    // widget (debounce, dropdown, caption pattern) is shared unchanged.
+    const isKegg = dbName === "KEGG";
+    const searchDb = isKegg ? "KEGG" : "Rhea + UniProt";
+
+    const input = el("input", {
+        class: "text-input ora-species-input", type: "text",
+        placeholder: isKegg ? dbName + " organism (name or KEGG organism code)" : dbName + " species (name or UniProt taxon ID)",
+    });
     input.disabled = locked;
     const resultsSelect = el("select", { class: "hidden ora-species-select" });
     const selectedCaption = el("div", { class: "caption ora-selected-caption" });
+    const statusLine = el("div", { class: "caption ora-species-status" });
 
     function refreshCaption() {
-        selectedCaption.textContent = dbCfg.taxonId ? "Selected: " + dbCfg.taxonName + " (taxon " + dbCfg.taxonId + ")" : "";
+        selectedCaption.textContent = dbCfg.taxonId
+            ? "Selected: " + dbCfg.taxonName + (isKegg ? " (KEGG organism " : " (taxon ") + dbCfg.taxonId + ")"
+            : "";
     }
     refreshCaption();
 
     let lastQuery = "";
+    let inFlight = false;
     let timer = null;
     input.addEventListener("input", () => {
         const query = input.value.trim();
@@ -9241,13 +9416,22 @@ function renderOraSpeciesSearchWidget(dbName, locked, panel, configRoot) {
         if (query.length < 3) {
             resultsSelect.innerHTML = "";
             resultsSelect.classList.add("hidden");
+            statusLine.textContent = "";
             return;
         }
         timer = setTimeout(async () => {
-            if (query === lastQuery) return;
+            if (query === lastQuery || inFlight) return;
             lastQuery = query;
+            inFlight = true;
+            // KEGG's organism list has no fast REST source (verified live: its
+            // own list/organism endpoint 400s), so the FIRST search per server
+            // process falls back to scraping KEGG's full HTML organism table -
+            // still a few seconds even after that fallback. Without this status
+            // line the box looks dead for that whole stretch, since the prior
+            // dropdown contents are otherwise left untouched during the wait.
+            if (isKegg) statusLine.textContent = "Searching KEGG organisms…";
             try {
-                const data = await apiJson("/api/contexts/search?database=" + encodeURIComponent("Rhea + UniProt") + "&query=" + encodeURIComponent(query) + "&limit=10");
+                const data = await apiJson("/api/contexts/search?database=" + encodeURIComponent(searchDb) + "&query=" + encodeURIComponent(query) + "&limit=10");
                 resultsSelect.innerHTML = "";
                 resultsSelect.appendChild(el("option", { value: "" }, "Select organism"));
                 (data.results || []).forEach((rec, idx) => {
@@ -9256,7 +9440,13 @@ function renderOraSpeciesSearchWidget(dbName, locked, panel, configRoot) {
                 });
                 resultsSelect._records = data.results || [];
                 resultsSelect.classList.toggle("hidden", (data.results || []).length === 0);
-            } catch (err) { /* keep prior dropdown contents on transient search errors */ }
+                statusLine.textContent = "";
+            } catch (err) {
+                // keep prior dropdown contents on transient search errors
+                if (isKegg) statusLine.textContent = "KEGG search failed - try again.";
+            } finally {
+                inFlight = false;
+            }
         }, 350);
     });
 
@@ -9272,6 +9462,7 @@ function renderOraSpeciesSearchWidget(dbName, locked, panel, configRoot) {
     });
 
     wrap.appendChild(input);
+    wrap.appendChild(statusLine);
     wrap.appendChild(resultsSelect);
     wrap.appendChild(selectedCaption);
     return wrap;
@@ -9298,11 +9489,11 @@ function startOraAnalysisRun() {
                 min_term_size: minTs,
                 max_term_size: maxTs,
             };
-            // GO/Reactome only: flag whether the background checkbox is on AND a
-            // file was actually uploaded, so the server keeps it (and prunes it
+            // GO/Reactome/KEGG only: flag whether the background checkbox is on AND
+            // a file was actually uploaded, so the server keeps it (and prunes it
             // otherwise on this run) - unchecking disables a background even if
             // one is still stored locally from a previous upload.
-            if (db === "GO" || db === "Reactome") {
+            if (db === "GO" || db === "Reactome" || db === "KEGG") {
                 perDbApi[db].has_background = !!(cfg.useBackground && cfg.backgroundSummary);
             }
         }

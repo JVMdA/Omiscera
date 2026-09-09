@@ -32,15 +32,31 @@ PUBCHEM_TEXT_SEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch
 PUBCHEM_CID_PROPERTIES_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/property/MolecularFormula,CanonicalSMILES,IsomericSMILES,InChIKey/JSON"
 PUBCHEM_CID_SYNONYMS_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/synonyms/JSON"
 PUBCHEM_PUGVIEW_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/{cid}/JSON"
+# PubChem's "substance" (SID) namespace is DIFFERENT from its "compound" (CID)
+# namespace - the two number lines overlap but refer to unrelated entities.
+# Needed because KEGG's own DBLINKS "PubChem:" value is an SID, not a CID (a
+# legacy KEGG-NIH submission quirk, confirmed live 2026-08-26: KEGG C00031
+# (D-glucose) reports "PubChem: 3333", which is SID 3333 - resolving it via
+# THIS endpoint correctly gives CID 5793 (real D-glucose), while treating
+# 3333 as a CID directly would silently point at an unrelated drug molecule.
+PUBCHEM_SID_TO_CID_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/substance/sid/{sid}/cids/TXT"
+KEGG_FIND_COMPOUND_URL = "https://rest.kegg.jp/find/compound/{encoded_name}"
+KEGG_GET_COMPOUND_URL = "https://rest.kegg.jp/get/{kegg_id}"
+# KEGG's documented per-request cap on the "get" endpoint - used to batch
+# reaction-equation fetches in database_catalog.py rather than one call per
+# reaction (a compound's Role column can otherwise need ~10x as many calls).
+KEGG_GET_BATCH_SIZE = 10
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 PUBCHEM_CACHE_PATH = os.path.join(CACHE_DIR, "pubchem_cache.csv")
+KEGG_CACHE_PATH = os.path.join(CACHE_DIR, "kegg_cache.csv")
 PUBCHEM_SYNONYMS_CACHE_PATH = os.path.join(CACHE_DIR, "pubchem_synonyms_cache.csv")
 HMDB_CACHE_PATH = os.path.join(CACHE_DIR, "hmdb_pubchem_cache.csv")
 FINAL_RESULT_CACHE_PATH = os.path.join(CACHE_DIR, "final_result_cache.csv")
 
 PUBCHEM_CACHE = {}
+KEGG_CACHE = {}
 PUBCHEM_SYNONYMS_CACHE = {}
 HMDB_CACHE = {}
 FINAL_RESULT_CACHE = {}
@@ -51,6 +67,7 @@ RUNTIME_DIAGNOSTICS = {
     "api_cache_hits": 0,
     "online_requests": 0,
     "pubchem_online_requests": 0,
+    "kegg_online_requests": 0,
     "cache_misses": 0,
     "retry_count": 0,
     "total_sleep_time": 0.0,
@@ -60,6 +77,7 @@ RUNTIME_DIAGNOSTICS = {
 HTTP_SESSION = requests.Session() if requests is not None else None
 OUTPUT_COLUMNS = [
     "Name",
+    "KEGG ID",
     "PubChem ID",
     "SMILES",
     "InChIKey",
@@ -85,6 +103,15 @@ def ensure_cache_loaded():
                 "PubChem ID": row.get("PubChem ID", ""),
                 "SMILES": row.get("SMILES", ""),
                 "InChIKey": row.get("InChIKey", ""),
+                "Formula": row.get("Formula", ""),
+            }
+
+    if os.path.exists(KEGG_CACHE_PATH):
+        df = pd.read_csv(KEGG_CACHE_PATH, dtype=str).fillna("")
+        for _, row in df.iterrows():
+            cache_key = (row.get("CacheType", ""), row.get("CacheKey", ""))
+            KEGG_CACHE[cache_key] = {
+                "KEGG ID": row.get("KEGG ID", ""),
                 "Formula": row.get("Formula", ""),
             }
 
@@ -131,6 +158,7 @@ def print_runtime_diagnostics(total_runtime: float = 0.0):
         "api_cache_hits",
         "online_requests",
         "pubchem_online_requests",
+        "kegg_online_requests",
         "cache_misses",
         "retry_count",
         "total_sleep_time",
@@ -155,6 +183,19 @@ def save_pubchem_cache():
         })
     pd.DataFrame(rows).to_csv(PUBCHEM_CACHE_PATH, index=False)
 
+
+def save_kegg_cache():
+    """Persist KEGG cache to disk."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    rows = []
+    for (cache_type, cache_key), data in KEGG_CACHE.items():
+        rows.append({
+            "CacheType": cache_type,
+            "CacheKey": cache_key,
+            "KEGG ID": data.get("KEGG ID", ""),
+            "Formula": data.get("Formula", ""),
+        })
+    pd.DataFrame(rows).to_csv(KEGG_CACHE_PATH, index=False)
 
 
 def save_pubchem_synonyms_cache():
@@ -197,7 +238,7 @@ def make_final_result_cache_key(name, row=None) -> str:
         return base_key
 
     identifier_parts = []
-    for column in ["PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula"]:
+    for column in ["KEGG ID", "PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula"]:
         if column == "SMILES":
             value = clean_smiles_text(row.get(column, ""))
         elif column == "Formula":
@@ -247,7 +288,7 @@ def set_final_result_cache(name, data: dict, row=None, user_fields: dict = None)
 
     user_fields = user_fields or {}
     retrieved = {}
-    for column in ("PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula"):
+    for column in ("KEGG ID", "PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula"):
         if column == "HMDB ID":
             value = normalize_hmdb_ids(data.get(column, ""))
             user_value = normalize_hmdb_ids(user_fields.get(column, ""))
@@ -263,6 +304,7 @@ def set_final_result_cache(name, data: dict, row=None, user_fields: dict = None)
 
     FINAL_RESULT_CACHE[cache_key] = {
         "Name": name,
+        "KEGG ID": retrieved.get("KEGG ID", ""),
         "PubChem ID": retrieved.get("PubChem ID", ""),
         "SMILES": retrieved.get("SMILES", ""),
         "InChIKey": retrieved.get("InChIKey", ""),
@@ -295,6 +337,26 @@ def set_pubchem_cache(cache_type: str, cache_key: str, data: dict):
 
 
 
+def get_kegg_cache(cache_type: str, cache_key: str) -> dict:
+    ensure_cache_loaded()
+    cached = KEGG_CACHE.get((cache_type, cache_key), {})
+    if cached:
+        RUNTIME_DIAGNOSTICS["api_cache_hits"] += 1
+    else:
+        RUNTIME_DIAGNOSTICS["cache_misses"] += 1
+    return cached
+
+
+def set_kegg_cache(cache_type: str, cache_key: str, data: dict):
+    if not data or not data.get("KEGG ID"):
+        return
+    ensure_cache_loaded()
+    KEGG_CACHE[(cache_type, cache_key)] = {
+        "KEGG ID": data.get("KEGG ID", ""),
+        "Formula": data.get("formula", data.get("Formula", "")),
+    }
+
+
 def safe_http_request(
     url: str,
     timeout: int = 15,
@@ -313,6 +375,8 @@ def safe_http_request(
         database_lower = str(database).lower()
         if "pubchem" in database_lower:
             RUNTIME_DIAGNOSTICS["pubchem_online_requests"] += 1
+        elif "kegg" in database_lower:
+            RUNTIME_DIAGNOSTICS["kegg_online_requests"] += 1
 
         try:
             if HTTP_SESSION is not None:
@@ -409,6 +473,8 @@ def load_input_table(path: str, verbose: bool = False) -> pd.DataFrame:
 
         if lower == "name":
             rename_map[column] = "Name"
+        elif lower in ("keggid", "kegg"):
+            rename_map[column] = "KEGG ID"
         elif lower in ("pubchemid", "pubchem"):
             rename_map[column] = "PubChem ID"
         elif lower == "smiles":
@@ -446,11 +512,11 @@ def load_input_table(path: str, verbose: bool = False) -> pd.DataFrame:
         raise ValueError("Input table 'Name' column is empty for all rows.")
 
     # Ensure all expected columns are present
-    for col in ["Name", "PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula"]:
+    for col in ["Name", "KEGG ID", "PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula"]:
         if col not in df.columns:
             df[col] = ""
 
-    for col in ["PubChem ID", "InChIKey", "Formula"]:
+    for col in ["KEGG ID", "PubChem ID", "InChIKey", "Formula"]:
         df[col] = df[col].apply(clean_identifier)
 
     df["HMDB ID"] = df["HMDB ID"].apply(normalize_hmdb_ids)
@@ -562,6 +628,7 @@ def get_user_provided_fields(row: pd.Series, input_name: str) -> dict:
     """Read and normalize user-provided fields from the current input row."""
     return {
         "Name": input_name,
+        "KEGG ID": clean_identifier(row.get("KEGG ID", "")),
         "PubChem ID": clean_identifier(row.get("PubChem ID", "")),
         "SMILES": clean_smiles_text(row.get("SMILES", "")),
         "InChIKey": clean_identifier(row.get("InChIKey", "")),
@@ -571,12 +638,22 @@ def get_user_provided_fields(row: pd.Series, input_name: str) -> dict:
 
 
 def calculate_mapping_status(result: dict) -> str:
-    """Calculate Mapping_status from the final merged identifier set."""
+    """Calculate Mapping_status from the final merged identifier set.
+
+    "mapped" requires KEGG alongside the four identifiers already required
+    (PubChem + SMILES + InChIKey + HMDB) - a deliberate change from before
+    KEGG was re-added, when HMDB alone filled this slot. This does NOT
+    exclude anything from the analysis (API.py passes both "mapped" and
+    "partial" rows through to stage 2) - it only changes which label and
+    which displayed count a compound gets.
+    """
+    has_kegg = bool(cell_to_text(result.get("KEGG ID", "")))
     has_pubchem = bool(cell_to_text(result.get("PubChem ID", "")))
     has_smiles = bool(cell_to_text(result.get("SMILES", "")))
     has_inchikey = bool(cell_to_text(result.get("InChIKey", "")))
     has_hmdb = bool(cell_to_text(result.get("HMDB ID", "")))
     useful_identifiers = [
+        has_kegg,
         has_pubchem,
         has_smiles,
         has_inchikey,
@@ -584,7 +661,7 @@ def calculate_mapping_status(result: dict) -> str:
         bool(cell_to_text(result.get("Formula", ""))),
     ]
 
-    if has_pubchem and has_smiles and has_inchikey and has_hmdb:
+    if has_kegg and has_pubchem and has_smiles and has_inchikey and has_hmdb:
         return "mapped"
     if any(useful_identifiers):
         return "partial"
@@ -596,7 +673,7 @@ def merge_cached_result_with_user_fields(cached_result: dict, user_fields: dict,
     merged = {col: "" for col in OUTPUT_COLUMNS}
     merged["Name"] = user_fields.get("Name", cached_result.get("Name", ""))
 
-    for field in ["PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula"]:
+    for field in ["KEGG ID", "PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula"]:
         if field == "HMDB ID":
             user_value = normalize_hmdb_ids(user_fields.get(field, ""))
             cached_value = normalize_hmdb_ids(cached_result.get(field, ""))
@@ -1134,6 +1211,190 @@ def get_pubchem_data_by_cid(cid: str, verbose: bool = False) -> dict:
     return result
 
 
+def parse_kegg_get(text: str) -> dict:
+    """Parse the raw KEGG get response for basic fields.
+
+    Returns a dict with keys: KEGG ID, name, formula, pubchem_sid. The
+    DBLINKS "PubChem:" value KEGG reports is a Substance ID (SID), not a
+    Compound ID - see PUBCHEM_SID_TO_CID_URL's comment for why that
+    distinction matters.
+    """
+    result = {"KEGG ID": "", "name": "", "formula": "", "pubchem_sid": ""}
+    names = []
+    in_dblinks = False
+
+    for line in text.splitlines():
+        if line.startswith("ENTRY"):
+            parts = line.split()
+            if len(parts) >= 2:
+                result["KEGG ID"] = parts[1].strip()
+            in_dblinks = False
+        elif line.startswith("NAME"):
+            name_line = line[4:].strip()
+            names.append(name_line)
+            in_dblinks = False
+        elif line.startswith("FORMULA"):
+            result["formula"] = line[7:].strip()
+            in_dblinks = False
+        elif line.startswith("DBLINKS"):
+            in_dblinks = True
+            rest = line[7:].strip()
+            if rest.startswith("PubChem:"):
+                result["pubchem_sid"] = rest.split(":", 1)[1].strip()
+        elif line.startswith("///"):
+            break
+        elif line.startswith(" "):
+            # continuation line - only DBLINKS continuations matter here,
+            # everything else (NAME wraps, pathway/enzyme blocks, ...) is
+            # outside what this parser reports.
+            cont = line.strip()
+            if in_dblinks and cont.startswith("PubChem:"):
+                result["pubchem_sid"] = cont.split(":", 1)[1].strip()
+            elif names and not in_dblinks:
+                names[-1] += " " + cont
+        else:
+            in_dblinks = False
+
+    if names:
+        result["name"] = "; ".join(names)
+
+    return result
+
+
+def validate_kegg_id(kegg_id: str, verbose: bool = False) -> dict:
+    """Validate a KEGG ID and extract basic info (name, formula, PubChem SID)."""
+    if not kegg_id or not str(kegg_id).strip():
+        return {}
+
+    kegg_id_text = str(kegg_id).strip()
+    cached = get_kegg_cache("id", kegg_id_text)
+    if cached.get("KEGG ID"):
+        return {
+            "KEGG ID": cached.get("KEGG ID", kegg_id_text),
+            "name": "",
+            "formula": cached.get("Formula", ""),
+            "pubchem_sid": "",
+        }
+
+    url = KEGG_GET_COMPOUND_URL.format(kegg_id=urllib.parse.quote(kegg_id_text))
+    text, success = safe_http_request(url, timeout=20, verbose=verbose, database="KEGG id", query=kegg_id_text)
+    if not success or not text or "ENTRY" not in text:
+        return {}
+
+    parsed = parse_kegg_get(text)
+    if not parsed.get("KEGG ID"):
+        parsed["KEGG ID"] = kegg_id_text
+    set_kegg_cache("id", kegg_id_text, parsed)
+    return parsed
+
+
+def get_pubchem_cid_from_kegg_sid(sid: str, verbose: bool = False) -> str:
+    """Resolve a PubChem Substance ID (as reported in a KEGG DBLINKS line)
+    to its associated Compound ID, via PubChem's substance->CID endpoint.
+
+    Must never be skipped in favour of treating the SID as if it were a
+    CID directly - the two ID spaces overlap numerically but refer to
+    unrelated entities (verified live 2026-08-26: KEGG C00031/D-glucose
+    reports "PubChem: 3333"; SID 3333 correctly resolves here to CID 5793,
+    the real D-glucose CID, while CID 3333 taken literally is an unrelated
+    dihydropyridine drug).
+    """
+    sid_text = clean_identifier(sid)
+    if not sid_text or not sid_text.isdigit():
+        return ""
+
+    cached = get_pubchem_cache("kegg_sid_to_cid", sid_text)
+    if cached.get("PubChem ID"):
+        return cached.get("PubChem ID", "")
+
+    url = PUBCHEM_SID_TO_CID_URL.format(sid=sid_text)
+    text, success = safe_http_request(url, timeout=20, verbose=verbose, database="PubChem SID", query=sid_text)
+    if not success or not text:
+        return ""
+
+    cid = parse_first_cid(text)
+    if cid:
+        set_pubchem_cache("kegg_sid_to_cid", sid_text, {"PubChem ID": cid})
+    return cid
+
+
+def search_kegg_compound_by_name(name: str, resolved_pubchem_id: str = "", verbose: bool = False) -> dict:
+    """Search KEGG compound entries by name and return a verified match.
+
+    Every name-matched candidate is checked against `resolved_pubchem_id`
+    (this row's own already-resolved PubChem CID, if any) via KEGG's own
+    DBLINKS PubChem cross-reference - see get_pubchem_cid_from_kegg_sid for
+    why that check requires an SID->CID resolution step rather than a
+    direct comparison. This is what protects against KEGG's name search
+    matching a similarly-named but structurally different compound.
+
+    Falls back to the single best unverified name match only when nothing
+    could be structurally verified (e.g. no PubChem CID was resolved for
+    this compound at all, or the matched KEGG entry has no PubChem DBLINK).
+    """
+    if not name or not name.strip():
+        return {}
+
+    query_name = clean_query_name(name)
+    query_key = query_name.lower()
+    cached = get_kegg_cache("name", query_key)
+    if cached.get("KEGG ID"):
+        return {"KEGG ID": cached.get("KEGG ID", ""), "name": ""}
+
+    encoded_name = urllib.parse.quote(query_name, safe="")
+    if verbose and "/" in query_name:
+        print(f"Original query: {query_name}")
+        print(f"Encoded query: {encoded_name}")
+    url = KEGG_FIND_COMPOUND_URL.format(encoded_name=encoded_name)
+    text, success = safe_http_request(url, timeout=20, verbose=verbose, database="KEGG name", query=query_key)
+    if not success or not text:
+        return {}
+
+    candidates = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "	" not in line:
+            continue
+        parts = line.split("	", 1)
+        if len(parts) == 2:
+            candidates.append({"KEGG ID": parts[0].strip(), "name": parts[1].strip()})
+
+    if not candidates:
+        return {}
+
+    # Exact-name candidates first (by normalized string), same ranking the
+    # unverified fallback below uses - but here we may check several.
+    query_norm = normalize_query_string(query_name)
+    exact_candidates = []
+    for candidate in candidates:
+        candidate_names = [n.strip() for n in candidate["name"].split(";") if n.strip()]
+        if any(normalize_query_string(n) == query_norm for n in candidate_names):
+            exact_candidates.append(candidate)
+    ranked = exact_candidates or candidates
+
+    resolved_pubchem_id_text = clean_identifier(resolved_pubchem_id)
+    if resolved_pubchem_id_text:
+        for candidate in ranked:
+            info = validate_kegg_id(candidate["KEGG ID"], verbose=verbose)
+            sid = info.get("pubchem_sid", "")
+            if not sid:
+                continue
+            candidate_cid = get_pubchem_cid_from_kegg_sid(sid, verbose=verbose)
+            if candidate_cid and candidate_cid == resolved_pubchem_id_text:
+                result = {"KEGG ID": candidate["KEGG ID"], "name": candidate["name"]}
+                set_kegg_cache("name", query_key, result)
+                if verbose:
+                    print(f"KEGG match verified via PubChem CID {candidate_cid}: {candidate['KEGG ID']}")
+                return result
+
+    # Nothing could be structurally verified - fall back to the best
+    # unverified name match (ranked[0]), matching the original behaviour.
+    best = ranked[0]
+    result = {"KEGG ID": best["KEGG ID"], "name": best["name"]}
+    set_kegg_cache("name", query_key, result)
+    return result
+
+
 def resolve_compound(row: pd.Series, verbose: bool = False) -> dict:
     """Resolve a single compound row and return the mapped result.
 
@@ -1141,7 +1402,11 @@ def resolve_compound(row: pd.Series, verbose: bool = False) -> dict:
     1. Preserve user-provided identifiers
     2. Use PubChem identifiers to recover missing PubChem fields
     3. Search PubChem by name only for missing IDs
-    4. Determine mapping_status after all recovery attempts
+    4. If no KEGG ID was provided, search KEGG by name, VERIFIED against the
+       PubChem CID already resolved in step 2/3 (see
+       search_kegg_compound_by_name) - this runs after PubChem resolution
+       precisely because it needs a resolved CID to verify against.
+    5. Determine mapping_status after all recovery attempts
     """
     global CURRENT_ROW_REQUEST_FAILED
     CURRENT_ROW_REQUEST_FAILED = False
@@ -1180,11 +1445,26 @@ def resolve_compound(row: pd.Series, verbose: bool = False) -> dict:
     synonyms = get_query_names(input_name)
 
     # Read existing input identifiers - preserve these
+    kegg_id = user_fields["KEGG ID"] or legacy_cached_result.get("KEGG ID", "")
     pubchem_id = user_fields["PubChem ID"] or legacy_cached_result.get("PubChem ID", "")
     smiles = user_fields["SMILES"] or legacy_cached_result.get("SMILES", "")
     inchikey = user_fields["InChIKey"] or legacy_cached_result.get("InChIKey", "")
     hmdb_id = user_fields["HMDB ID"] or legacy_cached_result.get("HMDB ID", "")
     formula = user_fields["Formula"] or legacy_cached_result.get("Formula", "")
+
+    # Step 0 (KEGG): if a KEGG ID was provided, validate it (backfills
+    # Formula if still missing) and, if PubChem is still empty, try to
+    # recover a PubChem CID from the KEGG entry's own name - the same
+    # KEGG-name-seed-to-PubChem enrichment the pre-removal tool did.
+    if kegg_id:
+        kegg_info = validate_kegg_id(kegg_id, verbose=verbose)
+        formula = keep_user_value_or_fill(formula, kegg_info.get("formula", ""), "Formula", "KEGG ID", input_name, verbose)
+        if not pubchem_id and kegg_info.get("name"):
+            kegg_name_seed = kegg_info["name"].split(";")[0].strip()
+            if kegg_name_seed:
+                pubchem_id = get_pubchem_cid_by_name(kegg_name_seed, verbose=verbose)
+                if verbose and pubchem_id:
+                    print(f"PubChem match source: KEGG ID name ({pubchem_id})")
 
     # Step 1: If PubChem ID is provided, fetch missing properties
     if pubchem_id:
@@ -1236,8 +1516,23 @@ def resolve_compound(row: pd.Series, verbose: bool = False) -> dict:
         hmdb_id = get_hmdb_ids_by_pubchem_cid(pubchem_id, verbose=verbose)
     hmdb_id = normalize_hmdb_ids(hmdb_id)
 
+    # Step 7 (KEGG): search by name/synonym only if no KEGG ID exists yet.
+    # Runs here, AFTER PubChem resolution, specifically so pubchem_id is
+    # available to verify each name-matched KEGG candidate against (see
+    # search_kegg_compound_by_name's docstring for why that matters).
+    if not kegg_id and synonyms:
+        for synonym in synonyms:
+            kegg_match = search_kegg_compound_by_name(synonym, resolved_pubchem_id=pubchem_id, verbose=verbose)
+            if kegg_match.get("KEGG ID"):
+                kegg_id = kegg_match["KEGG ID"]
+                if not formula:
+                    kegg_info = validate_kegg_id(kegg_id, verbose=verbose)
+                    formula = keep_user_value_or_fill(formula, kegg_info.get("formula", ""), "Formula", "KEGG ID", input_name, verbose)
+                break
+
     resolved = {
         "Name": input_name,
+        "KEGG ID": kegg_id,
         "PubChem ID": pubchem_id,
         "SMILES": smiles,
         "InChIKey": inchikey,
@@ -1268,19 +1563,25 @@ def resolve_compound_table(df: pd.DataFrame, verbose: bool = False) -> pd.DataFr
         try:
             resolved = resolve_compound(row, verbose=verbose)
         except Exception as exc:
+            fallback_kegg = clean_identifier(row.get("KEGG ID", ""))
             fallback_pubchem = clean_identifier(row.get("PubChem ID", ""))
             fallback_smiles = clean_smiles_text(row.get("SMILES", ""))
             fallback_inchikey = clean_identifier(row.get("InChIKey", ""))
             fallback_hmdb = normalize_hmdb_ids(row.get("HMDB ID", ""))
             fallback_formula = clean_identifier(row.get("Formula", ""))
-            if fallback_pubchem and fallback_smiles and fallback_inchikey:
+            # fallback_status is recomputed unconditionally by
+            # calculate_mapping_status() below regardless of this value, so
+            # this is just for readability of what a raw-passthrough row
+            # looks like before that normalization runs.
+            if fallback_kegg and fallback_pubchem and fallback_smiles and fallback_inchikey:
                 fallback_status = "mapped"
-            elif any([fallback_pubchem, fallback_smiles, fallback_inchikey, fallback_hmdb, fallback_formula]):
+            elif any([fallback_kegg, fallback_pubchem, fallback_smiles, fallback_inchikey, fallback_hmdb, fallback_formula]):
                 fallback_status = "partial"
             else:
                 fallback_status = "not_found"
             resolved = {
                 "Name": input_name,
+                "KEGG ID": fallback_kegg,
                 "PubChem ID": fallback_pubchem,
                 "SMILES": fallback_smiles,
                 "InChIKey": fallback_inchikey,
@@ -1299,6 +1600,7 @@ def resolve_compound_table(df: pd.DataFrame, verbose: bool = False) -> pd.DataFr
 
     output_df = pd.DataFrame(output_rows, columns=OUTPUT_COLUMNS)
     save_pubchem_cache()
+    save_kegg_cache()
     save_pubchem_synonyms_cache()
     save_hmdb_cache()
     save_final_result_cache()

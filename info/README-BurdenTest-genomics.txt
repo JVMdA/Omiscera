@@ -22,7 +22,9 @@ pathway's score distribution against the rest of the scored genes — is the
 same one used by established gene-set tools such as CAMERA and MAGMA.
 
 It runs against the same curated knowledge bases available elsewhere in
-Genomics: Gene Ontology and Reactome, or your own uploaded gene-set database.
+Genomics: Gene Ontology, Reactome and KEGG PATHWAY, or your own uploaded
+gene-set database. (GWAS Catalog is not offered here — it is symbol-native
+and an unconventional unit for a burden test.)
 
 USER INPUT
 -------------
@@ -81,10 +83,35 @@ MULTIPLE-TESTING CORRECTION
 -------------------------------
 Because many pathways are tested at once, some will look "significant"
 purely by chance. Benjamini-Hochberg FDR correction is applied separately
-within each database (GO:BP, GO:MF, GO:CC, Reactome, or your custom
+within each database (GO:BP, GO:MF, GO:CC, Reactome, KEGG, or your custom
 database each get their own correction). A Bonferroni option is also
 available for a stricter, more conservative threshold. Significance
 defaults to FDR < 0.05, adjustable per database.
+
+KEGG identifies organisms by its own organism code (e.g. "hsa"), a separate
+choice from the UniProt organism above, made during retrieval rather than
+here — see "USING KEGG" below. KEGG's coverage of non-model organisms is
+usually the best of the three databases here, the same reason it is offered
+in Metabolic Connection and Genomics ORA.
+
+USING KEGG
+--------------
+KEGG tests in its own gene-ID space, not UniProt accession space (an earlier
+version matched via UniProt and inflated term sizes wherever a gene had more
+than one UniProt entry, and could never reach genes with no UniProt
+cross-reference — worst for non-model organisms). To use it: resolve your
+genes normally first, then use the "Resolve KEGG gene IDs" box that appears
+on the retrieval screen — pick a KEGG organism and click "Resolve KEGG gene
+IDs." This is optional; skip it if you are not using KEGG here.
+
+This step can also rescue genes that came back "ambiguous" under UniProt
+alone — common for non-model organisms, which usually have no UniProt
+reference proteome to break a tie between candidates. If KEGG's own data
+identifies the gene uniquely, it is resolved (shown as "Resolved via KEGG")
+and its score becomes usable everywhere, not only for KEGG. KEGG never
+guesses: a gene stays ambiguous if more than one candidate remains plausible
+even with KEGG's help. Results still show your own gene symbol or Ensembl ID
+in the "Genes" column, never a raw KEGG gene ID.
 
 TERM-SIZE FILTERING
 -----------------------
@@ -156,3 +183,5 @@ THINGS TO KEEP IN MIND
     causality.
   - Double-check your score direction setting (see above) if a result looks
     backwards — it is by far the most common cause.
+  - KEGG's REST API and academic use — see README-ORA-genomics.txt; the same
+    points apply here unchanged.
