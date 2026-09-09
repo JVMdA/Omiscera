@@ -9384,16 +9384,30 @@ function renderOraSpeciesSearchWidget(dbName, locked, panel, configRoot) {
     const dbCfg = configRoot.perDatabase[dbName] || { taxonId: "", taxonName: "" };
     configRoot.perDatabase[dbName] = dbCfg;
 
-    // KEGG identifies organisms by its own organism code (e.g. "hsa"), not a
-    // UniProt/NCBI taxon ID, so it searches a different backend database and
-    // gets its own placeholder/caption wording; everything else about this
-    // widget (debounce, dropdown, caption pattern) is shared unchanged.
-    const isKegg = dbName === "KEGG";
-    const searchDb = isKegg ? "KEGG" : "Rhea + UniProt";
+    // KEGG's organism is chosen ONCE, at retrieval time (the "Resolve KEGG
+    // gene IDs" step, STATE.ora.keggOrganismId) - NOT here. A second,
+    // independent KEGG organism picker used to live in this widget and could
+    // silently diverge from the organism the gene IDs were actually resolved
+    // against (e.g. genes resolved for "hsa" but this picker set to "mmu"),
+    // producing an EMPTY KEGG result with no warning, since the two ID spaces
+    // never intersect. Sync from the retrieval-stage choice instead of
+    // asking a second time, so there is only one place this can be set.
+    if (dbName === "KEGG") {
+        dbCfg.taxonId = STATE.ora.keggOrganismId || "";
+        dbCfg.taxonName = STATE.ora.keggOrganismName || "";
+        if (dbCfg.taxonId) {
+            wrap.appendChild(el("div", { class: "caption ora-selected-caption" },
+                "Organism: " + dbCfg.taxonName + " (KEGG organism " + dbCfg.taxonId + ") - set at the retrieval step."));
+        } else {
+            wrap.appendChild(alertBox("warning",
+                "No KEGG organism resolved yet. Go back to the retrieval step and use \"Resolve KEGG gene IDs\" before running KEGG here."));
+        }
+        return wrap;
+    }
 
     const input = el("input", {
         class: "text-input ora-species-input", type: "text",
-        placeholder: isKegg ? dbName + " organism (name or KEGG organism code)" : dbName + " species (name or UniProt taxon ID)",
+        placeholder: dbName + " species (name or UniProt taxon ID)",
     });
     input.disabled = locked;
     const resultsSelect = el("select", { class: "hidden ora-species-select" });
@@ -9402,7 +9416,7 @@ function renderOraSpeciesSearchWidget(dbName, locked, panel, configRoot) {
 
     function refreshCaption() {
         selectedCaption.textContent = dbCfg.taxonId
-            ? "Selected: " + dbCfg.taxonName + (isKegg ? " (KEGG organism " : " (taxon ") + dbCfg.taxonId + ")"
+            ? "Selected: " + dbCfg.taxonName + " (taxon " + dbCfg.taxonId + ")"
             : "";
     }
     refreshCaption();
@@ -9423,15 +9437,8 @@ function renderOraSpeciesSearchWidget(dbName, locked, panel, configRoot) {
             if (query === lastQuery || inFlight) return;
             lastQuery = query;
             inFlight = true;
-            // KEGG's organism list has no fast REST source (verified live: its
-            // own list/organism endpoint 400s), so the FIRST search per server
-            // process falls back to scraping KEGG's full HTML organism table -
-            // still a few seconds even after that fallback. Without this status
-            // line the box looks dead for that whole stretch, since the prior
-            // dropdown contents are otherwise left untouched during the wait.
-            if (isKegg) statusLine.textContent = "Searching KEGG organisms…";
             try {
-                const data = await apiJson("/api/contexts/search?database=" + encodeURIComponent(searchDb) + "&query=" + encodeURIComponent(query) + "&limit=10");
+                const data = await apiJson("/api/contexts/search?database=" + encodeURIComponent("Rhea + UniProt") + "&query=" + encodeURIComponent(query) + "&limit=10");
                 resultsSelect.innerHTML = "";
                 resultsSelect.appendChild(el("option", { value: "" }, "Select organism"));
                 (data.results || []).forEach((rec, idx) => {
@@ -9443,7 +9450,6 @@ function renderOraSpeciesSearchWidget(dbName, locked, panel, configRoot) {
                 statusLine.textContent = "";
             } catch (err) {
                 // keep prior dropdown contents on transient search errors
-                if (isKegg) statusLine.textContent = "KEGG search failed - try again.";
             } finally {
                 inFlight = false;
             }

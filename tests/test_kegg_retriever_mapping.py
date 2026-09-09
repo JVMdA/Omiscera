@@ -23,6 +23,7 @@ sys.path.insert(0, _ROOT)
 
 import pandas as pd
 
+import API
 import Genomics_module as gm
 import Genomics_module_retriever as gr
 
@@ -173,6 +174,86 @@ df5 = pd.DataFrame([{"Gene Symbol": "X", "UniProt ID": "ACC1", "Entry Name": "",
 df5_copy_before = df5.copy()
 gr.resolve_kegg_ids(df5, "Gene Symbol", "", verbose=False)
 check(df5.equals(df5_copy_before), "the input DataFrame is left unchanged (a new frame is returned)")
+
+print("=== _job_run_ora: KEGG organism guard - session value wins over a mismatched config taxon_id ===")
+# Regression test for a real bug found by audit: the config screen used to
+# carry its OWN independent KEGG organism picker (dbCfg.taxonId), separate
+# from the one the retrieval step actually resolved KEGG IDs against
+# (session["ora"]["kegg_organism_code"]). The two could silently diverge -
+# genes resolved as "hsa" tested against an "mmu" universe, an empty result
+# with no warning. Fixed by (a) removing the second picker in static/app.js
+# and (b) this server-side guard, which must never trust the config screen's
+# taxon_id for KEGG over the session's own record of what the gene IDs were
+# actually resolved for.
+_real_build_kegg_universe = gm.build_kegg_universe
+captured_taxon_ids = []
+
+
+def _fake_build_kegg_universe(taxon_id, verbose=False, force_refresh=False):
+    captured_taxon_ids.append(taxon_id)
+    return {"pathways": {"p1": {"name": "Test", "genes": {"hsa:1"}}},
+            "universe_size": 1, "fetched_at": "", "caveat": None}
+
+
+gm.build_kegg_universe = _fake_build_kegg_universe
+try:
+    final_df = pd.DataFrame([{
+        "Gene Symbol": "GENEA", "UniProt ID": "ACC1", "Entry Name": "", "Protein Name": "",
+        "NCBI Gene ID": "", "KEGG ID": "hsa:1", "Resolution_status": "resolved", "Candidates": "",
+    }])
+    session = {"ora": API._fresh_ora_state()}
+    session["ora"]["final_df"] = final_df
+    # The organism the gene IDs were ACTUALLY resolved for (set by
+    # _job_resolve_kegg_ids in the real flow).
+    session["ora"]["kegg_organism_code"] = "hsa"
+    # A DELIBERATELY mismatched config-screen organism, simulating the
+    # divergence the removed second picker used to allow.
+    session["ora"]["ora_config"] = {
+        "databases": ["KEGG"],
+        "per_database": {"KEGG": {"taxon_id": "mmu", "taxon_name": "", "include_iea": True}},
+    }
+
+    result = API._job_run_ora("fake-job-kegg-guard", session)
+    check(captured_taxon_ids == ["hsa"],
+          f"build_kegg_universe was called with the SESSION's organism ('hsa'), never the mismatched "
+          f"config-screen one ('mmu') (got {captured_taxon_ids})")
+    kegg_block = result.get("KEGG", {}).get("KEGG", {})
+    check(bool(kegg_block.get("caveat")) and "did not match" in kegg_block.get("caveat", ""),
+          f"a mismatch is surfaced as a caveat, not silently corrected (got {kegg_block.get('caveat')!r})")
+
+    print("=== _job_run_ora: KEGG organism guard - no caveat when the two agree ===")
+    captured_taxon_ids.clear()
+    session2 = {"ora": API._fresh_ora_state()}
+    session2["ora"]["final_df"] = final_df
+    session2["ora"]["kegg_organism_code"] = "hsa"
+    session2["ora"]["ora_config"] = {
+        "databases": ["KEGG"],
+        "per_database": {"KEGG": {"taxon_id": "hsa", "taxon_name": "", "include_iea": True}},
+    }
+    result2 = API._job_run_ora("fake-job-kegg-agree", session2)
+    check(captured_taxon_ids == ["hsa"], f"agreeing organisms still build for 'hsa' (got {captured_taxon_ids})")
+    kegg_block2 = result2.get("KEGG", {}).get("KEGG", {})
+    check(not kegg_block2.get("caveat"), f"no spurious caveat when config and session already agree (got {kegg_block2.get('caveat')!r})")
+
+    print("=== _job_run_burden: the identical guard ===")
+    captured_taxon_ids.clear()
+    session3 = {"ora": API._fresh_ora_state()}
+    session3["ora"]["final_df"] = final_df
+    session3["ora"]["kegg_organism_code"] = "hsa"
+    session3["ora"]["variant_scores"] = {"genea": 1.0}
+    session3["ora"]["burden_config"] = {
+        "databases": ["KEGG"],
+        "per_database": {"KEGG": {"taxon_id": "mmu", "taxon_name": "", "include_iea": True}},
+    }
+    result3 = API._job_run_burden("fake-job-kegg-burden-guard", session3)
+    check(captured_taxon_ids == ["hsa"],
+          f"burden's build_kegg_universe call also used the session organism, not the mismatched config "
+          f"one (got {captured_taxon_ids})")
+    kegg_block3 = result3.get("KEGG", {}).get("KEGG", {})
+    check(bool(kegg_block3.get("caveat")) and "did not match" in kegg_block3.get("caveat", ""),
+          f"burden also surfaces the mismatch as a caveat (got {kegg_block3.get('caveat')!r})")
+finally:
+    gm.build_kegg_universe = _real_build_kegg_universe
 
 print("\nTOTAL: %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

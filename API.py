@@ -538,6 +538,12 @@ def _fresh_ora_state() -> dict:
         "display_cols": [],
         "id_col": "",
         "final_df": None,
+        # KEGG organism code (e.g. "hsa") the "KEGG ID" column of resolved_df/
+        # table1_df/final_df was actually resolved against, set by
+        # _job_resolve_kegg_ids. The single source of truth _job_run_ora/
+        # _job_run_burden trust for KEGG's universe organism - never the
+        # config screen's taxon_id, which is only synced FROM this value.
+        "kegg_organism_code": "",
         "ora_config": None,
         "ora_results": None,
         "custom_db": None,   # parsed user-uploaded gene-set database (Part 10)
@@ -1418,6 +1424,16 @@ def _term_size_bounds(cfg: dict) -> tuple:
     return min_ts, max_ts
 
 
+def _append_caveat(block: dict, message: str) -> None:
+    """Append a caveat message onto a result block, preserving any existing one.
+
+    Shared by _job_run_ora and _job_run_burden's KEGG organism-mismatch and
+    dropped-background guards.
+    """
+    existing = block.get("caveat")
+    block["caveat"] = (existing + " " + message) if existing else message
+
+
 def _job_run_ora(job_id: str, session: dict) -> dict:
     update_job(job_id, message="Starting over-representation analysis...")
     final_df = session["ora"]["final_df"]
@@ -1507,6 +1523,26 @@ def _job_run_ora(job_id: str, session: dict) -> dict:
         taxon_id = db_cfg["taxon_id"]
         taxon_name = db_cfg.get("taxon_name", "")
         include_iea = bool(db_cfg.get("include_iea", True))
+
+        # Server-side correctness guard: KEGG's organism must be the one the
+        # KEGG gene IDs were actually resolved for (session["ora"]
+        # ["kegg_organism_code"], set by /api/ora/genes/resolve-kegg), never
+        # whatever the config screen's taxon_id happens to hold. The two used
+        # to be independently settable via a second KEGG organism picker on
+        # the config screen (removed in static/app.js - see that fix), which
+        # could silently diverge from the retrieval-stage organism and test
+        # "hsa" gene IDs against an "mmu" universe: an empty result, no error.
+        # The client is not the correctness boundary, so this is checked here
+        # too, not only prevented in the UI. If kegg_ids is non-empty,
+        # kegg_organism_code is guaranteed set - the same job
+        # (_job_resolve_kegg_ids) writes both together.
+        kegg_taxon_mismatch = False
+        if db == "KEGG":
+            kegg_org = session["ora"].get("kegg_organism_code", "")
+            if kegg_org and kegg_org != taxon_id:
+                kegg_taxon_mismatch = True
+                taxon_id = kegg_org
+
         # User-supplied background list (GO/Reactome/KEGG) lives in the session,
         # keyed by database; None -> use the whole annotated-genome universe.
         # Always uploaded/parsed as UniProt accessions (load_user_background_list),
@@ -1515,12 +1551,15 @@ def _job_run_ora(job_id: str, session: dict) -> dict:
         # silently match nothing against a KEGG-gene-ID-keyed universe.
         background = set(background_by_db.get(db) or []) or None
         background_kegg_ids = None
+        kegg_background_dropped = False
         if db == "KEGG" and background:
             kegg_org_for_bg = session["ora"].get("kegg_organism_code", "")
             if kegg_org_for_bg:
                 bg_gene_map = genomics_ora.build_kegg_gene_map(kegg_org_for_bg)
                 bg_acc_to_gene = bg_gene_map.get("acc_to_gene", {})
                 background_kegg_ids = {bg_acc_to_gene[a] for a in background if a in bg_acc_to_gene} or None
+            else:
+                kegg_background_dropped = True
 
         # Defensive gate: GWAS needs symbols; skip gracefully if unavailable.
         if db == "GWAS Catalog" and not symbols:
@@ -1578,6 +1617,16 @@ def _job_run_ora(job_id: str, session: dict) -> dict:
             progress_callback=_progress,
             verbose=False,
         )
+        if db == "KEGG" and "KEGG" in result:
+            if kegg_taxon_mismatch:
+                _append_caveat(result["KEGG"],
+                    f"The configured organism did not match the one KEGG IDs were "
+                    f"resolved for; '{taxon_id}' (the resolved organism) was used instead.")
+            if kegg_background_dropped:
+                _append_caveat(result["KEGG"],
+                    "A background gene list was uploaded but could not be mapped to "
+                    "KEGG gene space (no KEGG organism on record) - it was ignored "
+                    "for this run.")
         all_results[db] = result
 
     session["ora"]["ora_results"] = all_results
@@ -1762,6 +1811,18 @@ def _job_run_burden(job_id: str, session: dict) -> dict:
         taxon_name = db_cfg.get("taxon_name", "")
         include_iea = bool(db_cfg.get("include_iea", True))
 
+        # Server-side correctness guard: same reasoning as _job_run_ora's
+        # identical block - trust session["ora"]["kegg_organism_code"] (the
+        # organism KEGG gene IDs were actually resolved for), never the config
+        # screen's taxon_id, which used to be independently settable via a
+        # second KEGG organism picker (removed - see static/app.js).
+        kegg_taxon_mismatch = False
+        if db == "KEGG":
+            kegg_org = session["ora"].get("kegg_organism_code", "")
+            if kegg_org and kegg_org != taxon_id:
+                kegg_taxon_mismatch = True
+                taxon_id = kegg_org
+
         # Defensive gate: KEGG needs a "KEGG ID" per gene (see _job_run_ora's
         # identical gate for the full rationale) - a separate opt-in step from
         # normal resolution.
@@ -1803,6 +1864,10 @@ def _job_run_burden(job_id: str, session: dict) -> dict:
             progress_callback=_progress,
             verbose=False,
         )
+        if db == "KEGG" and kegg_taxon_mismatch and "KEGG" in result:
+            _append_caveat(result["KEGG"],
+                f"The configured organism did not match the one KEGG IDs were "
+                f"resolved for; '{taxon_id}' (the resolved organism) was used instead.")
         all_results[db] = result
 
     session["ora"]["burden_results"] = all_results
