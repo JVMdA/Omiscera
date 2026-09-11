@@ -1086,6 +1086,46 @@ test_organism_allowlist_mirror.py  7 checks. Guards a drift risk found while
                                 deliberately-broken "always available" gate
                                 genuinely produces mismatches against the
                                 real Python source of truth.
+test_gsea_fdr.py               24 checks. Correctness of GSEA's two FDR/
+                                q-value columns (Transcriptomics_module.py,
+                                also shared by the Regulon activity module).
+                                Written because _pooled_fdr's own docstring
+                                claimed its monotonicity "is verified
+                                explicitly in this module's unit tests" and no
+                                such test existed anywhere in this directory -
+                                an audit question ("is the FDR q-value
+                                calculated correctly?") surfaced the gap.
+                                _pooled_fdr (the GSEA-paper pooled-permutation
+                                FDR, not a plain BH correction on nominal p)
+                                is cross-checked against an INDEPENDENT,
+                                literal brute-force reimplementation of the
+                                paper's formula (plain loops, no shared
+                                helpers with the vectorized code under test) -
+                                exact match (0.0 max diff) across 5 random
+                                seeds. Also checks monotonicity within each
+                                NES-sign family directly (q must not increase
+                                as |NES| gets more extreme), with a
+                                SENSITIVITY check that the compared sequence
+                                genuinely varies first (a constant sequence
+                                would pass "monotone" vacuously either
+                                direction). Confirmed non-vacuous by actually
+                                injecting the exact "backward running-min"
+                                bug the real function's own docstring warns
+                                about (wrong-direction monotonicity) via
+                                runpy in-process monkeypatching - 9 of the 24
+                                checks go red, including 5 of the 5 brute-
+                                force cross-checks. Edge cases: an entirely
+                                one-signed scenario (no negative-NES terms at
+                                all), and a null pool with no same-sign values
+                                for one term's sign (denom_null_total=0) falls
+                                back to q=1.0 rather than NaN or an unhandled
+                                division. benjamini_hochberg (the sibling
+                                "FDR (BH)" column, classic BH on nominal p) is
+                                cross-checked the same way against an
+                                independent reference across 3 seeds, plus the
+                                two BH invariants (q non-decreasing in
+                                p-rank; q never below its own p) and the
+                                empty-input edge case.
 test_gsea_null_histogram_range.py  4 checks. A real, user-reported bug in
                                 buildGseaNullHistogram (static/app.js): when
                                 the observed NES is more extreme than the
