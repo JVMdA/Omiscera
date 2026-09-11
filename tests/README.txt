@@ -340,6 +340,79 @@ test_reactome_module_organism_filter.py  8 checks. A real bug found while
                                 red. Direct function calls against the real,
                                 local Reactome bulk file - no server needed.
 
+test_transcriptomics_kegg.py   78 checks. KEGG in Transcriptomics ORA +
+                                GSEA, fully offline (every KEGG call
+                                monkeypatched, on-disk cache redirected to a
+                                temp dir so a run can neither read nor poison
+                                the real cache - the mistake that had to be
+                                fixed in test_kegg_gene_map.py). Transcriptomics
+                                is gene-SYMBOL-native while KEGG is keyed by
+                                KEGG gene ID, so KEGG needs two bridges nothing
+                                else in that module needs, and each can fail
+                                silently:
+                                (1) ORGANISM. KEGG publishes no taxon ->
+                                organism-code endpoint, so
+                                resolve_kegg_organism_code matches on organism
+                                NAME and then VERIFIES against KEGG's own
+                                "TAXONOMY  TAX:<id>" line. Covers the exact
+                                match, the genus+species fallback (the app's
+                                "Saccharomyces cerevisiae S288C" vs KEGG's
+                                unsuffixed genome name), and the case that
+                                makes verification non-optional: a species-
+                                level taxon whose only KEGG genomes are
+                                strains, which must resolve to NOTHING rather
+                                than silently test the wrong strain. This is
+                                the same bug class as commit 27ce033 (KEGG
+                                organism divergence in Genomics ORA), which is
+                                why Transcriptomics derives the organism
+                                instead of offering a second picker.
+                                (2) IDENTIFIER. KEGG gene -> Entrez (KEGG's own
+                                conv/ncbi-geneid table) -> this run's symbols
+                                (the resolved DE table's own columns, now
+                                shared with Reactome via
+                                _entrez_sets_to_symbol_sets). Includes a
+                                sensitivity check that a BLANK Entrez ID never
+                                matches a blank entrez_id column - without the
+                                guard, every unmapped gene would join every
+                                set. Asserts all four "KEGG returned nothing"
+                                causes (unresolvable organism / no pathways /
+                                no Entrez conversion / no matching gene in this
+                                experiment) produce their OWN note, so none of
+                                them is mistaken for the generic "your DEGs
+                                aren't annotated" message that would blame the
+                                user's gene list for a service or coverage
+                                problem. Also: progress steps_total accounts
+                                for KEGG exactly, GSEA's "fewer than 2 ranked
+                                genes" early-out gives KEGG its own labelled
+                                block, and Reactome's output is unchanged by
+                                the bridge refactor.
+                                Also covers the strain-disambiguation picker
+                                added on top of (1): when several name-matched
+                                KEGG genomes exist and NONE taxon-verifies
+                                (the real Bacillus subtilis case - 14 strain
+                                genomes, none carrying species-level taxon
+                                1423), resolve_kegg_organism_code now exposes
+                                a structured "candidates" list (empty outside
+                                this exact case) and accepts an optional
+                                confirmed_organism_code. The sensitivity check
+                                that matters here: a confirmed code that is
+                                NOT one of THIS call's own re-derived
+                                candidates is silently ignored, falling back
+                                to the plain refusal - a confirmation can
+                                never become an independent organism source
+                                unrelated to the real taxon_name, which is
+                                what would recreate the 27ce033 divergence bug
+                                one layer up. Also: confirmation bypasses the
+                                on-disk cache entirely (never read or
+                                written), a confirmed code is a no-op outside
+                                the ambiguous branch (ignored when the
+                                organism already resolves cleanly), and
+                                run_ora/run_gsea's new
+                                kegg_confirmed_organism_code parameter reaches
+                                a real result end to end - the SAME run
+                                without it stays refused, proving the
+                                parameter is what changed the outcome.
+
 test_kegg_universe_parsing.py  23 checks. build_kegg_universe, the KEGG
                                 PATHWAY gene-set source added to Genomics ORA
                                 + Gene-set Burden Test (KEGG PATHWAY only;
@@ -722,6 +795,59 @@ live_msigdb_urls.py             49 checks. LIVE network test: every pinned
                                 MSigDB's release server, same as
                                 smoke_regulon_fetchers.py below.
 
+live_transcriptomics_kegg.py   31 checks. LIVE network test for the same
+                                feature - what the offline file cannot prove:
+                                that its fixtures match what KEGG actually
+                                serves. Resolves 9 real organisms to their
+                                KEGG codes and taxon-verifies each (human,
+                                mouse, rat, zebrafish, fly, worm, Arabidopsis,
+                                chickpea, and yeast via the genus+species
+                                fallback), confirms the real Bacillus subtilis
+                                ambiguity (14 strain genomes, none carrying
+                                taxon 1423) refuses rather than guesses, and
+                                measures the Entrez bridge on real data: 372/372
+                                human pathways survive it, chickpea has 163
+                                pathways over 5,757 genes (the non-model case
+                                KEGG is offered for), and every member ID comes
+                                out as a bare Entrez ID. Ends with a real
+                                run_ora + run_gsea against live KEGG membership.
+                                Also confirms the strain-disambiguation picker
+                                against the real B. subtilis candidate list:
+                                its "candidates" carry all 14 real strains
+                                (not just the note text), confirming the real
+                                "bsu" fetches a genuine KEGG pathway set
+                                (128 pathways) exactly like any automatically-
+                                resolved organism, and confirming a code KEGG
+                                never actually name-matched ("hsa") is ignored
+                                against the LIVE candidate list too, not just
+                                the offline fixture.
+
+live_e2e_transcriptomics_kegg_confirm.py
+                                18 checks. Real HTTP end-to-end test (no
+                                browser) for the two new endpoints the picker
+                                calls - /api/transcriptomics/kegg/resolve-
+                                organism and /confirm-organism - mirroring
+                                regression_ora_gsea.py's approach. Uses the
+                                same real Bacillus subtilis ambiguity as
+                                live_transcriptomics_kegg.py. The check that
+                                matters most here: confirms a KEGG organism
+                                for B. subtilis, runs ORA over HTTP and sees
+                                the confirmation's caveat in the result: THEN
+                                re-resolves the session to a different
+                                organism (human) and re-runs - proving the
+                                confirmation does NOT leak into a run for a
+                                different species. This is the one layer
+                                neither the offline nor the direct-call live
+                                test can see: whether API.py's
+                                _transcriptomics_kegg_confirmed_code actually
+                                guards a stale confirmation at read time, not
+                                only whether _job_resolve_de resets it at
+                                write time. Also: resolve-organism is
+                                confirmed read-only (identical result on two
+                                consecutive calls), and confirm-organism
+                                rejects both a non-candidate code and a
+                                missing one.
+
 live_kegg_universe.py           39 checks. LIVE network test for KEGG
                                 PATHWAY in Genomics ORA + Gene-set Burden
                                 Test: build_kegg_universe, build_kegg_gene_map
@@ -1004,6 +1130,44 @@ test_msigdb_summary_figure.py   15 checks. The MSigDB cross-collection
                                 sensitivity check reverted the real fix and
                                 confirmed the check goes red with the exact
                                 misleading string a user actually saw.
+playwright_transcriptomics_kegg.py
+                                45 checks. Real-browser flow for KEGG in
+                                Transcriptomics ORA and GSEA, and the only
+                                machine check on static/app.js in an
+                                environment with no Node (any console or page
+                                error fails the run). Covers what neither
+                                file above can see: the KEGG pill exists on
+                                BOTH config screens, checking it triggers a
+                                full re-render so its organism caption
+                                actually appears (a real bug this test caught
+                                - the toggle only re-rendered the run button),
+                                and - the point of the whole design - NO
+                                organism search box is rendered for KEGG,
+                                since a second organism control here is
+                                precisely the divergence bug of commit
+                                27ce033. Then runs both analyses for real:
+                                three "KEGG (direction)" families whose term
+                                IDs all start with "hsa" (proving the DERIVED
+                                organism was really the one used), a slugged
+                                result card, the same four result-nav panes
+                                every other database gets, and a figure that
+                                actually draws when its lazy "Show ..." toggle
+                                is clicked.
+                                Also drives the strain-disambiguation picker
+                                through the real UI against the real Bacillus
+                                subtilis ambiguity (not a stub): checking KEGG
+                                for that organism makes the picker appear with
+                                the real 14-strain candidate list by name,
+                                confirm stays disabled until one is chosen,
+                                confirming replaces the picker with a
+                                "Confirmed manually" caption and persists the
+                                choice into client state, a real run then
+                                carries the manual-confirmation caveat in its
+                                result table (proving the confirmed organism
+                                genuinely reached the run, not just the UI),
+                                and switching back to a clean organism clears
+                                the confirmation from client state.
+
 playwright_msigdb.py            68 checks. Same real-browser approach for
                                 MSigDB in ORA and GSEA: the collection
                                 sub-selector only appears once "MSigDB" is

@@ -21,10 +21,14 @@ direction — which is a real biological signal that a per-gene significance
 cutoff would discard gene by gene, since no single member stands out on its
 own.
 
-It runs against three curated knowledge bases:
+It runs against four curated knowledge bases:
   - Gene Ontology (GO) — standardized descriptions of what a gene product
     does, where it acts, and what process it participates in.
   - Reactome — curated metabolic and signaling pathways.
+  - KEGG PATHWAY — curated metabolic and signaling maps, with by far the
+    broadest organism coverage of the four. If you work on a non-model
+    organism, this is usually the one with real annotation for it. See
+    "USING KEGG" below.
   - MSigDB — 8 curated collections you pick from (Hallmark, Perturbations,
     WikiPathways, PID, Phenotype, Oncogenic, Immunologic, Cell type),
     covering human and (mostly) mouse. See "MSIGDB COLLECTIONS AND
@@ -32,6 +36,55 @@ It runs against three curated knowledge bases:
     left out, and why.
 
 You can also upload your own custom gene-set database.
+
+USING KEGG
+--------------
+There is normally nothing extra to choose. KEGG names organisms with its own
+codes ("hsa" for human, "cam" for chickpea) rather than by NCBI taxon, so the
+code is looked up automatically from the organism you already picked at
+retrieval, and then checked against the NCBI taxon KEGG itself records for
+that genome before anything is tested. You never pick a KEGG organism
+separately from a general list — a second, independent organism control
+would be a way for your genes and your pathways to end up describing
+different species without anything saying so.
+
+Two cases end with no automatic match:
+  - KEGG has no genome for your organism at all. KEGG only covers organisms
+    with a sequenced, annotated genome in KEGG GENOME. GO still works, and
+    nothing more can be done for KEGG here.
+  - KEGG has several strain-level genomes and no way to tell which one you
+    meant. This is common for bacteria: "Bacillus subtilis" as a species
+    matches 14 KEGG genomes, every one of them a specific strain. Checking
+    the KEGG box then shows a picker listing exactly those candidates (never
+    KEGG's full organism list) — confirm the one you meant, or leave it
+    unconfirmed to skip KEGG for this run. A confirmed organism is never
+    taxon-verified the way an automatic match is (that verification is
+    exactly what failed here), so results carry a caveat naming it as a
+    manual choice — double-check it's the strain/assembly you intended.
+    Changing the organism at retrieval clears any earlier confirmation.
+
+KEGG's pathways are keyed by KEGG's own gene IDs, which are translated to
+NCBI Entrez Gene IDs (using KEGG's own conversion table) and from there to
+your gene symbols, using the Entrez IDs your resolved table already carries.
+Results always show your own gene symbols, never KEGG or Entrez IDs. If your
+genes carry no Entrez IDs, KEGG says so explicitly rather than returning an
+empty table — that is an identifier gap, not a sign your genes are
+unannotated, and GO or MSigDB (which match on symbol) are unaffected by it.
+
+KEGG carries no evidence codes, so the IEA setting does not apply to it.
+
+KEGG'S REST API AND ACADEMIC USE. KEGG's REST API is intended for
+individual, academic use; its terms restrict systematic bulk downloading
+and commercial redistribution of its data. This module's KEGG requests are
+a handful of bulk calls per organism you actually analyze — cached
+afterward — not an export of KEGG's database. This app is distributed as
+source for you to run yourself, rather than offered as a hosted service
+making KEGG calls on other users' behalf.
+
+(This is KEGG's own data, fetched from KEGG directly. It is unrelated to
+MSigDB's repackaged KEGG_LEGACY/KEGG_MEDICUS subsets, which stay excluded
+from the MSigDB collections above for licensing reasons — see "MSIGDB
+COLLECTIONS AND LICENSING".)
 
 MSIGDB COLLECTIONS AND LICENSING
 -------------------------------------
@@ -101,7 +154,7 @@ Every database/collection here gets its OWN independent Benjamini-Hochberg
 correction — there is no correction ACROSS them (same convention as ORA and
 the Regulon module). Selecting several MSigDB collections multiplies how
 many such independent families one run can produce: up to 8 (one per
-collection), on top of GO/Reactome/Custom database. The results screen
+collection), on top of GO/Reactome/KEGG/Custom database. The results screen
 reports exactly how many independently-corrected tables a given run
 produced. Scanning every table and reporting the single best hit across all
 of them inflates the true error rate above what any one FDR column states —

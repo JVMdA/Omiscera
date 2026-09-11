@@ -3,11 +3,16 @@
 Transcriptomics statistical analysis module for Omiscera — Over-Representation
 Analysis (ORA).
 
-Standalone: does not import any Genomics_* module. Tests whether the genes in
-a differential-expression (DE) result (produced upstream by
-Transcriptomics_module_retriever.py) are over-represented in GO terms, Reactome
-pathways, or MSigDB gene sets (8 curated collections, human + mouse - see
-MSIGDB_COLLECTIONS).
+Tests whether the genes in a differential-expression (DE) result (produced
+upstream by Transcriptomics_module_retriever.py) are over-represented in GO
+terms, Reactome pathways, KEGG PATHWAY maps, or MSigDB gene sets (8 curated
+collections, human + mouse - see MSIGDB_COLLECTIONS).
+
+Depends on Genomics_module only for shared, already-tested leaf utilities
+(term-name formatting, and the throttled KEGG REST fetch/parse helpers reused
+by the KEGG section below) - never for its analysis engine, its
+accession-keyed identifier model, or its session/organism handling, all of
+which are deliberately different here.
 
 Guiding principles
 -------------------
@@ -18,9 +23,12 @@ Guiding principles
     background either.
   - Identifier spine = gene SYMBOL. Each database is fetched in whatever ID
     space it is natively keyed by (GO -> symbol, via QuickGO's own SYMBOL
-    column; Reactome -> Entrez; MSigDB -> symbol) and reported back in symbol
-    space, since the resolver already gives every gene its symbol, Entrez ID,
-    and Ensembl ID together. No cross-database ID translation file is needed.
+    column; Reactome -> Entrez; KEGG -> KEGG gene ID, converted to Entrez via
+    KEGG's own conv/ncbi-geneid table; MSigDB -> symbol) and reported back in
+    symbol space, since the resolver already gives every gene its symbol,
+    Entrez ID, and Ensembl ID together. No cross-database ID translation file
+    is needed - the two Entrez-native databases share one bridge built from
+    the resolved DE table itself (_entrez_sets_to_symbol_sets).
   - Statistical test: Wallenius non-central hypergeometric (GOseq-style gene-
     length bias correction — longer genes accumulate more reads and are more
     likely to be called DE independent of biology), falling back to the plain
@@ -38,7 +46,7 @@ Module layout
   1. Constants
   2. Stats engine              (pure functions, no I/O)
   3. On-disk JSON cache helpers (shared by every fetcher)
-  4. Gene-set fetchers          (GO, Reactome, MSigDB)
+  4. Gene-set fetchers          (GO, Reactome, KEGG, MSigDB)
   5. Gene-length fetcher + PWF fitting (length-bias correction)
   6. DEG selection + universe
   7. ORA orchestrator (run_ora)
@@ -58,7 +66,18 @@ import numpy as np
 import pandas as pd
 
 import go_hierarchy
-from Genomics_module import format_term_name
+from Genomics_module import (
+    format_term_name,
+    # KEGG REST plumbing, reused rather than re-implemented: _kegg_safe_get
+    # carries the shared KEGG rate-throttle and the "nodata vs error" status
+    # distinction, and build_kegg_universe owns the disk-cached pathway build
+    # that Genomics ORA/Burden already depend on. Aliased with a _genomics_
+    # prefix so a reader of the KEGG section below can see at a glance which
+    # calls cross the module boundary.
+    _kegg_safe_get as _genomics_kegg_get,
+    _parse_kegg_ncbi_geneid_conv as _genomics_parse_ncbi_geneid_conv,
+    build_kegg_universe as _genomics_build_kegg_universe,
+)
 
 try:
     import requests as _requests
@@ -112,6 +131,32 @@ GO_NAMESPACES = ("biological_process", "molecular_function", "cellular_component
 REACTOME_URL = "https://reactome.org/download/current/NCBI2Reactome_All_Levels.txt"
 REACTOME_PATH = os.path.join(CACHE_DIR, "transcriptomics_ncbi2reactome.txt")
 REACTOME_REFRESH_DAYS = 30
+
+# KEGG PATHWAY - native KEGG REST. Fetched from KEGG's own API, NOT from
+# MSigDB's repackaged copy: MSigDB's KEGG_LEGACY/KEGG_MEDICUS subsets carry
+# redistribution terms this app cannot meet and stay excluded from
+# MSIGDB_COLLECTIONS (see that constant). KEGG's own REST API is free for
+# academic use; see info/README-ORA-transcriptomics.txt.
+#
+# list/genome is the organism list (list/organism began returning HTTP 400 -
+# see database_catalog.KEGG_LIST_ORGANISM_URL), and get/genome:T##### is the
+# only endpoint that ties a KEGG organism to an NCBI taxon.
+KEGG_LIST_GENOME_URL = "https://rest.kegg.jp/list/genome"
+KEGG_GET_GENOME_URL = "https://rest.kegg.jp/get/genome:{tnum}"
+KEGG_CONV_NCBI_GENEID_URL = "https://rest.kegg.jp/conv/ncbi-geneid/{org}"
+KEGG_REFRESH_DAYS = 30
+# Cap on per-candidate taxon verification: each check is its own throttled
+# KEGG call, and a name that matches more than a handful of KEGG genomes is
+# already too ambiguous to resolve automatically (see
+# resolve_kegg_organism_code).
+KEGG_ORG_MAX_VERIFY = 8
+# Bump to invalidate every cached Entrez-keyed KEGG set after a shape change.
+KEGG_SETS_CACHE_VERSION = 1
+# Bump to invalidate every cached organism-resolution result after a shape
+# change - e.g. v1 -> v2 added the "candidates" field, and an old cached
+# blob without it would otherwise be served back as a cache hit with no
+# error, just a missing key wherever a caller reads "candidates".
+KEGG_ORG_CACHE_VERSION = 2
 
 # MSigDB — native download, gene-symbol-keyed, human + mouse. VERIFIED LIVE
 # before this was built: https://data.broadinstitute.org/gsea-msigdb/msigdb/
@@ -772,6 +817,367 @@ def fetch_reactome_sets(
 
 
 # ---------------------------------------------------------------------------
+# KEGG PATHWAY gene sets (native KEGG REST, Entrez-keyed like Reactome)
+#
+# Two things make KEGG different from every other database here:
+#
+#   1. KEGG does not identify organisms by NCBI taxon. It uses its own
+#      three/four-letter organism code ("hsa", "cam"), and it publishes NO
+#      taxon -> code endpoint (verified live: br08610 carries no taxon IDs;
+#      conv/genome/ncbi-taxonomy returns HTTP 400; find/genome/9606 matches
+#      the T-NUMBER, not the taxon, and returns an unrelated bacterium).
+#      resolve_kegg_organism_code below therefore derives the code from the
+#      run's organism NAME and then VERIFIES it against KEGG's own
+#      "TAXONOMY  TAX:<id>" field, so a name collision can never silently
+#      hand back the wrong organism.
+#
+#   2. KEGG's pathway membership is keyed by KEGG gene ID, not gene symbol.
+#      fetch_kegg_sets converts to Entrez via KEGG's own conv/ncbi-geneid
+#      table, so KEGG arrives in exactly the shape fetch_reactome_sets
+#      already returns and rides the SAME Entrez -> symbol bridge
+#      (_entrez_sets_to_symbol_sets) the resolved DE table provides. KEGG's
+#      own gene-symbol field is deliberately NOT used: measured live, it
+#      covers 98.5% of human pathway genes but only 3.5% of chickpea's -
+#      useless exactly where KEGG's non-model coverage is the reason to
+#      offer it at all.
+#
+# Genomics_module already owns tested, throttled fetch/parse helpers for the
+# same REST endpoints, so they are reused rather than re-implemented (see this
+# module's docstring on the Genomics_module dependency).
+# ---------------------------------------------------------------------------
+
+def _parse_kegg_genome_list(text: str) -> "list[tuple[str, str, str]]":
+    """Parse list/genome rows into [(t_number, organism_code, name), ...].
+
+    Rows look like "T01001<TAB>hsa; Homo sapiens (human)" - the code and the
+    name share one tab-separated field, joined by "; ". Mirrors
+    database_catalog._parse_kegg_rest_genome, kept local because this module
+    needs plain tuples, not that module's context DataFrame.
+    """
+    rows: list = []
+    for line in text.splitlines():
+        line = line.strip()
+        if "\t" not in line:
+            continue
+        tnum, remainder = line.split("\t", 1)
+        remainder = remainder.strip()
+        if ";" in remainder:
+            code, name = remainder.split(";", 1)
+        else:
+            parts = remainder.split(None, 1)
+            if len(parts) < 2:
+                continue
+            code, name = parts[0], parts[1]
+        tnum, code, name = tnum.strip(), code.strip(), name.strip()
+        if tnum and code and name:
+            rows.append((tnum, code, name))
+    return rows
+
+
+def _kegg_genome_taxon(t_number: str, verbose: bool = False) -> "str | None":
+    """Return the NCBI taxon id KEGG itself records for one genome entry.
+
+    Reads the "TAXONOMY    TAX:9606" line of get/genome:T01001. This is the
+    only KEGG endpoint that ties a KEGG organism to an NCBI taxon, and it is
+    what makes name-based resolution verifiable rather than a guess.
+    """
+    status, text = _genomics_kegg_get(KEGG_GET_GENOME_URL.format(tnum=t_number), verbose=verbose)
+    if status != "ok" or not text:
+        return None
+    match = re.search(r"^\s*TAXONOMY\s+TAX:(\d+)", text, re.M)
+    return match.group(1) if match else None
+
+
+def _kegg_strip_common_name(name: str) -> str:
+    """"Homo sapiens (human)" -> "Homo sapiens"."""
+    return re.sub(r"\s*\(.*?\)\s*$", "", str(name)).strip()
+
+
+def resolve_kegg_organism_code(
+    taxon_id: str,
+    taxon_name: str,
+    verbose: bool = False,
+    force_refresh: bool = False,
+    confirmed_organism_code: str = "",
+) -> dict:
+    """Derive the KEGG organism code for this run's organism, or explain why not.
+
+    Unlike Genomics ORA - where the user picks a KEGG organism by hand at the
+    retrieval step - Transcriptomics DERIVES it, because the organism is
+    already fixed by retrieval (taxon_id/taxon_name, guarded by
+    API._require_consistent_taxon). Adding a second, independently-settable
+    organism control here would recreate exactly the divergence bug fixed in
+    commit 27ce033, where KEGG gene IDs resolved for one organism were tested
+    against another organism's universe and returned an empty table with no
+    error at all.
+
+    Resolution is name-based but TAXON-VERIFIED:
+      1. Match taxon_name against KEGG's genome list, exactly first, then
+         falling back to genus + species (KEGG names its yeast genome
+         "Saccharomyces cerevisiae" where this app's organism is
+         "Saccharomyces cerevisiae S288C" - verified live).
+      2. Ask KEGG for each candidate's own TAXONOMY TAX: id, and keep the
+         candidates whose id equals taxon_id.
+      3. Exactly one verified candidate -> use it, no caveat.
+         No verified candidate but exactly one name candidate -> use it, with
+         a caveat naming the disagreement, since an unverified match is a real
+         risk the user should see rather than a detail to swallow.
+         Several name candidates, none verified -> genuinely ambiguous
+         (verified live: species-level taxon 1423, Bacillus subtilis, matches
+         14 strain-level KEGG genomes and none carries taxon 1423). Resolves
+         to nothing UNLESS confirmed_organism_code names one of these exact
+         candidates - see below.
+
+    confirmed_organism_code: takes effect ONLY in the genuinely-ambiguous case
+    above, and only when it equals one of the CANDIDATES this call itself
+    just derived for taxon_name - never trusted blindly. This is what stops
+    a confirmation from becoming a second, independently-settable organism
+    source (the divergence bug this whole function exists to avoid): it can
+    only ever select among values this exact run's own automatic pass
+    already surfaced, never an arbitrary code. A confirmation attempt always
+    re-derives live rather than reading/writing the on-disk cache below - it
+    is a rare, user-driven path tied to one specific code, and sharing the
+    plain cache_key with the unconfirmed case would risk serving a stale
+    result back for either one.
+
+    Returns {"organism_code": str, "organism_name": str, "verified": bool,
+             "note": str|None, "caveat": str|None,
+             "candidates": [{"organism_code", "organism_name"}, ...]}.
+    organism_code is "" when nothing could be resolved, and `note` then
+    explains why - the same "empty block gets an explanatory note" contract
+    Reactome's callers use. `candidates` is non-empty ONLY in the genuinely-
+    ambiguous case (several name matches, none taxon-verified, and no valid
+    confirmed_organism_code among them) - callers use a non-empty list to
+    decide whether to offer a confirmation choice at all.
+    """
+    taxon_id = str(taxon_id or "").strip()
+    taxon_name = str(taxon_name or "").strip()
+    confirmed_organism_code = str(confirmed_organism_code or "").strip().lower()
+    blank = {"organism_code": "", "organism_name": "", "verified": False, "caveat": None, "candidates": []}
+
+    if not taxon_name:
+        return dict(blank, note=(
+            "KEGG requires a resolved organism name to look up its own organism code; "
+            "none was available for this run. Re-run retrieval and confirm an organism "
+            "was selected, then re-run this analysis."
+        ))
+
+    cache_key = f"kegg_org_v{KEGG_ORG_CACHE_VERSION}_{taxon_id}_{taxon_name.lower().replace(' ', '_')}"
+    cache_path = _universe_cache_path(cache_key)
+    use_cache = not force_refresh and not confirmed_organism_code
+    if use_cache:
+        cached = _load_json_cache(cache_path, KEGG_REFRESH_DAYS)
+        if cached is not None:
+            return cached
+
+    status, text = _genomics_kegg_get(KEGG_LIST_GENOME_URL, verbose=verbose)
+    if status != "ok" or not text.strip():
+        # Transient - deliberately NOT cached, so the next run retries instead
+        # of being told "KEGG is unavailable" for KEGG_REFRESH_DAYS.
+        return dict(blank, note=(
+            "Could not reach KEGG to look up its organism list for this run (transient "
+            "service error); KEGG terms are unavailable. Re-run the analysis to retry."
+        ))
+
+    genomes = _parse_kegg_genome_list(text)
+    target_full = taxon_name.lower()
+    target_gs = _genus_species(taxon_name)
+
+    exact: list = []
+    genus_species_hits: list = []
+    for tnum, code, name in genomes:
+        base = _kegg_strip_common_name(name).lower()
+        if base == target_full:
+            exact.append((tnum, code, name))
+        elif _genus_species(base) == target_gs:
+            genus_species_hits.append((tnum, code, name))
+    candidates = exact or genus_species_hits
+
+    if not candidates:
+        result = dict(blank, note=(
+            f"KEGG has no genome for \"{taxon_name}\". KEGG identifies organisms by its own "
+            "organism code, and covers only organisms with a sequenced, annotated genome in "
+            "KEGG GENOME - try GO or MSigDB for this organism."
+        ))
+        if not confirmed_organism_code:
+            _save_json_cache(cache_path, result)
+        return result
+
+    verified: list = []
+    for tnum, code, name in candidates[:KEGG_ORG_MAX_VERIFY]:
+        if _kegg_genome_taxon(tnum, verbose=verbose) == taxon_id:
+            verified.append((tnum, code, name))
+
+    if len(verified) == 1:
+        _, code, name = verified[0]
+        result = {
+            "organism_code": code, "organism_name": _kegg_strip_common_name(name),
+            "verified": True, "note": None, "caveat": None, "candidates": [],
+        }
+    elif not verified and len(candidates) == 1:
+        _, code, name = candidates[0]
+        result = {
+            "organism_code": code, "organism_name": _kegg_strip_common_name(name),
+            "verified": False, "note": None, "candidates": [],
+            "caveat": (
+                f"KEGG organism \"{code}\" was matched to \"{taxon_name}\" by name, but KEGG "
+                f"records a different NCBI taxon for it than this run's ({taxon_id}). The names "
+                "agree, so this is most often a strain or assembly difference - check that "
+                f"\"{_kegg_strip_common_name(name)}\" is the organism you meant."
+            ),
+        }
+    else:
+        # Genuinely ambiguous: several name-matched candidates, none
+        # taxon-verified. confirmed_organism_code is honoured ONLY here, and
+        # only when it equals one of THESE candidates' own codes.
+        candidate_list = [
+            {"organism_code": c, "organism_name": _kegg_strip_common_name(n)}
+            for _, c, n in candidates
+        ]
+        confirmed_match = next(
+            (cand for cand in candidate_list if cand["organism_code"] == confirmed_organism_code),
+            None,
+        ) if confirmed_organism_code else None
+
+        if confirmed_match is not None:
+            result = {
+                "organism_code": confirmed_match["organism_code"],
+                "organism_name": confirmed_match["organism_name"],
+                "verified": False, "note": None, "candidates": [],
+                "caveat": (
+                    f"KEGG organism \"{confirmed_match['organism_code']}\" "
+                    f"({confirmed_match['organism_name']}) was manually confirmed from "
+                    f"{len(candidates)} name-matched candidates for \"{taxon_name}\" - KEGG's own "
+                    f"taxon record did not verify any of them against this run's NCBI taxon "
+                    f"({taxon_id}). Double-check this is the organism/strain you meant."
+                ),
+            }
+        else:
+            shown = ", ".join(f"{c} ({_kegg_strip_common_name(n)})" for _, c, n in candidates[:5])
+            more = f", and {len(candidates) - 5} more" if len(candidates) > 5 else ""
+            result = dict(blank, candidates=candidate_list, note=(
+                f"\"{taxon_name}\" matches {len(candidates)} KEGG organisms ({shown}{more}), none of "
+                f"which carries NCBI taxon {taxon_id}. This usually means KEGG has strain-level "
+                "genomes where this run's organism is a species. Confirm which one you meant, or "
+                "KEGG stays skipped - GO and MSigDB match on gene symbol and are unaffected."
+            ))
+
+    if not confirmed_organism_code:
+        _save_json_cache(cache_path, result)
+    if verbose:
+        print(f"[KEGG] taxon {taxon_id} {taxon_name!r} -> {result['organism_code']!r} "
+              f"(verified={result['verified']}, confirmed={bool(confirmed_organism_code)})")
+    return result
+
+
+def fetch_kegg_sets(
+    organism_code: str,
+    verbose: bool = False,
+    force_refresh: bool = False,
+) -> dict:
+    """Fetch KEGG PATHWAY gene sets for one KEGG organism, keyed by Entrez ID.
+
+    Returns the SAME shape as fetch_reactome_sets - {"pathways": {pathway_id:
+    {"name": str, "genes": [entrez_id, ...]}}, ...} - so both ride the same
+    Entrez -> symbol bridge in run_ora/run_gsea.
+
+    Pathway membership itself comes from Genomics_module.build_kegg_universe
+    (already tested and disk-cached, KEGG-gene-ID-keyed); this adds the one
+    step Transcriptomics needs on top: KEGG gene ID -> Entrez, read from
+    KEGG's own conv/ncbi-geneid table rather than assumed. The numeric part of
+    a KEGG gene ID usually IS the Entrez ID (hsa:1 -> ncbi-geneid:1), but
+    parsing the real conversion costs one bulk call and does not bet the whole
+    result on that identity holding for every organism.
+
+    No include_iea (KEGG publishes no evidence codes) and no taxon_name (the
+    organism code is self-sufficient) - unlike fetch_go_sets/fetch_reactome_sets.
+    """
+    org = str(organism_code or "").strip().lower()
+    if not org:
+        return {"pathways": {}, "n_pathways_before_bridge": 0, "fetch_failed": False,
+                "caveat": "No KEGG organism code was provided."}
+
+    cache_path = _universe_cache_path(f"kegg_{org}_v{KEGG_SETS_CACHE_VERSION}")
+    if not force_refresh:
+        cached = _load_json_cache(cache_path, KEGG_REFRESH_DAYS)
+        if cached is not None:
+            return cached
+
+    universe = _genomics_build_kegg_universe(org, verbose=verbose, force_refresh=force_refresh)
+    kegg_pathways = universe.get("pathways", {})
+    universe_caveat = universe.get("caveat")
+
+    conv_status, conv_text = _genomics_kegg_get(
+        KEGG_CONV_NCBI_GENEID_URL.format(org=org), verbose=verbose
+    )
+    gene_to_entrez = _genomics_parse_ncbi_geneid_conv(conv_text) if conv_status == "ok" else {}
+
+    pathways: dict = {}
+    for pid, info in kegg_pathways.items():
+        entrez_ids = sorted({gene_to_entrez[g] for g in info["genes"] if g in gene_to_entrez})
+        if entrez_ids:
+            pathways[pid] = {"name": info["name"], "genes": entrez_ids}
+
+    # "KEGG has no pathways here" and "KEGG has pathways but none survived the
+    # Entrez bridge" are different failures that the caller reports
+    # differently, so keep the pre-bridge count instead of collapsing both
+    # into an empty dict.
+    fetch_failed = conv_status == "error" or bool(
+        universe_caveat and universe_caveat.startswith("Could not reach")
+    )
+    caveat = universe_caveat
+    if conv_status == "error":
+        caveat = f"Could not reach KEGG's Entrez conversion table for organism '{org}'. Re-run to retry."
+    elif kegg_pathways and not gene_to_entrez:
+        caveat = (
+            f"KEGG publishes no NCBI Entrez cross-references for organism '{org}', so its "
+            "pathways could not be matched to this experiment's genes."
+        )
+
+    result = {
+        "pathways": pathways,
+        "n_pathways_before_bridge": len(kegg_pathways),
+        "fetch_failed": fetch_failed,
+        "caveat": caveat,
+    }
+
+    # Same discipline as fetch_reactome_sets and build_kegg_universe: never
+    # cache an empty or partial build, so a transient failure cannot be served
+    # back as "this organism has no KEGG data" for KEGG_REFRESH_DAYS.
+    if pathways and not fetch_failed:
+        _save_json_cache(cache_path, result)
+    elif verbose:
+        print(f"[KEGG] not caching org={org!r}: {caveat}")
+    if verbose:
+        print(f"[KEGG] org={org!r}: {len(pathways)}/{len(kegg_pathways)} pathways "
+              "survived the Entrez bridge")
+    return result
+
+
+def _entrez_sets_to_symbol_sets(pathways: dict, universe_df: pd.DataFrame) -> dict:
+    """Translate Entrez-keyed gene sets into this run's gene-symbol space.
+
+    Shared by Reactome and KEGG - the two Entrez-native databases here - in
+    both run_ora and run_gsea. The bridge is the resolved DE table's OWN
+    entrez_id -> gene_symbol columns, so no external ID-mapping call is
+    needed: the universe here IS the user's measured genes, and the retriever
+    already fetched every gene's symbol and Entrez ID together.
+
+    Sets that translate to nothing are dropped rather than kept empty, so
+    "how many sets are testable" stays honest.
+    """
+    entrez_to_symbol = dict(zip(
+        universe_df["entrez_id"].astype(str), universe_df["gene_symbol"].astype(str).str.upper()
+    ))
+    symbol_sets: dict = {}
+    for set_id, info in (pathways or {}).items():
+        syms = {entrez_to_symbol[e] for e in info["genes"] if e in entrez_to_symbol and e}
+        if syms:
+            symbol_sets[set_id] = {"name": info["name"], "genes": sorted(syms)}
+    return symbol_sets
+
+
+# ---------------------------------------------------------------------------
 # MSigDB gene sets (native download, symbol-keyed, human + mouse)
 # ---------------------------------------------------------------------------
 
@@ -1288,12 +1694,13 @@ def run_ora(
     custom_db: "dict | None" = None,
     background_symbols: "set | None" = None,
     msigdb_collections: "list[str] | None" = None,
+    kegg_confirmed_organism_code: str = "",
     progress_callback=None,
     verbose: bool = False,
 ) -> dict:
     """Run ORA for the requested databases against the resolved DE table.
 
-    databases: subset of ["GO", "Reactome", "MSigDB", "Custom database"].
+    databases: subset of ["GO", "Reactome", "KEGG", "MSigDB", "Custom database"].
     msigdb_collections: required (non-empty) when "MSigDB" is selected - a
         list of MSIGDB_COLLECTIONS keys. Each becomes its OWN independently
         BH-corrected result family (like "Reactome (up)"), e.g.
@@ -1327,6 +1734,16 @@ def run_ora(
         fetch_go_sets/fetch_msigdb_sets, which now refuse to cache a
         partial/failed result in the first place - but this remains the
         manual escape hatch for an already-poisoned on-disk cache).
+    kegg_confirmed_organism_code: KEGG only, and only meaningful in the rare
+        case resolve_kegg_organism_code cannot taxon-verify a unique KEGG
+        organism for this run (several name-matched KEGG genomes, none
+        carrying this run's NCBI taxon - e.g. a species with only
+        strain-level KEGG genomes). Forwarded as-is to
+        resolve_kegg_organism_code's confirmed_organism_code, which re-
+        validates it against that call's OWN candidate list before using it -
+        see that function's docstring for why this can never become an
+        independent organism source. Ignored (has no effect) when the
+        organism resolves automatically.
 
     Returns:
         {
@@ -1525,14 +1942,7 @@ def run_ora(
             # Reactome pathways are Entrez-keyed natively; translate to the
             # universe's symbol space via the resolved table's own entrez_id ->
             # gene_symbol mapping, so every database is tested in the same space.
-            entrez_to_symbol = dict(zip(
-                universe_df["entrez_id"].astype(str), universe_df["gene_symbol"].astype(str).str.upper()
-            ))
-            reactome_symbol_sets: dict = {}
-            for pw_id, info in reactome.get("pathways", {}).items():
-                syms = {entrez_to_symbol[e] for e in info["genes"] if e in entrez_to_symbol and e}
-                if syms:
-                    reactome_symbol_sets[pw_id] = {"name": info["name"], "genes": sorted(syms)}
+            reactome_symbol_sets = _entrez_sets_to_symbol_sets(reactome.get("pathways"), universe_df)
             # A genuinely empty pathway set means this organism/setting has NO
             # Reactome data at all; an empty reactome_symbol_sets DESPITE
             # non-empty pathways means Reactome has data but none of it could
@@ -1591,6 +2001,78 @@ def run_ora(
                 if fallback_note:
                     block["note"] = (block["note"] + " " + fallback_note) if block.get("note") else fallback_note
                 _store(result_key, direction_key, block)
+
+    if "KEGG" in databases:
+        # KEGG's organism is DERIVED from this run's organism, never picked
+        # separately - see resolve_kegg_organism_code for why a second
+        # organism control here would be a correctness bug, not a feature.
+        kegg_org = resolve_kegg_organism_code(
+            taxon_id, taxon_name, verbose=verbose, force_refresh=force_refresh,
+            confirmed_organism_code=kegg_confirmed_organism_code,
+        )
+        org_caveat = kegg_org.get("caveat")
+        kegg_note = kegg_org.get("note")
+        kegg_symbol_sets: dict = {}
+        if not kegg_note:
+            kegg = fetch_kegg_sets(
+                kegg_org["organism_code"], verbose=verbose, force_refresh=force_refresh,
+            )
+            kegg_symbol_sets = _entrez_sets_to_symbol_sets(kegg.get("pathways"), universe_df)
+            # Four distinct ways KEGG can come back with nothing, checked
+            # outermost-cause first so none of them masquerades as
+            # _run_ora_for_sets' generic "your DEGs aren't annotated" note -
+            # that would blame the gene list for what is really a service,
+            # coverage, or identifier-mapping problem.
+            if kegg.get("fetch_failed"):
+                kegg_note = kegg.get("caveat") or (
+                    "Could not reach KEGG for this run (transient service error); KEGG's "
+                    "terms are unavailable. Re-run the analysis to retry."
+                )
+            elif not kegg.get("n_pathways_before_bridge"):
+                kegg_note = (
+                    f"KEGG has no pathway data for organism \"{kegg_org['organism_name']}\" "
+                    f"({kegg_org['organism_code']}). Not every KEGG genome is annotated onto "
+                    "KEGG's pathway maps."
+                )
+            elif not kegg.get("pathways"):
+                kegg_note = kegg.get("caveat") or (
+                    f"KEGG's pathways for \"{kegg_org['organism_name']}\" could not be "
+                    "translated to NCBI Entrez Gene IDs, so they cannot be matched to this "
+                    "experiment's genes."
+                )
+            elif not kegg_symbol_sets:
+                kegg_note = (
+                    f"KEGG has pathway data for \"{kegg_org['organism_name']}\", but none of "
+                    "your resolved genes carry a matching Entrez Gene ID, so no pathway could "
+                    "be translated to your gene symbols. This is an identifier-mapping gap, not "
+                    "a sign that your genes aren't biologically annotated - try GO or MSigDB, "
+                    "which match on gene symbol instead."
+                )
+        for direction_key in DIRECTIONS:
+            deg_symbols = directions[direction_key]
+            step += 1
+            _progress(step, steps_total, f"KEGG ({direction_key})")
+            result_key = f"KEGG ({direction_key})"
+            if kegg_note:
+                combined = (org_caveat + " " + kegg_note) if org_caveat else kegg_note
+                _store(result_key, direction_key, _empty_block(combined))
+                continue
+            if not deg_symbols:
+                empty_note = "No DEGs in this direction at the current thresholds."
+                if org_caveat:
+                    empty_note = org_caveat + " " + empty_note
+                _store(result_key, direction_key, _empty_block(empty_note))
+                continue
+            block = _run_ora_for_sets(
+                kegg_symbol_sets, universe_symbols_all, deg_symbols,
+                min_term_size, max_term_size,
+                pwf_weights_by_direction[direction_key],
+            )
+            # Append rather than overwrite, same as Reactome's fallback note:
+            # _run_ora_for_sets may already carry its own explanation.
+            if org_caveat:
+                block["note"] = (block["note"] + " " + org_caveat) if block.get("note") else org_caveat
+            _store(result_key, direction_key, block)
 
     if "MSigDB" in databases:
         # Each SELECTED COLLECTION is its own independently BH-corrected
@@ -2235,6 +2717,7 @@ def run_gsea(
     custom_db: "dict | None" = None,
     background_symbols: "set | None" = None,
     msigdb_collections: "list[str] | None" = None,
+    kegg_confirmed_organism_code: str = "",
     progress_callback=None,
     verbose: bool = False,
 ) -> dict:
@@ -2248,11 +2731,13 @@ def run_gsea(
     down-regulated end) - unlike run_ora there is no separate all/up/down
     loop, and result keys carry no direction suffix.
 
-    databases: subset of ["GO", "Reactome", "MSigDB", "Custom database"].
+    databases: subset of ["GO", "Reactome", "KEGG", "MSigDB", "Custom database"].
     msigdb_collections: required (non-empty) when "MSigDB" is selected - see
         run_ora's docstring; identical contract here, just without the
         all/up/down split (each selected collection is still its own family,
         e.g. "MSigDB: Cell type", but with no direction suffix).
+    kegg_confirmed_organism_code: KEGG only - see run_ora's docstring, same
+        contract exactly.
     metric: one of GSEA_RANKING_METRICS.
     seed: reseeds an independent RNG for this run only - reruns with the same
         inputs and seed reproduce identical results.
@@ -2377,14 +2862,7 @@ def run_gsea(
                     f"No exact Reactome organism match for \"{taxon_name}\"; matched via "
                     f"genus + species (\"{_genus_species(taxon_name)}\") instead."
                 )
-            entrez_to_symbol = dict(zip(
-                universe_df["entrez_id"].astype(str), universe_df["gene_symbol"].astype(str).str.upper()
-            ))
-            reactome_symbol_sets: dict = {}
-            for pw_id, info in reactome.get("pathways", {}).items():
-                syms = {entrez_to_symbol[e] for e in info["genes"] if e in entrez_to_symbol and e}
-                if syms:
-                    reactome_symbol_sets[pw_id] = {"name": info["name"], "genes": sorted(syms)}
+            reactome_symbol_sets = _entrez_sets_to_symbol_sets(reactome.get("pathways"), universe_df)
             no_data_note = None
             if not reactome.get("pathways"):
                 no_data_note = (
@@ -2412,6 +2890,59 @@ def run_gsea(
                 if fallback_note:
                     block["note"] = fallback_note
                 tables["Reactome"] = block
+
+    if "KEGG" in databases:
+        step += 1
+        _progress(step, steps_total, "GSEA: KEGG")
+        # Organism derived, never separately picked - see run_ora's KEGG block.
+        kegg_org = resolve_kegg_organism_code(
+            taxon_id, taxon_name, verbose=verbose, force_refresh=force_refresh,
+            confirmed_organism_code=kegg_confirmed_organism_code,
+        )
+        org_caveat = kegg_org.get("caveat")
+        kegg_note = kegg_org.get("note")
+        kegg_symbol_sets: dict = {}
+        if not kegg_note:
+            kegg = fetch_kegg_sets(
+                kegg_org["organism_code"], verbose=verbose, force_refresh=force_refresh,
+            )
+            kegg_symbol_sets = _entrez_sets_to_symbol_sets(kegg.get("pathways"), universe_df)
+            if kegg.get("fetch_failed"):
+                kegg_note = kegg.get("caveat") or (
+                    "Could not reach KEGG for this run (transient service error); KEGG's "
+                    "terms are unavailable. Re-run the analysis to retry."
+                )
+            elif not kegg.get("n_pathways_before_bridge"):
+                kegg_note = (
+                    f"KEGG has no pathway data for organism \"{kegg_org['organism_name']}\" "
+                    f"({kegg_org['organism_code']}). Not every KEGG genome is annotated onto "
+                    "KEGG's pathway maps."
+                )
+            elif not kegg.get("pathways"):
+                kegg_note = kegg.get("caveat") or (
+                    f"KEGG's pathways for \"{kegg_org['organism_name']}\" could not be "
+                    "translated to NCBI Entrez Gene IDs, so they cannot be matched to this "
+                    "experiment's genes."
+                )
+            elif not kegg_symbol_sets:
+                kegg_note = (
+                    f"KEGG has pathway data for \"{kegg_org['organism_name']}\", but none of "
+                    "your resolved genes carry a matching Entrez Gene ID, so no pathway could "
+                    "be translated to your gene symbols. This is an identifier-mapping gap, not "
+                    "a sign that your genes aren't biologically annotated - try GO or MSigDB, "
+                    "which match on gene symbol instead."
+                )
+        if kegg_note:
+            tables["KEGG"] = _empty_block(
+                (org_caveat + " " + kegg_note) if org_caveat else kegg_note
+            )
+        else:
+            block = _run_gsea_for_sets(
+                kegg_symbol_sets, ranked, min_term_size, max_term_size, n_permutations, weight, rng,
+            )
+            if org_caveat:
+                block["note"] = org_caveat
+            tables["KEGG"] = block
 
     if "MSigDB" in databases:
         for collection_key in msigdb_keys_selected:

@@ -185,6 +185,14 @@ function _clearTranscriptomicsResolutionDependentState() {
     delete tx._gseaDraft;
     delete tx._regulonDraft;
     delete tx._networkDraft;
+    // KEGG organism resolution/confirmation (renderKeggOrganismWidget) is
+    // also organism-gated - the widget itself re-checks these against the
+    // CURRENT taxonId/taxonName before trusting them, so this isn't the only
+    // guard, but clearing here too avoids a stale check result (or a
+    // confirmed organism from the previous species) ever being visible even
+    // for one render.
+    delete tx._keggOrganismCheck;
+    delete tx._keggOrganismConfirmed;
 }
 
 // Coverage per regulon database (see Transcriptomics_regulon.py's module
@@ -1735,6 +1743,118 @@ function _msigdbCollectionAvailableForTaxon(collection, taxonId) {
 // the 8 offered collections to run. EACH selected collection becomes its own
 // independently BH-corrected result family (see the family-count caption on
 // the results screen) - shared between the ORA and GSEA config screens.
+// ---------------------------------------------------------------------------
+// KEGG organism widget (shared by ORA + GSEA config screens). KEGG's
+// organism is DERIVED from retrieval's taxonId/taxonName, never picked
+// separately - see resolve_kegg_organism_code's docstring for why a second,
+// independently-settable organism control here would recreate the
+// divergence bug fixed in commit 27ce033. This widget only ever offers a
+// choice among the CANDIDATES the server's own automatic pass already
+// produced for THIS organism, and only when that pass could not verify a
+// unique one on its own (e.g. a species with only strain-level KEGG
+// genomes) - it never lets the user pick an organism KEGG hasn't already
+// matched by name.
+// ---------------------------------------------------------------------------
+
+async function _fetchKeggOrganismCheck() {
+    const taxonId = STATE.transcriptomics.taxonId;
+    const taxonName = STATE.transcriptomics.taxonName;
+    const cached = STATE.transcriptomics._keggOrganismCheck;
+    if (cached && cached.taxonId === taxonId && cached.taxonName === taxonName) {
+        return cached.result;
+    }
+    const result = await apiPostJson("/api/transcriptomics/kegg/resolve-organism", {});
+    STATE.transcriptomics._keggOrganismCheck = { taxonId, taxonName, result };
+    return result;
+}
+
+function renderKeggOrganismWidget(container) {
+    container.innerHTML = "";
+    const taxonId = STATE.transcriptomics.taxonId;
+    const taxonName = STATE.transcriptomics.taxonName;
+
+    // A confirmation made for a DIFFERENT organism is stale - drop it so the
+    // picker doesn't keep showing a leftover choice after switching species.
+    // The server independently guards this too (_job_resolve_de clears
+    // kegg_organism_confirmation, and _transcriptomics_kegg_confirmed_code
+    // re-checks it against the session's current organism before trusting
+    // it) - this is the client-side mirror of that, not the only guard.
+    const confirmed = STATE.transcriptomics._keggOrganismConfirmed;
+    if (confirmed && (confirmed.taxonId !== taxonId || confirmed.taxonName !== taxonName)) {
+        STATE.transcriptomics._keggOrganismConfirmed = null;
+    }
+
+    container.appendChild(el("div", { class: "caption" },
+        "KEGG uses the organism you already chose at retrieval - there is nothing extra to pick here. "
+        + "KEGG names organisms with its own codes, so the code is looked up from that organism and "
+        + "checked against KEGG's own NCBI taxon before anything is tested."));
+
+    if (STATE.transcriptomics._keggOrganismConfirmed) {
+        const c = STATE.transcriptomics._keggOrganismConfirmed;
+        container.appendChild(el("div", { class: "caption ora-selected-caption" },
+            "Confirmed manually: " + c.organismName + " (KEGG organism " + c.organismCode + ") - "
+            + "KEGG could not verify a unique match automatically, so this was picked from its "
+            + "name-matched candidates."));
+        return;
+    }
+
+    const statusDiv = el("div", { class: "caption" }, "Checking whether KEGG's organism can be resolved automatically...");
+    container.appendChild(statusDiv);
+
+    _fetchKeggOrganismCheck().then((result) => {
+        statusDiv.remove();
+        if (result.organism_code) {
+            // Resolved automatically (verified or single unverified name
+            // match) - the caption above already covers this; nothing more
+            // to show or confirm.
+            return;
+        }
+        if (result.candidates && result.candidates.length > 0) {
+            const pickWrap = el("div", { class: "ora-kegg-organism-picker" });
+            pickWrap.appendChild(el("div", { class: "caption" },
+                (result.note || "KEGG could not verify a unique organism automatically.")
+                + " Confirm the one you meant below, or leave it unconfirmed to skip KEGG."));
+            const row = el("div", { class: "row", style: { gap: "0.5rem", alignItems: "center", flexWrap: "wrap" } });
+            const select = el("select", { class: "chart-option-select" });
+            select.appendChild(el("option", { value: "" }, "Select KEGG organism"));
+            result.candidates.forEach((cand) => {
+                select.appendChild(el("option", { value: cand.organism_code },
+                    cand.organism_code + " — " + cand.organism_name));
+            });
+            const confirmBtn = el("button", { class: "btn" }, "Confirm KEGG organism");
+            confirmBtn.disabled = true;
+            select.addEventListener("change", () => { confirmBtn.disabled = !select.value; });
+            confirmBtn.addEventListener("click", async () => {
+                confirmBtn.disabled = true;
+                confirmBtn.textContent = "Confirming...";
+                try {
+                    const confirmResult = await apiPostJson("/api/transcriptomics/kegg/confirm-organism",
+                        { organism_code: select.value });
+                    STATE.transcriptomics._keggOrganismConfirmed = {
+                        taxonId, taxonName,
+                        organismCode: confirmResult.organism_code,
+                        organismName: confirmResult.organism_name,
+                    };
+                    render();
+                } catch (err) {
+                    confirmBtn.disabled = false;
+                    confirmBtn.textContent = "Confirm KEGG organism";
+                    pickWrap.appendChild(alertBox("error", "Could not confirm: " + err.message));
+                }
+            });
+            row.appendChild(select);
+            row.appendChild(confirmBtn);
+            pickWrap.appendChild(row);
+            container.appendChild(pickWrap);
+        } else {
+            container.appendChild(el("div", { class: "caption" },
+                result.note || "KEGG has no genome for this organism."));
+        }
+    }).catch((err) => {
+        statusDiv.textContent = "Could not check KEGG organism availability: " + err.message;
+    });
+}
+
 function renderMsigdbCollectionSelector(locked, draft, taxonId, onChange) {
     const wrap = el("div", { class: "ora-msigdb-collections" });
     wrap.appendChild(el("div", { class: "chart-option-label" }, "MSigDB collections"));
@@ -1917,7 +2037,13 @@ function buildMsigdbGseaCollectionSummary(div, tables, alpha, slug) {
         { directional: true, effectLabel: "NES" });
 }
 
-const TRANSCRIPTOMICS_ORA_DATABASES = ["GO", "Reactome", "MSigDB", "Custom database"];
+// Shared by the ORA and GSEA config screens (GSEA renders the same list).
+// KEGG needs no organism control of its own: the server derives its
+// organism code from this run's taxon (Transcriptomics_module.
+// resolve_kegg_organism_code) rather than offering a second, independently
+// settable picker like Genomics ORA does - see commit 27ce033 for the
+// divergence bug that pattern caused there.
+const TRANSCRIPTOMICS_ORA_DATABASES = ["GO", "Reactome", "KEGG", "MSigDB", "Custom database"];
 
 function renderTranscriptomicsOraConfigScreen() {
     const wrap = el("div", { class: "ora-config-screen" });
@@ -1980,10 +2106,12 @@ function renderTranscriptomicsOraConfigScreen() {
             } else {
                 draft.databases = draft.databases.filter((d) => d !== dbName);
             }
-            // "Custom database" toggles a whole upload widget below, and
-            // "MSigDB" toggles the collection sub-selector, not just the run
-            // button, so both need a full re-render; the others don't.
-            if (dbName === "Custom database" || dbName === "MSigDB") render();
+            // "Custom database" toggles a whole upload widget below,
+            // "MSigDB" toggles the collection sub-selector, and "KEGG"
+            // toggles the caption explaining where its organism comes from -
+            // none of those is just the run button, so all three need a full
+            // re-render; the others don't.
+            if (dbName === "Custom database" || dbName === "MSigDB" || dbName === "KEGG") render();
             else renderOraRunBtn();
         });
         label.appendChild(cb);
@@ -1993,7 +2121,13 @@ function renderTranscriptomicsOraConfigScreen() {
     wrap.appendChild(checkRow);
     if (!msigdbAvailable) {
         wrap.appendChild(el("div", { class: "caption" },
-            "MSigDB is disabled: it covers human and mouse only. GO and Reactome support this organism."));
+            "MSigDB is disabled: it covers human and mouse only. GO and Reactome support this organism, "
+            + "and KEGG does too if KEGG has a genome for it."));
+    }
+    if (draft.databases.indexOf("KEGG") !== -1) {
+        const keggOrganismWrap = el("div", { class: "ora-kegg-organism-wrap" });
+        wrap.appendChild(keggOrganismWrap);
+        renderKeggOrganismWidget(keggOrganismWrap);
     }
     if (draft.databases.indexOf("MSigDB") !== -1 && msigdbAvailable) {
         wrap.appendChild(renderMsigdbCollectionSelector(locked, draft, taxonId, renderOraRunBtn));
@@ -2085,7 +2219,7 @@ function renderTranscriptomicsOraConfigScreen() {
         "IEA (\"Inferred from Electronic Annotation\") terms are assigned automatically, without curator " +
         "review - most GO annotations are IEA, and Reactome carries the same evidence distinction for its " +
         "orthology-projected pathways. Uncheck to restrict both GO and Reactome to curated evidence only. " +
-        "Has no effect on MSigDB, which carries no evidence-code data at all. Note: Reactome's " +
+        "Has no effect on KEGG or MSigDB, neither of which carries evidence-code data at all. Note: Reactome's " +
         "curated (non-IEA) coverage is essentially human-only - unchecking this for a non-human organism " +
         "will likely leave Reactome with zero pathways."));
 
@@ -2282,7 +2416,7 @@ function startTranscriptomicsOraRun(draft) {
 
 const TRANSCRIPTOMICS_ORA_FAMILY_ORDER = [
     "GO: Biological Process", "GO: Molecular Function", "GO: Cellular Component",
-    "Reactome",
+    "Reactome", "KEGG",
     ...TRANSCRIPTOMICS_MSIGDB_COLLECTIONS.map((c) => "MSigDB: " + c.label),
     "Custom database",
 ];
@@ -4264,7 +4398,7 @@ const GSEA_DEFAULT_SIG_THRESHOLD = 0.25;
 
 const TRANSCRIPTOMICS_GSEA_FAMILY_ORDER = [
     "GO: Biological Process", "GO: Molecular Function", "GO: Cellular Component",
-    "Reactome",
+    "Reactome", "KEGG",
     ...TRANSCRIPTOMICS_MSIGDB_COLLECTIONS.map((c) => "MSigDB: " + c.label),
     "Custom database",
 ];
@@ -4319,7 +4453,7 @@ function renderTranscriptomicsGseaConfigScreen() {
         runBtnWrap.appendChild(runBtn);
     }
 
-    // Same 4 databases and same MSigDB human/mouse-only gate as ORA
+    // Same databases and same MSigDB human/mouse-only gate as ORA
     // (TRANSCRIPTOMICS_ORA_DATABASES, defined above in the ORA section).
     const taxonId = STATE.transcriptomics.taxonId;
     const msigdbAvailable = _msigdbAvailableForTaxon(taxonId);
@@ -4338,7 +4472,8 @@ function renderTranscriptomicsGseaConfigScreen() {
             } else {
                 draft.databases = draft.databases.filter((d) => d !== dbName);
             }
-            if (dbName === "Custom database" || dbName === "MSigDB") render();
+            // Same three re-render cases as ORA above.
+            if (dbName === "Custom database" || dbName === "MSigDB" || dbName === "KEGG") render();
             else renderGseaRunBtn();
         });
         label.appendChild(cb);
@@ -4348,7 +4483,13 @@ function renderTranscriptomicsGseaConfigScreen() {
     wrap.appendChild(checkRow);
     if (!msigdbAvailable) {
         wrap.appendChild(el("div", { class: "caption" },
-            "MSigDB is disabled: it covers human and mouse only. GO and Reactome support this organism."));
+            "MSigDB is disabled: it covers human and mouse only. GO and Reactome support this organism, "
+            + "and KEGG does too if KEGG has a genome for it."));
+    }
+    if (draft.databases.indexOf("KEGG") !== -1) {
+        const keggOrganismWrap = el("div", { class: "ora-kegg-organism-wrap" });
+        wrap.appendChild(keggOrganismWrap);
+        renderKeggOrganismWidget(keggOrganismWrap);
     }
     if (draft.databases.indexOf("MSigDB") !== -1 && msigdbAvailable) {
         wrap.appendChild(renderMsigdbCollectionSelector(locked, draft, taxonId, renderGseaRunBtn));
@@ -4453,7 +4594,7 @@ function renderTranscriptomicsGseaConfigScreen() {
     ieaRow.appendChild(ieaLabel);
     wrap.appendChild(ieaRow);
     wrap.appendChild(el("div", { class: "caption" },
-        "Uncheck to restrict GO and Reactome to curated evidence only. No effect on MSigDB. " +
+        "Uncheck to restrict GO and Reactome to curated evidence only. No effect on KEGG or MSigDB. " +
         "Reactome's curated (non-IEA) coverage is essentially human-only."));
 
     const actions = el("div", { class: "right-actions", style: { marginTop: "1rem" } });
