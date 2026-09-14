@@ -247,6 +247,126 @@ with sync_playwright() as p:
           f"a gene-symbol-only file is REJECTED (customDb stays null), not silently accepted and matching nothing "
           f"(got {custom_db_after_bad})")
 
+    print("=== KEGG: pill present, no organism picker, clean human run ===")
+    # STATE.proteomics.resolved at this point is actually still the MESSY
+    # MaxQuant example from the contaminant-filtering section above (the
+    # DISEASES section only set taxonId and navigated - it never re-uploaded
+    # the clean file), so re-do a clean human upload+resolve explicitly
+    # rather than depending on inherited cross-section state.
+    page.evaluate("""() => {
+        STATE.aaPage = 'proteomics';
+        STATE.proteomicsModuleName = '';
+        render();
+    }""")
+    page.wait_for_timeout(150)
+    page.locator("button.module-btn.proteomics", has_text="Over-Representation Analysis").click()
+    page.wait_for_timeout(150)
+    page.evaluate("""() => { STATE.proteomics.taxonId = '9606'; STATE.proteomics.taxonName = 'Homo sapiens'; render(); }""")
+    page.wait_for_timeout(150)
+    page.locator("input[type=file]").set_input_files(
+        os.path.join(_ROOT, "Data3", "example_proteomics_de_full.csv"))
+    page.wait_for_timeout(1200)
+    page.locator("button", has_text="Resolve accessions").first.click()
+    for _ in range(180):
+        if page.evaluate("!!STATE.proteomics.resolved"):
+            break
+        page.wait_for_timeout(1000)
+    check(page.evaluate("!!STATE.proteomics.resolved") is True, "re-resolved the clean human example for the KEGG section")
+    page.locator("button", has_text="Continue to Over-Representation Analysis").click()
+    page.wait_for_timeout(200)
+
+    kegg_pill = page.locator("label.ora-db-pill", has_text="KEGG").first
+    check(kegg_pill.count() == 1, "a KEGG pill is present in the database checklist")
+    kegg_cb = kegg_pill.locator("input[type=checkbox]")
+    check(not kegg_cb.is_disabled(), "the KEGG pill is enabled")
+    caption_before = page.evaluate(
+        "() => [...document.querySelectorAll('.caption')].some(c => c.textContent.includes('KEGG uses the organism'))")
+    check(caption_before is False, "the KEGG organism caption is hidden until KEGG is checked")
+    kegg_cb.check()
+    page.wait_for_timeout(1200)
+    caption_after = page.evaluate(
+        "() => [...document.querySelectorAll('.caption')].some(c => c.textContent.includes('KEGG uses the organism'))")
+    check(caption_after is True, "checking KEGG shows the organism-derivation caption (real re-render, not stale)")
+    check(page.locator(".ora-kegg-organism-picker").count() == 0,
+          "SENSITIVITY: NO disambiguation picker for the clean human case - a second, independently-"
+          "settable organism control here is exactly the bug fixed in commit 27ce033")
+
+    run_btn = page.locator("button.ora-run-btn")
+    check(not run_btn.is_disabled(), "Run button enabled with KEGG selected")
+    run_btn.click()
+    page.wait_for_timeout(300)
+    for _ in range(300):
+        if page.evaluate("!!STATE.proteomics.oraResults"):
+            break
+        page.wait_for_timeout(1000)
+    check(page.evaluate("!!STATE.proteomics.oraResults") is True, "the KEGG-only run finished")
+    kegg_tables = page.evaluate("STATE.proteomics.oraResults.tables")
+    kegg_keys = sorted(kegg_tables.keys())
+    check(kegg_keys == ["KEGG (all)", "KEGG (down)", "KEGG (up)"],
+          f"three KEGG direction families came back through the real UI (got {kegg_keys})")
+    kegg_all = kegg_tables.get("KEGG (all)", {})
+    check(kegg_all.get("n_terms_tested", 0) > 0,
+          f"the KEGG family actually tested real terms (got n_terms_tested={kegg_all.get('n_terms_tested')})")
+
+    print("=== KEGG: strain-disambiguation picker for a real ambiguous organism (Bacillus subtilis) ===")
+    page.evaluate("""() => {
+        STATE.aaPage = 'proteomics';
+        STATE.proteomicsModuleName = '';
+        render();
+    }""")
+    page.wait_for_timeout(150)
+    page.locator("button.module-btn.proteomics", has_text="Over-Representation Analysis").click()
+    page.wait_for_timeout(150)
+    page.evaluate("""() => {
+        STATE.proteomics.taxonId = '1423';
+        STATE.proteomics.taxonName = 'Bacillus subtilis';
+        render();
+    }""")
+    page.wait_for_timeout(150)
+    page.locator("input[type=file]").set_input_files(
+        os.path.join(_ROOT, "Data3", "example_proteomics_de_full.csv"))
+    page.wait_for_timeout(1200)
+    page.locator("button", has_text="Resolve accessions").first.click()
+    for _ in range(180):
+        if page.evaluate("!!STATE.proteomics.resolved"):
+            break
+        page.wait_for_timeout(1000)
+    check(page.evaluate("!!STATE.proteomics.resolved") is True,
+          "resolve completed for Bacillus subtilis (real UniProt ID Mapping round trip)")
+    page.locator("button", has_text="Continue to Over-Representation Analysis").click()
+    page.wait_for_timeout(200)
+    check(page.evaluate("STATE.aaPage") == "proteomics_ora_config",
+          "navigated to the ORA config screen for the ambiguous organism")
+
+    page.locator("label.ora-db-pill", has_text="KEGG").first.locator("input[type=checkbox]").check()
+    picker = page.locator(".ora-kegg-organism-picker")
+    for _ in range(30):
+        if picker.count() > 0:
+            break
+        page.wait_for_timeout(500)
+    check(picker.count() == 1,
+          "SENSITIVITY: the SAME disambiguation picker used by Transcriptomics also appears here for "
+          "Proteomics, proving the widget's generalization (moduleKey='proteomics') genuinely works, "
+          "not just a Transcriptomics-shaped stub")
+    select = picker.locator("select")
+    confirm_btn = picker.locator("button", has_text="Confirm KEGG organism")
+    options = select.locator("option").all_inner_texts()
+    check(any(o.startswith("bsu —") for o in options),
+          f"the real 'bsu' (B. subtilis 168) candidate is offered by name (got {options[:5]})")
+    select.select_option("bsu")
+    confirm_btn.click()
+    for _ in range(30):
+        if page.evaluate("() => !!(STATE.proteomics._keggOrganismConfirmed)"):
+            break
+        page.wait_for_timeout(500)
+    confirmed_state = page.evaluate("() => STATE.proteomics._keggOrganismConfirmed")
+    check(confirmed_state and confirmed_state.get("organismCode") == "bsu",
+          f"confirming persists the real chosen organism into Proteomics' OWN state key "
+          f"(got {confirmed_state})")
+    check(page.locator(".ora-selected-caption", has_text="Confirmed manually").count() == 1,
+          "the config screen shows the confirmed-organism caption")
+    check(picker.count() == 0, "and the picker itself is gone, replaced by that caption")
+
     print("=== console error check ===")
     check(len(errors) == 0, f"no console/page errors during the whole flow (got {errors})")
 

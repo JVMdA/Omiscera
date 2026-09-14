@@ -605,6 +605,97 @@ test_proteomics_quant.py        31 checks. Proteomics_module.
                                 `alternative` kwarg reproduces the explicit
                                 "greater" call exactly).
 
+test_proteomics_kegg.py         40 checks. KEGG in Proteomics ORA +
+                                Quantitative Enrichment, entirely offline
+                                (every KEGG call monkeypatched, on-disk cache
+                                redirected to a temp dir). Proteomics is
+                                UniProt-accession-native - unlike
+                                Transcriptomics (gene-symbol-native, needed
+                                an Entrez bridge), KEGG needs NO identifier
+                                bridge here: "accession" is already the exact
+                                key KEGG's own conv/uniprot table uses. Guards
+                                build_kegg_accession_sets' accession -> gene
+                                -> pathway join: the critical property is
+                                that going gene -> accession reuses the SAME
+                                (already-deduplicated) acc_to_gene map
+                                build_kegg_gene_map produces, never KEGG's
+                                raw, un-deduplicated conv/uniprot data
+                                directly - that naive direction is exactly
+                                the accession fan-out bug that made Genomics
+                                move its OWN KEGG universe off accession
+                                space (human N=10,873 accessions vs N=9,424
+                                real genes). SENSITIVITY: confirms two
+                                measured accessions sharing one gene (real
+                                isoforms) BOTH appear - that is not fan-out,
+                                it mirrors how every other Proteomics
+                                accession-space database already treats
+                                isoforms - while an accession dropped as
+                                ambiguous by build_kegg_gene_map never
+                                reappears here. Also asserts the four
+                                distinct "nothing to report" notes
+                                _resolve_kegg_for_proteomics (shared by both
+                                run_ora and run_quantitative_enrichment) must
+                                produce: organism unresolved/ambiguous, KEGG
+                                unreachable, zero measured proteins mapped,
+                                and mapped-but-none-on-a-pathway - each named
+                                differently so none is mistaken for the
+                                others or for the generic "no overlap"
+                                message. Confirms the organism-resolution/
+                                confirmation machinery was genuinely
+                                GENERALIZED from Transcriptomics (API.
+                                _kegg_confirmed_code, not a
+                                Transcriptomics-only copy) and that both
+                                modules' KEGG endpoints are registered.
+
+live_proteomics_kegg.py         20 checks. LIVE network test for the same
+                                feature - confirms known real human
+                                accessions (GAPDH, ENO1, PKM, ALDOA -> real
+                                KEGG gene IDs) land in the real
+                                Glycolysis/Gluconeogenesis pathway map, and
+                                CDK1/CCNB1 land in Cell cycle, through the
+                                real accession -> gene -> pathway join. Also
+                                re-measures the exact coverage figures the
+                                module docstring cites, on the app's own real
+                                3,500-protein example file: 94.6% of
+                                accessions map to a unique KEGG gene, 44.1%
+                                sit on a KEGG pathway map - if KEGG's own data
+                                shape ever drifts enough to move these
+                                numbers substantially, this is what would
+                                catch it. Ends with a real run_ora +
+                                run_quantitative_enrichment against live KEGG
+                                membership, confirming the up-regulated
+                                glycolysis genes and down-regulated cell-cycle
+                                genes come out on the correct sides of both
+                                engines.
+
+live_e2e_proteomics_kegg_confirm.py
+                                25 checks. Real HTTP end-to-end test (no
+                                browser) for the two Proteomics KEGG
+                                endpoints, mirroring
+                                live_e2e_transcriptomics_kegg_confirm.py's
+                                structure closely on purpose: the point is to
+                                prove the GENERALIZATION (Transcriptomics-
+                                only code made module-generic) didn't
+                                silently narrow or break anything for the
+                                second module now depending on it. Runs a
+                                clean KEGG ORA + Quant pass on real human
+                                accessions first, then switches to the same
+                                real Bacillus subtilis ambiguity used
+                                throughout this feature, confirms a real
+                                candidate ("bsu") via
+                                /api/proteomics/kegg/confirm-organism, and
+                                proves the confirmation reaches a real run's
+                                result caveat. The check that matters most:
+                                re-resolves the session back to human and
+                                re-runs, confirming the B. subtilis
+                                confirmation does NOT leak into a run for a
+                                different organism - the one layer that
+                                proves API._kegg_confirmed_code's taxon
+                                re-check actually guards a stale confirmation
+                                at READ time, not only that
+                                _job_resolve_proteins resets it at write
+                                time.
+
 test_format_term_name.py        49 checks. Genomics_module.format_term_name -
                                 pathway/term names rendered lowercase-first
                                 ("cytoplasmic translation") across every
@@ -995,7 +1086,7 @@ playwright_transcriptomics_network.py  37 checks. The FIRST real-browser
                                 exactly, each check independently gated on
                                 whether that specific caveat is expected to
                                 appear at all.
-playwright_proteomics_ora.py    40 checks. The FIRST real-browser coverage of
+playwright_proteomics_ora.py    57 checks. The FIRST real-browser coverage of
                                 the Proteomics module (Milestone 1: the
                                 foundation plus Over-Representation
                                 Analysis). Drives the real flow end to end -
@@ -1026,7 +1117,21 @@ playwright_proteomics_ora.py    40 checks. The FIRST real-browser coverage of
                                 still parsed into bare accessions - without
                                 it the protein-concept network's log2FC
                                 colouring would silently stop resolving.
-playwright_proteomics_quant.py  41 checks. Milestone 2 - the first real-
+                                Also drives KEGG through the real UI twice:
+                                a clean human run (KEGG pill present, no
+                                organism picker, real terms tested), then a
+                                fresh upload/resolve for the real Bacillus
+                                subtilis ambiguity, where the SAME
+                                disambiguation-picker widget Transcriptomics
+                                uses (generalized with moduleKey="proteomics")
+                                appears, offers the real 14-strain candidate
+                                list, and confirming persists into
+                                Proteomics' OWN state key
+                                (STATE.proteomics._keggOrganismConfirmed, not
+                                a Transcriptomics one) - proving the
+                                generalization genuinely works for a second
+                                module, not just a Transcriptomics-shaped stub.
+playwright_proteomics_quant.py  56 checks. Milestone 2 - the first real-
                                 browser coverage of Quantitative Enrichment
                                 (1D annotation enrichment / competitive
                                 Wilcoxon, reusing Genomics' Gene-set Burden
@@ -1060,7 +1165,32 @@ playwright_proteomics_quant.py  41 checks. Milestone 2 - the first real-
                                 chart builders (dot, bar, volcano, enrichment
                                 map, protein-concept network) for real
                                 rendered Plotly figures, plus the CSV download
-                                endpoint.
+                                endpoint. Also closes a real gap found while
+                                auditing the module for completeness: MSigDB
+                                was selectable here (same as ORA/GSEA) but had
+                                NO cross-collection summary figure - ORA and
+                                GSEA both have one, Quant did not. Runs a real
+                                MSigDB: Oncogenic pass, opens the new summary
+                                figure and confirms it renders with REAL data
+                                (proving _msigdbFamiliesFromQuantTables' own
+                                column names - "FDR", "Effect (mean
+                                difference)" - actually match what the
+                                Wilcoxon engine's blocks carry, not just that
+                                the function is defined), then changes the
+                                significance threshold with the summary still
+                                open and confirms it survives - the one
+                                behaviour easy to miss when wiring
+                                refreshMsigdbSummary (declaring it without
+                                actually calling it from the alpha input's
+                                change handler). Also drives a clean-organism KEGG
+                                run through this screen's own OWN checkbox and
+                                widget instance (the full strain-picker flow
+                                is already covered in
+                                playwright_proteomics_ora.py, using the same
+                                generalized widget - no need to duplicate it
+                                here), confirming a real single "KEGG" family
+                                with no direction suffix comes back with
+                                tested terms.
 test_organism_allowlist_mirror.py  7 checks. Guards a drift risk found while
                                 auditing organism generality: several
                                 per-database organism allowlists are

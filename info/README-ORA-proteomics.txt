@@ -105,7 +105,7 @@ isn't a coincidence — complementary, not interchangeable.
 
 THE DATABASES
 ----------------
-Eight sources are offered. Six are natively keyed on UniProt accessions —
+Nine sources are offered. Seven are natively keyed on UniProt accessions —
 they annotate PROTEINS, not genes — so your accessions are used directly,
 with no conversion:
 
@@ -113,6 +113,11 @@ with no conversion:
     process it takes part in. Tested as three separate families (Biological
     Process, Molecular Function, Cellular Component). Source: EBI QuickGO.
   - REACTOME — curated metabolic and signaling pathways.
+  - KEGG — curated metabolic and signaling pathway MAPS, with by far the
+    broadest organism coverage of any database here. Your accessions reach
+    it through KEGG's own accession-to-gene table, not a symbol bridge - see
+    "USING KEGG" below for how the organism is chosen and what "no results"
+    means here.
   - INTERPRO — protein domain and family signatures. Genuinely
     protein-level: a domain is a property of a protein sequence. Pfam,
     SMART, PROSITE and others are member databases INSIDE InterPro, so they
@@ -147,6 +152,52 @@ challenge page, including for static files). This is an access barrier, not
 a licensing one. PANTHER's protein FAMILY signatures are in any case already
 covered through InterPro, which includes PANTHER as a member database; only
 PANTHER's own Protein Class hierarchy is missing.
+
+USING KEGG
+--------------
+There is nothing extra to choose. KEGG names organisms with its own codes
+("hsa" for human, "cam" for chickpea) rather than by NCBI taxon, so the code
+is looked up automatically from the organism you already picked at
+retrieval, and then checked against the NCBI taxon KEGG itself records for
+that genome before anything is tested. You never pick a KEGG organism
+separately from a general list.
+
+Unlike GO/Reactome/InterPro/Complex Portal/UniProt above, KEGG does not use
+your accession directly as its identity - it looks up which KEGG GENE each
+accession corresponds to (via KEGG's own accession-to-gene table) and tests
+in that space. This matters in one specific way: an accession KEGG cannot
+uniquely place (rare - measured on the human proteome, under 1% of
+accessions) is left out rather than guessed at, the same "never guess" rule
+this app applies to every other identifier-mapping step.
+
+Two cases end with no automatic match:
+  - KEGG has no genome for your organism at all. KEGG only covers organisms
+    with a sequenced, annotated genome in KEGG GENOME. GO still works, and
+    nothing more can be done for KEGG here.
+  - KEGG has several strain-level genomes and no way to tell which one you
+    meant. This is common for bacteria: "Bacillus subtilis" as a species
+    matches 14 KEGG genomes, every one of them a specific strain. Checking
+    the KEGG box then shows a picker listing exactly those candidates —
+    confirm the one you meant, or leave it unconfirmed to skip KEGG for this
+    run. A confirmed organism is never taxon-verified the way an automatic
+    match is (that verification is exactly what failed here), so results
+    carry a caveat naming it as a manual choice. Changing the organism at
+    retrieval clears any earlier confirmation.
+
+Each KEGG result also reports how many of your quantified proteins actually
+reached a KEGG pathway (e.g. "1,542 of your 3,500 quantified proteins map to
+a KEGG gene that sits on a KEGG pathway map") - a coverage number worth
+reading before concluding "no significant KEGG terms" means anything about
+your biology, since it might just mean few of your measured proteins have
+KEGG pathway annotations for this organism.
+
+KEGG'S REST API AND ACADEMIC USE. KEGG's REST API is intended for
+individual, academic use; its terms restrict systematic bulk downloading
+and commercial redistribution of its data. This module's KEGG requests are
+a handful of bulk calls per organism you actually analyze — cached
+afterward — not an export of KEGG's database. This app is distributed as
+source for you to run yourself, rather than offered as a hosted service
+making KEGG calls on other users' behalf.
 
 WHY TWO DISEASE DATABASES
 -----------------------------
@@ -224,7 +275,9 @@ THINGS TO KEEP IN MIND
   - DISEASES is human-only and MSigDB is human/mouse-only; both are greyed
     out for other organisms rather than returning an unexplained empty
     table. Complex Portal covers ~20 species. GO, Reactome, InterPro and
-    UniProt cover far more.
+    UniProt cover far more. KEGG usually covers MORE non-model organisms
+    than any other database here - see "USING KEGG" above for the one case
+    (strain-level ambiguity) where it needs your confirmation to proceed.
   - A database returning no terms is a real answer, not necessarily a
     problem — check how many terms were TESTED (shown in the selector)
     before assuming something went wrong.

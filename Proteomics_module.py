@@ -18,6 +18,25 @@ Databases
   GO, Reactome          - reuse Genomics_module.build_go_universe /
                            build_reactome_universe verbatim (same accession
                            space, same native sources).
+  KEGG                  - accession-space too, but via a NEW join
+                           (build_kegg_accession_sets below), not a verbatim
+                           reuse: Genomics ORA/Burden's KEGG universe is
+                           KEGG-gene-ID-keyed (needs a separate "Resolve KEGG
+                           gene IDs" retrieval step to assign one), and
+                           Transcriptomics' is Entrez-ID-keyed (bridged
+                           through entrez_id). Proteomics already starts FROM
+                           the UniProt accession, so this instead joins
+                           accession -> KEGG gene -> pathway directly, via
+                           KEGG's own conv/uniprot table (build_kegg_gene_map,
+                           already deduplicated - an accession mapping to
+                           more than one KEGG gene is dropped, never guessed)
+                           and build_kegg_universe's pathway membership. No
+                           retriever change: "accession" is already a
+                           RESOLVED_COLUMNS field. Organism is DERIVED from
+                           taxon_id/taxon_name (Transcriptomics_module.
+                           resolve_kegg_organism_code, reused unchanged) -
+                           never a second, independently-settable picker; see
+                           that function's docstring for why.
   MSigDB                - gene-symbol-native (reuses
                            Transcriptomics_module.fetch_msigdb_sets); tested
                            via the resolved accession->gene_symbol bridge,
@@ -77,10 +96,21 @@ from Genomics_module import (
     load_custom_geneset_db, load_user_background_list,
     _fetch_uniprot_annotations_bulk,
     _load_universe_cache, _save_universe_cache,
+    # KEGG: build_kegg_gene_map (accession -> KEGG gene, native KEGG source,
+    # already deduplicated) and build_kegg_universe (KEGG-gene-keyed pathway
+    # membership, already tested/cached) - reused as-is, never re-implemented.
+    # See build_kegg_accession_sets below for the accession-space join.
+    build_kegg_gene_map, build_kegg_universe,
 )
 from Transcriptomics_module import (
     fetch_msigdb_sets, msigdb_collection_available, MSIGDB_COLLECTIONS,
     _msigdb_selected_keys, GSEA_RANKING_METRICS, GSEA_MIN_P,
+    # KEGG organism resolution is organism-only (taxon_id/taxon_name in,
+    # KEGG organism code out) - not gene-symbol-specific despite living in
+    # Transcriptomics_module, so it's reused unchanged here rather than
+    # re-derived. See that function's docstring for the divergence-bug
+    # history (commit 27ce033) this design avoids.
+    resolve_kegg_organism_code,
 )
 
 # ---------------------------------------------------------------------------
@@ -93,7 +123,7 @@ DIRECTIONS = ("all", "up", "down")
 
 # PANTHER intentionally excluded - see module docstring.
 PROTEOMICS_ORA_DATABASES = [
-    "GO", "Reactome", "MSigDB", "UniProt (disease)", "UniProt (keywords)",
+    "GO", "Reactome", "KEGG", "MSigDB", "UniProt (disease)", "UniProt (keywords)",
     "InterPro", "Complex Portal", "DISEASES", "Custom database",
 ]
 
@@ -508,6 +538,181 @@ def build_complex_portal_universe(taxon_id: str, verbose: bool = False, force_re
 
 
 # ---------------------------------------------------------------------------
+# KEGG PATHWAY - accession-space join (native KEGG source via
+# Genomics_module's tested, cached KEGG plumbing)
+# ---------------------------------------------------------------------------
+
+def build_kegg_accession_sets(
+    organism_code: str,
+    measured_accessions: set,
+    verbose: bool = False,
+    force_refresh: bool = False,
+) -> dict:
+    """Build KEGG PATHWAY gene sets keyed on UniProt accession, for one KEGG
+    organism.
+
+    Unlike Genomics ORA/Burden (KEGG-gene-ID-keyed universe, matched against
+    a per-row KEGG gene ID the retriever assigns via a separate "Resolve KEGG
+    gene IDs" step) and Transcriptomics (Entrez-ID-keyed, bridged through the
+    resolved DE table's own entrez_id column), Proteomics already starts FROM
+    the UniProt accession - its native, retriever-provided identifier - so no
+    separate resolution step or identifier bridge is needed here. This does
+    the accession -> KEGG gene -> pathway join directly:
+
+      1. build_kegg_gene_map(org)["acc_to_gene"] - accession -> KEGG gene,
+         from KEGG's own conv/uniprot table, already deduplicated (an
+         accession mapping to more than one KEGG gene is dropped entirely,
+         never guessed - see that function's own docstring). Measured live on
+         human: 99.07% of accessions map to exactly one KEGG gene.
+      2. build_kegg_universe(org)["pathways"] - KEGG-gene-keyed pathway
+         membership (already tested, disk-cached).
+      3. Join accession -> gene -> pathways: invert the SAME (already-
+         deduplicated) acc_to_gene map to {gene: {accessions}}, then for each
+         pathway, union in every accession behind each of its member genes.
+         Going gene -> accession the naive way, from KEGG's own RAW (un-
+         deduplicated) conv/uniprot data, is exactly the accession fan-out
+         problem that made Genomics move off accession space for its own
+         KEGG universe (verified there: human N=10,873 accessions vs N=9,424
+         real genes). Building the inverse from acc_to_gene instead means an
+         accession only ever appears under a gene when KEGG's own data
+         uniquely assigned it there. Two or more measured accessions CAN
+         legitimately land under the same gene (isoforms) and both are kept -
+         that mirrors how GO/Reactome/InterPro/Complex Portal already treat
+         accession-space membership in this module; it is not a KEGG-specific
+         inflation.
+
+    measured_accessions: this run's own quantified-protein accessions (same
+    set run_ora/run_quantitative_enrichment intersect every other database's
+    universe against) - used only to report HOW MUCH of it actually reached
+    KEGG (n_measured/n_mapped/n_on_pathway below), for the caller's coverage
+    caveat. The returned "pathways" values are NOT pre-intersected against it
+    (every other universe builder in this module returns its full set and
+    lets the caller intersect - kept consistent here).
+
+    Returns {"pathways": {pathway_id: {"name": str, "genes": set[accession]}},
+             "n_measured": int, "n_mapped": int, "n_on_pathway": int,
+             "fetch_failed": bool, "caveat": str|None} - the "pathways" shape
+    matches build_reactome_universe's, so callers use it identically. Not
+    cached itself (build_kegg_gene_map and build_kegg_universe already cache
+    their own halves); this join is a cheap in-memory pass over data both
+    already fetched.
+    """
+    org = str(organism_code or "").strip().lower()
+    if not org:
+        return {
+            "pathways": {}, "n_measured": len(measured_accessions), "n_mapped": 0,
+            "n_on_pathway": 0, "fetch_failed": False,
+            "caveat": "No KEGG organism code was provided.",
+        }
+
+    gene_map = build_kegg_gene_map(org, verbose=verbose, force_refresh=force_refresh)
+    universe = build_kegg_universe(org, verbose=verbose, force_refresh=force_refresh)
+
+    acc_to_gene = gene_map.get("acc_to_gene") or {}
+    gene_to_accs: dict = {}
+    for acc, gene in acc_to_gene.items():
+        gene_to_accs.setdefault(gene, set()).add(acc)
+
+    pathways: dict = {}
+    for pw_id, info in universe.get("pathways", {}).items():
+        accs: set = set()
+        for gene in info["genes"]:
+            accs |= gene_to_accs.get(gene, set())
+        if accs:
+            pathways[pw_id] = {"name": info["name"], "genes": accs}
+
+    gene_caveat = gene_map.get("caveat")
+    universe_caveat = universe.get("caveat")
+    fetch_failed = bool(
+        (gene_caveat and gene_caveat.startswith("Could not reach"))
+        or (universe_caveat and universe_caveat.startswith("Could not reach"))
+    )
+    caveat = gene_caveat or universe_caveat
+
+    n_measured = len(measured_accessions)
+    n_mapped = len(measured_accessions & set(acc_to_gene.keys()))
+    on_pathway_accs: set = set()
+    for info in pathways.values():
+        on_pathway_accs |= info["genes"]
+    n_on_pathway = len(measured_accessions & on_pathway_accs)
+
+    if verbose:
+        print(f"[KEGG accession sets] org={org!r}: {len(pathways)} pathways, "
+              f"n_measured={n_measured}, n_mapped={n_mapped}, n_on_pathway={n_on_pathway}")
+
+    return {
+        "pathways": pathways,
+        "n_measured": n_measured, "n_mapped": n_mapped, "n_on_pathway": n_on_pathway,
+        "fetch_failed": fetch_failed, "caveat": caveat,
+    }
+
+
+def _resolve_kegg_for_proteomics(
+    taxon_id: str,
+    taxon_name: str,
+    universe_accessions: set,
+    kegg_confirmed_organism_code: str = "",
+    verbose: bool = False,
+    force_refresh: bool = False,
+) -> "tuple[dict, str, str]":
+    """Shared by run_ora and run_quantitative_enrichment: resolve KEGG's
+    organism and fetch its accession-space pathway sets, in one place so the
+    two callers' KEGG blocks don't duplicate this note-construction logic.
+
+    Returns (pathways, caveat, note):
+      - note is set (and pathways is {}) whenever nothing can be tested, for
+        one of several distinct reasons (organism unresolved/ambiguous, KEGG
+        unreachable, no proteins mapped, mapped proteins on no pathway) -
+        each gets its OWN explanation, never collapsed into a generic
+        "no overlap" message a reader would mistake for a biology conclusion.
+        In this case `caveat` is the organism-resolution caveat ONLY (e.g. an
+        unverified/manually-confirmed organism) - the CALLER combines it with
+        `note` before storing (see run_ora's KEGG block).
+      - note is None (success) means `caveat` is the FULLY COMBINED caveat
+        (organism-resolution + coverage), ready to attach to every stored
+        block as-is.
+    """
+    kegg_org = resolve_kegg_organism_code(
+        taxon_id, taxon_name, verbose=verbose, force_refresh=force_refresh,
+        confirmed_organism_code=kegg_confirmed_organism_code,
+    )
+    org_caveat = kegg_org.get("caveat")
+    note = kegg_org.get("note")
+    if note:
+        return {}, org_caveat, note
+
+    kegg = build_kegg_accession_sets(
+        kegg_org["organism_code"], universe_accessions, verbose=verbose, force_refresh=force_refresh,
+    )
+    pathways = kegg["pathways"]
+    if kegg.get("fetch_failed"):
+        note = kegg.get("caveat") or (
+            "Could not reach KEGG for this run (transient service error); KEGG's terms are "
+            "unavailable. Re-run the analysis to retry."
+        )
+        return {}, org_caveat, note
+    if kegg["n_mapped"] == 0:
+        note = kegg.get("caveat") or (
+            f"None of your quantified proteins map to a KEGG gene for organism "
+            f"\"{kegg_org['organism_name']}\" ({kegg_org['organism_code']})."
+        )
+        return {}, org_caveat, note
+    if not pathways:
+        note = (
+            f"{kegg['n_mapped']} of your {kegg['n_measured']} quantified proteins map to a KEGG "
+            "gene, but none of those genes sit on any KEGG pathway map."
+        )
+        return {}, org_caveat, note
+
+    coverage_caveat = (
+        f"{kegg['n_on_pathway']} of your {kegg['n_measured']} quantified proteins map to a KEGG "
+        "gene that sits on a KEGG pathway map."
+    )
+    combined_caveat = " ".join(c for c in (org_caveat, coverage_caveat) if c) or None
+    return pathways, combined_caveat, None
+
+
+# ---------------------------------------------------------------------------
 # ORA orchestrator
 # ---------------------------------------------------------------------------
 
@@ -667,6 +872,7 @@ def run_ora(
     custom_db: "dict | None" = None,
     background_accessions: "set | None" = None,
     msigdb_collections: "list[str] | None" = None,
+    kegg_confirmed_organism_code: str = "",
     progress_callback=None,
     verbose: bool = False,
 ) -> dict:
@@ -684,6 +890,12 @@ def run_ora(
         identifier space with no adaptation needed).
     background_accessions: optional UniProt-accession set restricting the
         universe for every database (from load_user_background_list).
+    kegg_confirmed_organism_code: KEGG only, and only meaningful in the rare
+        case resolve_kegg_organism_code cannot taxon-verify a unique KEGG
+        organism for this run. Forwarded as-is to that function's
+        confirmed_organism_code - see its docstring (Transcriptomics_module)
+        for why this can never become an independent organism source.
+        Ignored when the organism resolves automatically.
     """
     def _progress(step, total, label):
         if progress_callback:
@@ -821,6 +1033,25 @@ def run_ora(
             r_genes &= universe_accessions_all  # ALWAYS - see the GO block's comment above
             for direction_key in DIRECTIONS:
                 _run_family(f"Reactome ({direction_key})", direction_key, reactome_universe["pathways"], r_genes)
+
+    if "KEGG" in databases:
+        kegg_pathways, kegg_caveat, kegg_note = _resolve_kegg_for_proteomics(
+            taxon_id, taxon_name, universe_accessions_all, kegg_confirmed_organism_code,
+            verbose=verbose, force_refresh=force_refresh,
+        )
+        if kegg_note:
+            combined = (kegg_caveat + " " + kegg_note) if kegg_caveat else kegg_note
+            for direction_key in DIRECTIONS:
+                step += 1
+                _progress(step, steps_total, f"KEGG ({direction_key})")
+                tables[f"KEGG ({direction_key})"] = _empty_block(combined)
+        else:
+            k_genes: set = set()
+            for info in kegg_pathways.values():
+                k_genes |= info["genes"]
+            k_genes &= universe_accessions_all  # ALWAYS - see the GO block's comment above
+            for direction_key in DIRECTIONS:
+                _run_family(f"KEGG ({direction_key})", direction_key, kegg_pathways, k_genes, kegg_caveat)
 
     if "UniProt (disease)" in databases:
         disease_universe = build_uniprot_disease_universe(taxon_id, verbose=verbose, force_refresh=force_refresh)
@@ -1030,6 +1261,7 @@ def run_quantitative_enrichment(
     custom_db: "dict | None" = None,
     background_accessions: "set | None" = None,
     msigdb_collections: "list[str] | None" = None,
+    kegg_confirmed_organism_code: str = "",
     progress_callback=None,
     verbose: bool = False,
 ) -> dict:
@@ -1048,6 +1280,8 @@ def run_quantitative_enrichment(
     custom_db: required when "Custom database" is selected.
     background_accessions: optional UniProt-accession set restricting the
         universe for every database (from load_user_background_list).
+    kegg_confirmed_organism_code: KEGG only - see run_ora's docstring, same
+        contract exactly.
     """
     def _progress(step, total, label):
         if progress_callback:
@@ -1133,6 +1367,22 @@ def run_quantitative_enrichment(
                 r_genes |= info["genes"]
             r_genes &= universe_accessions_all
             _run_family("Reactome", reactome_universe["pathways"], r_genes, score_by_acc)
+
+    if "KEGG" in databases:
+        kegg_pathways, kegg_caveat, kegg_note = _resolve_kegg_for_proteomics(
+            taxon_id, taxon_name, universe_accessions_all, kegg_confirmed_organism_code,
+            verbose=verbose, force_refresh=force_refresh,
+        )
+        if kegg_note:
+            step += 1
+            combined = (kegg_caveat + " " + kegg_note) if kegg_caveat else kegg_note
+            tables["KEGG"] = _empty_block(combined)
+        else:
+            k_genes: set = set()
+            for info in kegg_pathways.values():
+                k_genes |= info["genes"]
+            k_genes &= universe_accessions_all
+            _run_family("KEGG", kegg_pathways, k_genes, score_by_acc, kegg_caveat)
 
     if "UniProt (disease)" in databases:
         disease_universe = build_uniprot_disease_universe(taxon_id, verbose=verbose, force_refresh=force_refresh)

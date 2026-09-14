@@ -96,17 +96,20 @@ targeted panel) and applies to every selected database.
 
 DATABASES
 ------------
-The same eight sources as Proteomics ORA, so the two modules differ only in
+The same nine sources as Proteomics ORA, so the two modules differ only in
 the statistic, never in what they know:
 
   GO (Biological Process / Molecular Function / Cellular Component),
-  Reactome, MSigDB, UniProt (disease), UniProt (keywords), InterPro,
+  Reactome, KEGG, MSigDB, UniProt (disease), UniProt (keywords), InterPro,
   Complex Portal, DISEASES, and your own Custom database.
 
 DISEASES is human-only and MSigDB is human/mouse-only; both grey out
 automatically for other organisms rather than returning a silent empty
 result. PANTHER is not included — see README-ORA-proteomics.txt for the
-reason (an access barrier, not a licensing one).
+reason (an access barrier, not a licensing one). KEGG's organism is derived
+automatically from your retrieval organism here too, with the same
+strain-disambiguation picker for the rare ambiguous case — see
+README-ORA-proteomics.txt's "USING KEGG" section, unchanged for this module.
 
 THE STATISTICAL TEST
 -----------------------
@@ -198,6 +201,14 @@ All charts are interactive (draggable nodes, adjustable font size, number of
 terms shown, and significance threshold) and exportable as SVG, PNG or
 300 dpi TIFF. The results table downloads as CSV with full numeric
 precision.
+
+MSIGDB COLLECTION SUMMARY — shown once per run (not per database), only when
+MSigDB was selected: one horizontal bar per selected collection, its length
+showing how many gene sets cleared your significance threshold, colour
+showing the direction of its best hit (Effect > 0 vs Effect < 0, the same
+signed quantity every other figure uses here). With up to 8 collections in
+one run, nothing else answers "which collection is actually carrying the
+signal?" without opening every table by hand.
 
 WHEN NOTHING IS SIGNIFICANT
 -------------------------------

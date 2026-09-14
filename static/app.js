@@ -1744,44 +1744,51 @@ function _msigdbCollectionAvailableForTaxon(collection, taxonId) {
 // independently BH-corrected result family (see the family-count caption on
 // the results screen) - shared between the ORA and GSEA config screens.
 // ---------------------------------------------------------------------------
-// KEGG organism widget (shared by ORA + GSEA config screens). KEGG's
-// organism is DERIVED from retrieval's taxonId/taxonName, never picked
-// separately - see resolve_kegg_organism_code's docstring for why a second,
-// independently-settable organism control here would recreate the
-// divergence bug fixed in commit 27ce033. This widget only ever offers a
-// choice among the CANDIDATES the server's own automatic pass already
-// produced for THIS organism, and only when that pass could not verify a
-// unique one on its own (e.g. a species with only strain-level KEGG
-// genomes) - it never lets the user pick an organism KEGG hasn't already
-// matched by name.
+// KEGG organism widget - shared by every module that derives KEGG's
+// organism from retrieval's taxonId/taxonName rather than picking it
+// separately: Transcriptomics ORA+GSEA and Proteomics ORA+Quantitative
+// Enrichment (moduleKey selects STATE[moduleKey] and /api/<moduleKey>/kegg/*
+// - default "transcriptomics" so existing call sites need no change). See
+// resolve_kegg_organism_code's docstring for why a second, independently-
+// settable organism control here would recreate the divergence bug fixed in
+// commit 27ce033. This widget only ever offers a choice among the
+// CANDIDATES the server's own automatic pass already produced for THIS
+// organism, and only when that pass could not verify a unique one on its
+// own (e.g. a species with only strain-level KEGG genomes) - it never lets
+// the user pick an organism KEGG hasn't already matched by name.
 // ---------------------------------------------------------------------------
 
-async function _fetchKeggOrganismCheck() {
-    const taxonId = STATE.transcriptomics.taxonId;
-    const taxonName = STATE.transcriptomics.taxonName;
-    const cached = STATE.transcriptomics._keggOrganismCheck;
+async function _fetchKeggOrganismCheck(moduleKey) {
+    moduleKey = moduleKey || "transcriptomics";
+    const state = STATE[moduleKey];
+    const taxonId = state.taxonId;
+    const taxonName = state.taxonName;
+    const cached = state._keggOrganismCheck;
     if (cached && cached.taxonId === taxonId && cached.taxonName === taxonName) {
         return cached.result;
     }
-    const result = await apiPostJson("/api/transcriptomics/kegg/resolve-organism", {});
-    STATE.transcriptomics._keggOrganismCheck = { taxonId, taxonName, result };
+    const result = await apiPostJson("/api/" + moduleKey + "/kegg/resolve-organism", {});
+    state._keggOrganismCheck = { taxonId, taxonName, result };
     return result;
 }
 
-function renderKeggOrganismWidget(container) {
+function renderKeggOrganismWidget(container, moduleKey) {
+    moduleKey = moduleKey || "transcriptomics";
+    const state = STATE[moduleKey];
     container.innerHTML = "";
-    const taxonId = STATE.transcriptomics.taxonId;
-    const taxonName = STATE.transcriptomics.taxonName;
+    const taxonId = state.taxonId;
+    const taxonName = state.taxonName;
 
     // A confirmation made for a DIFFERENT organism is stale - drop it so the
     // picker doesn't keep showing a leftover choice after switching species.
-    // The server independently guards this too (_job_resolve_de clears
-    // kegg_organism_confirmation, and _transcriptomics_kegg_confirmed_code
-    // re-checks it against the session's current organism before trusting
-    // it) - this is the client-side mirror of that, not the only guard.
-    const confirmed = STATE.transcriptomics._keggOrganismConfirmed;
+    // The server independently guards this too (_job_resolve_de/
+    // _job_resolve_proteins clear kegg_organism_confirmation, and
+    // _kegg_confirmed_code re-checks it against the session's current
+    // organism before trusting it) - this is the client-side mirror of
+    // that, not the only guard.
+    const confirmed = state._keggOrganismConfirmed;
     if (confirmed && (confirmed.taxonId !== taxonId || confirmed.taxonName !== taxonName)) {
-        STATE.transcriptomics._keggOrganismConfirmed = null;
+        state._keggOrganismConfirmed = null;
     }
 
     container.appendChild(el("div", { class: "caption" },
@@ -1789,8 +1796,8 @@ function renderKeggOrganismWidget(container) {
         + "KEGG names organisms with its own codes, so the code is looked up from that organism and "
         + "checked against KEGG's own NCBI taxon before anything is tested."));
 
-    if (STATE.transcriptomics._keggOrganismConfirmed) {
-        const c = STATE.transcriptomics._keggOrganismConfirmed;
+    if (state._keggOrganismConfirmed) {
+        const c = state._keggOrganismConfirmed;
         container.appendChild(el("div", { class: "caption ora-selected-caption" },
             "Confirmed manually: " + c.organismName + " (KEGG organism " + c.organismCode + ") - "
             + "KEGG could not verify a unique match automatically, so this was picked from its "
@@ -1801,7 +1808,7 @@ function renderKeggOrganismWidget(container) {
     const statusDiv = el("div", { class: "caption" }, "Checking whether KEGG's organism can be resolved automatically...");
     container.appendChild(statusDiv);
 
-    _fetchKeggOrganismCheck().then((result) => {
+    _fetchKeggOrganismCheck(moduleKey).then((result) => {
         statusDiv.remove();
         if (result.organism_code) {
             // Resolved automatically (verified or single unverified name
@@ -1828,9 +1835,9 @@ function renderKeggOrganismWidget(container) {
                 confirmBtn.disabled = true;
                 confirmBtn.textContent = "Confirming...";
                 try {
-                    const confirmResult = await apiPostJson("/api/transcriptomics/kegg/confirm-organism",
+                    const confirmResult = await apiPostJson("/api/" + moduleKey + "/kegg/confirm-organism",
                         { organism_code: select.value });
-                    STATE.transcriptomics._keggOrganismConfirmed = {
+                    state._keggOrganismConfirmed = {
                         taxonId, taxonName,
                         organismCode: confirmResult.organism_code,
                         organismName: confirmResult.organism_name,
@@ -2035,6 +2042,37 @@ function buildMsigdbOraCollectionSummary(div, tables, alpha, slug) {
 function buildMsigdbGseaCollectionSummary(div, tables, alpha, slug) {
     _buildMsigdbCollectionSummaryCore(div, _msigdbFamiliesFromGseaTables(tables, alpha), alpha, slug,
         { directional: true, effectLabel: "NES" });
+}
+// Proteomics Quantitative Enrichment: same per-collection SHAPE as GSEA (one
+// row per selected collection, no direction suffix on the result key - the
+// signed Effect already carries direction, mirroring GSEA's signed NES), but
+// built on the Burden/Wilcoxon engine's own column names ("FDR", "Effect
+// (mean difference)"), not GSEA's ("FDR q-value", "NES") - so neither
+// existing extraction function is reusable as-is; this is genuinely a third
+// column-name pairing over the same key format _msigdbFamiliesFromGseaTables
+// already uses.
+function _msigdbFamiliesFromQuantTables(tables, alpha) {
+    const families = [];
+    TRANSCRIPTOMICS_MSIGDB_COLLECTIONS.forEach((c) => {
+        const key = "MSigDB: " + c.label;
+        const block = tables[key];
+        if (!block) return;
+        const rows = _tableToObjects(block.table);
+        const nSignificant = rows.filter((r) => {
+            const fdr = _msigdbNum(r.FDR);
+            return !isNaN(fdr) && fdr < alpha;
+        }).length;
+        const best = _msigdbBestRow(rows, "FDR", "Effect (mean difference)");
+        families.push({ label: c.label, nSignificant, ...best });
+    });
+    return families;
+}
+function buildMsigdbQuantCollectionSummary(div, tables, alpha, slug) {
+    // directional:true - Effect (mean difference) is signed, same as GSEA's
+    // NES (positive = higher than the rest of the quantified proteome,
+    // negative = lower) - unlike ORA's unsigned fold enrichment.
+    _buildMsigdbCollectionSummaryCore(div, _msigdbFamiliesFromQuantTables(tables, alpha), alpha, slug,
+        { directional: true, effectLabel: "Effect (mean difference)" });
 }
 
 // Shared by the ORA and GSEA config screens (GSEA renders the same list).
@@ -2861,7 +2899,7 @@ const PROTEOMICS_TILES_NOT_YET_IMPLEMENTED = new Set([
 
 // Mirrors Proteomics_module.PROTEOMICS_ORA_DATABASES - keep in sync.
 const PROTEOMICS_ORA_DATABASES = [
-    "GO", "Reactome", "MSigDB", "UniProt (disease)", "UniProt (keywords)",
+    "GO", "Reactome", "KEGG", "MSigDB", "UniProt (disease)", "UniProt (keywords)",
     "InterPro", "Complex Portal", "DISEASES", "Custom database",
 ];
 // DISEASES (Jensen Lab) is a HUMAN-only resource by design, so its
@@ -2964,7 +3002,25 @@ function renderProteomicsOrganismSelector() {
             STATE.proteomics.oraConfig = null;
             STATE.proteomics.oraResults = null;
             STATE.proteomics.oraRunLocked = false;
+            // Pre-existing gap fixed alongside the KEGG work: this used to
+            // clear ONLY the ORA fields, leaving Quantitative Enrichment's
+            // results/config/lock from the OLD organism still sitting in
+            // state after switching to a new one (reachable only via
+            // "Continue to Quantitative Enrichment", which does reset these
+            // itself - so low-impact in practice, but a real inconsistency
+            // with the ORA branch above, and there's no reason the two
+            // analyses should behave differently here).
+            STATE.proteomics.quantConfig = null;
+            STATE.proteomics.quantResults = null;
+            STATE.proteomics.quantRunLocked = false;
         }
+        // KEGG organism resolution/confirmation (renderKeggOrganismWidget) is
+        // also organism-gated - the widget itself re-checks these against the
+        // CURRENT taxonId/taxonName before trusting them (same as
+        // Transcriptomics), so this isn't the only guard, but clearing here
+        // too avoids a stale check result ever being visible for one render.
+        delete STATE.proteomics._keggOrganismCheck;
+        delete STATE.proteomics._keggOrganismConfirmed;
         render();
     });
 
@@ -2993,12 +3049,22 @@ function renderProteomicsUploadSection() {
                 // Server's upload endpoint resets the whole session sub-dict -
                 // clear client-side too, or the UI would keep showing state
                 // the server can no longer serve (mirrors Transcriptomics).
+                // Was missing quantConfig/quantResults/quantRunLocked (fixed
+                // alongside the KEGG work) despite this comment's own stated
+                // intent of a FULL mirror - a stale Quantitative Enrichment
+                // result from the previous file could otherwise survive a
+                // brand new upload.
                 STATE.proteomics.customDb = null;
                 STATE.proteomics.background = null;
                 STATE.proteomics.resolved = null;
                 STATE.proteomics.oraConfig = null;
                 STATE.proteomics.oraResults = null;
                 STATE.proteomics.oraRunLocked = false;
+                STATE.proteomics.quantConfig = null;
+                STATE.proteomics.quantResults = null;
+                STATE.proteomics.quantRunLocked = false;
+                delete STATE.proteomics._keggOrganismCheck;
+                delete STATE.proteomics._keggOrganismConfirmed;
                 render();
             } catch (err) {
                 alert(err.message);
@@ -3314,7 +3380,7 @@ function renderProteomicsOraConfigScreen() {
             } else {
                 draft.databases = draft.databases.filter((d) => d !== dbName);
             }
-            if (dbName === "Custom database" || dbName === "MSigDB") render();
+            if (dbName === "Custom database" || dbName === "MSigDB" || dbName === "KEGG") render();
             else renderOraRunBtn();
         });
         label.appendChild(cb);
@@ -3331,6 +3397,11 @@ function renderProteomicsOraConfigScreen() {
         wrap.appendChild(el("div", { class: "caption" },
             "DISEASES is disabled: it is a human-only disease-gene resource."));
     }
+    if (draft.databases.indexOf("KEGG") !== -1) {
+        const keggOrganismWrap = el("div", { class: "ora-kegg-organism-wrap" });
+        wrap.appendChild(keggOrganismWrap);
+        renderKeggOrganismWidget(keggOrganismWrap, "proteomics");
+    }
     if (draft.databases.indexOf("MSigDB") !== -1 && msigdbAvailable) {
         wrap.appendChild(renderMsigdbCollectionSelector(locked, draft, taxonId, renderOraRunBtn));
     }
@@ -3338,7 +3409,9 @@ function renderProteomicsOraConfigScreen() {
         wrap.appendChild(renderProteomicsCustomDbWidget(locked));
     }
     wrap.appendChild(el("div", { class: "caption" },
-        "GO / Reactome / MSigDB / Custom: same engines as Transcriptomics. UniProt (disease) and " +
+        "GO / Reactome / MSigDB / Custom: same engines as Transcriptomics. KEGG: joins your " +
+        "quantified proteins to KEGG pathway maps via KEGG's own accession -> gene table (see the " +
+        "caption above once checked). UniProt (disease) and " +
         "UniProt (keywords): UniProt's own curated annotations - note UniProt's disease entries are " +
         "overwhelmingly one-gene rare diseases, so most are too small to test. DISEASES (Jensen Lab, " +
         "CC BY 4.0, human only): curated gene-disease associations grouped into broad disease " +
@@ -3465,7 +3538,7 @@ function startProteomicsOraRun(draft) {
 
 const PROTEOMICS_ORA_FAMILY_ORDER = [
     "GO: Biological Process", "GO: Molecular Function", "GO: Cellular Component",
-    "Reactome", "UniProt disease", "UniProt keywords", "InterPro", "Complex Portal",
+    "Reactome", "KEGG", "UniProt disease", "UniProt keywords", "InterPro", "Complex Portal",
     "DISEASES",
     ...TRANSCRIPTOMICS_MSIGDB_COLLECTIONS.map((c) => "MSigDB: " + c.label),
     "Custom database",
@@ -3879,7 +3952,7 @@ function renderProteomicsQuantConfigScreen() {
             } else {
                 draft.databases = draft.databases.filter((d) => d !== dbName);
             }
-            if (dbName === "Custom database" || dbName === "MSigDB") render();
+            if (dbName === "Custom database" || dbName === "MSigDB" || dbName === "KEGG") render();
             else renderQuantRunBtn();
         });
         label.appendChild(cb);
@@ -3896,6 +3969,11 @@ function renderProteomicsQuantConfigScreen() {
         wrap.appendChild(el("div", { class: "caption" },
             "DISEASES is disabled: it is a human-only disease-gene resource."));
     }
+    if (draft.databases.indexOf("KEGG") !== -1) {
+        const keggOrganismWrap = el("div", { class: "ora-kegg-organism-wrap" });
+        wrap.appendChild(keggOrganismWrap);
+        renderKeggOrganismWidget(keggOrganismWrap, "proteomics");
+    }
     if (draft.databases.indexOf("MSigDB") !== -1 && msigdbAvailable) {
         wrap.appendChild(renderMsigdbCollectionSelector(locked, draft, taxonId, renderQuantRunBtn));
     }
@@ -3903,7 +3981,7 @@ function renderProteomicsQuantConfigScreen() {
         wrap.appendChild(renderProteomicsCustomDbWidget(locked));
     }
     wrap.appendChild(el("div", { class: "caption" },
-        "Same 8 databases as Over-Representation Analysis (see that screen's caption for what each " +
+        "The same databases as Over-Representation Analysis (see that screen's caption for what each " +
         "one is). The difference is the STATISTIC: instead of testing a significant/non-significant " +
         "split, this compares the ranking-metric values of proteins INSIDE each term against every " +
         "other quantified protein (a competitive Wilcoxon rank-sum test, two-sided) - the proteomics " +
@@ -4076,6 +4154,8 @@ function renderProteomicsQuantResultsScreen() {
         if (acc && r.log2FC !== null && isFinite(Number(r.log2FC))) proteinLog2FC[acc] = Number(r.log2FC);
     });
 
+    let refreshMsigdbSummary = null;
+
     const alphaRow = el("div", { class: "ora-sig-threshold-row" });
     alphaRow.appendChild(el("span", { class: "chart-option-label" }, "Significance threshold (FDR <)"));
     const alphaInput = el("input", { type: "number", class: "ora-sig-threshold-input", min: "0", max: "1", step: "0.001" });
@@ -4086,6 +4166,7 @@ function renderProteomicsQuantResultsScreen() {
         STATE.proteomics.quantSigAlpha = v;
         alphaInput.value = v;
         renderPanel(select.value);
+        if (refreshMsigdbSummary) refreshMsigdbSummary();
     });
     alphaRow.appendChild(alphaInput);
     wrap.appendChild(alphaRow);
@@ -4107,6 +4188,36 @@ function renderProteomicsQuantResultsScreen() {
         "Each database (and each selected MSigDB collection) is independently Benjamini-Hochberg " +
         "corrected - there is no correction ACROSS these families. Scanning every table and reporting " +
         "the best hit across all of them inflates the true error rate above what any single FDR column states."));
+
+    const hasMsigdbFamilies = Object.keys(tables).some((k) => k.startsWith("MSigDB: "));
+    if (hasMsigdbFamilies) {
+        const summaryCard = el("div", { class: "ora-db-card msigdb-summary-card" });
+        summaryCard.appendChild(el("div", { class: "result-pane-header" },
+            el("h2", { class: "result-pane-title" }, "MSigDB collections")));
+        const summaryDiv = el("div", { id: _oraChartId("msigdbsummary", "proteomics_quant", null), class: "chart-container", style: { display: "none" } });
+        let summaryShown = false, summaryBuilt = false;
+        const summaryBtn = el("button", { class: "btn chart-toggle-btn" }, "Show MSigDB collection summary");
+        summaryBtn.addEventListener("click", () => {
+            if (!summaryShown) {
+                summaryDiv.style.display = "";
+                if (!summaryBuilt) {
+                    buildMsigdbQuantCollectionSummary(summaryDiv, tables, STATE.proteomics.quantSigAlpha, "proteomics_quant");
+                    summaryBuilt = true;
+                } else if (typeof Plotly !== "undefined") Plotly.Plots.resize(summaryDiv);
+                summaryShown = true; summaryBtn.textContent = "Hide MSigDB collection summary";
+            } else { summaryDiv.style.display = "none"; summaryShown = false; summaryBtn.textContent = "Show MSigDB collection summary"; }
+        });
+        refreshMsigdbSummary = () => {
+            summaryBuilt = false;
+            if (summaryShown) {
+                buildMsigdbQuantCollectionSummary(summaryDiv, tables, STATE.proteomics.quantSigAlpha, "proteomics_quant");
+                summaryBuilt = true;
+            }
+        };
+        summaryCard.appendChild(summaryBtn);
+        summaryCard.appendChild(summaryDiv);
+        wrap.appendChild(summaryCard);
+    }
 
     const sortedKeys = _sortedProteomicsQuantKeys(tables);
     const selectorRow = el("div", { class: "row" });

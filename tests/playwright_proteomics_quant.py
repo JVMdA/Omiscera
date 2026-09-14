@@ -213,6 +213,113 @@ with sync_playwright() as p:
     csv_text = csv_resp.text()
     check("Overlapping Proteins" in csv_text.splitlines()[0], "downloaded CSV header uses the renamed column")
 
+    print("=== MSigDB collection summary: the gap this run closes ===")
+    # Proteomics Quant offered MSigDB (any number of collections at once,
+    # same as ORA/GSEA) but had no cross-collection summary figure - the
+    # ORA/GSEA screens both have one, Quant did not. Oncogenic (189 human
+    # sets) kept deliberately small for speed, same choice playwright_msigdb.py
+    # already made for the identical reason.
+    page.evaluate("""() => {
+        STATE.proteomics.quantRunLocked = false;
+        STATE.aaPage = 'proteomics_quant_config';
+        delete STATE.proteomics._quantDraft;
+        render();
+    }""")
+    page.wait_for_timeout(200)
+    page.locator("label.ora-db-pill", has_text="MSigDB").first.locator("input[type=checkbox]").check()
+    page.wait_for_timeout(200)
+    oncogenic_pill = page.locator(".ora-msigdb-collections label", has_text="Oncogenic")
+    check(oncogenic_pill.count() == 1, "the Oncogenic collection checkbox is present on the Quant config screen")
+    oncogenic_pill.locator("input[type=checkbox]").check()
+    page.wait_for_timeout(100)
+    run_btn3 = page.locator("button.ora-run-btn")
+    check(not run_btn3.is_disabled(), "Run button enabled with MSigDB: Oncogenic selected")
+    run_btn3.click()
+    page.wait_for_timeout(300)
+    for _ in range(300):
+        if page.evaluate("!!STATE.proteomics.quantResults"):
+            break
+        page.wait_for_timeout(1000)
+    check(page.evaluate("!!STATE.proteomics.quantResults") is True, "the MSigDB-only Quant run finished")
+    msigdb_quant_tables = page.evaluate("Object.keys(STATE.proteomics.quantResults.tables)")
+    check(any(k.startswith("MSigDB: Oncogenic") for k in msigdb_quant_tables),
+          f"result tables include an 'MSigDB: Oncogenic' family, no direction suffix "
+          f"(got {msigdb_quant_tables})")
+
+    summary_btn2 = page.locator("button", has_text="Show MSigDB collection summary")
+    check(summary_btn2.count() == 1, "'Show MSigDB collection summary' toggle is present on the Quant results screen")
+    summary_btn2.click()
+    page.wait_for_timeout(800)
+    summary_has_data = page.evaluate("""() => {
+        const divs = [...document.querySelectorAll('.chart-container')];
+        const d = divs.find(x => x.id.includes('msigdbsummary') && x.data);
+        return !!(d && d.data && d.data.length > 0 && d.data[0].y.length > 0);
+    }""")
+    check(summary_has_data,
+          "the new MSigDB collection summary figure actually renders with real Quant data - "
+          "confirms _msigdbFamiliesFromQuantTables' own column names (FDR, Effect (mean "
+          "difference)) genuinely match what the Wilcoxon engine's blocks carry, not just "
+          "that the function is defined")
+
+    # Changing the significance threshold must refresh an ALREADY-OPEN
+    # summary too (refreshMsigdbSummary), not just a freshly-opened one -
+    # this is the one behaviour that could plausibly be missed when adding
+    # the wiring (declaring refreshMsigdbSummary but forgetting to call it
+    # from the alpha input's change handler).
+    alpha_input = page.locator("input.ora-sig-threshold-input")
+    alpha_input.fill("0.99")
+    alpha_input.dispatch_event("change")
+    page.wait_for_timeout(500)
+    summary_still_has_data = page.evaluate("""() => {
+        const divs = [...document.querySelectorAll('.chart-container')];
+        const d = divs.find(x => x.id.includes('msigdbsummary') && x.data);
+        return !!(d && d.data && d.data.length > 0 && d.data[0].y.length > 0);
+    }""")
+    check(summary_still_has_data,
+          "the open summary figure survives a significance-threshold change without erroring "
+          "(refreshMsigdbSummary was actually wired into the alpha input's change handler)")
+
+    print("=== KEGG: clean human run through the real UI ===")
+    # The full strain-disambiguation-picker flow (a real ambiguous organism,
+    # confirming a candidate) is already covered end to end in
+    # playwright_proteomics_ora.py, using the SAME generalized widget this
+    # screen also calls with moduleKey="proteomics" - no need to duplicate
+    # that whole flow here. This just confirms KEGG reaches Quantitative
+    # Enrichment's own screen and produces a real single-family result.
+    page.evaluate("""() => {
+        STATE.proteomics.quantRunLocked = false;
+        STATE.aaPage = 'proteomics_quant_config';
+        delete STATE.proteomics._quantDraft;
+        render();
+    }""")
+    page.wait_for_timeout(200)
+    check(page.evaluate("STATE.aaPage") == "proteomics_quant_config",
+          "navigated back to the Quant config screen for the KEGG section")
+    kegg_pill = page.locator("label.ora-db-pill", has_text="KEGG").first
+    check(kegg_pill.count() == 1, "a KEGG pill is present on the Quantitative Enrichment config screen")
+    kegg_pill.locator("input[type=checkbox]").check()
+    page.wait_for_timeout(1200)
+    check(page.locator(".ora-kegg-organism-wrap").count() == 1,
+          "checking KEGG renders its organism-derivation widget here too")
+    check(page.locator(".ora-kegg-organism-picker").count() == 0,
+          "no disambiguation picker for the clean human case")
+
+    run_btn2 = page.locator("button.ora-run-btn")
+    check(not run_btn2.is_disabled(), "Run button enabled with KEGG selected")
+    run_btn2.click()
+    page.wait_for_timeout(300)
+    for _ in range(300):
+        if page.evaluate("!!STATE.proteomics.quantResults"):
+            break
+        page.wait_for_timeout(1000)
+    check(page.evaluate("!!STATE.proteomics.quantResults") is True, "the KEGG-only Quant run finished")
+    kegg_quant_tables = page.evaluate("STATE.proteomics.quantResults.tables")
+    check(list(kegg_quant_tables.keys()) == ["KEGG"],
+          f"one KEGG family, no direction suffix (got {list(kegg_quant_tables.keys())})")
+    check(kegg_quant_tables["KEGG"].get("n_terms_tested", 0) > 0,
+          f"KEGG tested real terms through the real UI "
+          f"(got n_terms_tested={kegg_quant_tables['KEGG'].get('n_terms_tested')})")
+
     print("=== console error check ===")
     check(len(errors) == 0, f"no console/page errors during the whole flow (got {errors})")
 

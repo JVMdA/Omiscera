@@ -635,6 +635,14 @@ def _fresh_proteomics_state() -> dict:
         "quant_results": None,
         "custom_db": None,
         "background_accessions": None,
+        # KEGG's organism is normally DERIVED from taxon_id/taxon_name above
+        # (Transcriptomics_module.resolve_kegg_organism_code, reused
+        # unchanged - see Proteomics_module's module docstring on the KEGG
+        # database), never picked separately. This holds a manual
+        # confirmation for the rare case automatic resolution can't
+        # taxon-verify a unique KEGG organism. Same shape/contract as
+        # Transcriptomics' identical field - see _kegg_confirmed_code.
+        "kegg_organism_confirmation": None,
     }
 
 
@@ -952,26 +960,33 @@ def _serialize_transcriptomics_ora_tables(tables: dict) -> dict:
     return payload
 
 
-def _transcriptomics_kegg_confirmed_code(session: dict) -> str:
+def _kegg_confirmed_code(session: dict, module: str) -> str:
     """The KEGG organism code a user manually confirmed for THIS session's
-    CURRENT organism, or "" if none applies.
+    CURRENT organism in the given module ("transcriptomics" or
+    "proteomics"), or "" if none applies.
 
     Belt-and-braces re-check, mirroring the existing kegg_taxon_mismatch
     guard pattern used for Genomics ORA's kegg_organism_code (~API.py:1540):
     never trust stored session state without re-verifying it against the
-    run's current organism. _job_resolve_de already clears
-    kegg_organism_confirmation whenever a new organism is committed, but a
-    confirmation could still be stale if that invalidation were ever missed
-    - so the stored taxon_id/taxon_name are checked again here, at the one
-    point that actually matters (the moment a run is about to use it), not
-    only at the one point that currently sets it.
+    run's current organism. _job_resolve_de/_job_resolve_proteins already
+    clear kegg_organism_confirmation whenever a new organism is committed,
+    but a confirmation could still be stale if that invalidation were ever
+    missed - so the stored taxon_id/taxon_name are checked again here, at the
+    one point that actually matters (the moment a run is about to use it),
+    not only at the one point that currently sets it.
+
+    Generalized from the original _transcriptomics_kegg_confirmed_code (now
+    used by Proteomics too - same organism-resolution/confirmation contract,
+    see Proteomics_module.build_kegg_accession_sets' docstring for why
+    Proteomics needed no picker changes to reuse it, only a different
+    session key).
     """
-    confirmation = session["transcriptomics"].get("kegg_organism_confirmation")
+    confirmation = session[module].get("kegg_organism_confirmation")
     if not confirmation:
         return ""
     if (
-        confirmation.get("taxon_id") != session["transcriptomics"].get("taxon_id")
-        or confirmation.get("taxon_name") != session["transcriptomics"].get("taxon_name")
+        confirmation.get("taxon_id") != session[module].get("taxon_id")
+        or confirmation.get("taxon_name") != session[module].get("taxon_name")
     ):
         return ""
     return str(confirmation.get("organism_code") or "")
@@ -1008,7 +1023,7 @@ def _job_run_transcriptomics_ora(job_id: str, session: dict) -> dict:
             session["transcriptomics"].get("background_symbols") if config.get("use_background") else None
         ),
         msigdb_collections=config.get("msigdb_collections"),
-        kegg_confirmed_organism_code=_transcriptomics_kegg_confirmed_code(session),
+        kegg_confirmed_organism_code=_kegg_confirmed_code(session, "transcriptomics"),
         progress_callback=_progress,
         verbose=False,
     )
@@ -1043,6 +1058,10 @@ def _job_resolve_proteins(job_id: str, session: dict, taxon_id: str, taxon_name:
     session["proteomics"]["taxon_name"] = taxon_name
     session["proteomics"]["resolved_df"] = resolved_df
     session["proteomics"]["meta"] = meta
+    # A KEGG organism confirmation (see _fresh_proteomics_state) was made
+    # against the PREVIOUS organism, if any - committing a new one here
+    # invalidates it. Mirrors _job_resolve_de's identical reset.
+    session["proteomics"]["kegg_organism_confirmation"] = None
 
     update_job(job_id, progress=1.0, message="Done")
     return {
@@ -1102,6 +1121,7 @@ def _job_run_proteomics_ora(job_id: str, session: dict) -> dict:
             session["proteomics"].get("background_accessions") if config.get("use_background") else None
         ),
         msigdb_collections=config.get("msigdb_collections"),
+        kegg_confirmed_organism_code=_kegg_confirmed_code(session, "proteomics"),
         progress_callback=_progress,
         verbose=False,
     )
@@ -1165,6 +1185,7 @@ def _job_run_proteomics_quant(job_id: str, session: dict) -> dict:
             session["proteomics"].get("background_accessions") if config.get("use_background") else None
         ),
         msigdb_collections=config.get("msigdb_collections"),
+        kegg_confirmed_organism_code=_kegg_confirmed_code(session, "proteomics"),
         progress_callback=_progress,
         verbose=False,
     )
@@ -1235,7 +1256,7 @@ def _job_run_transcriptomics_gsea(job_id: str, session: dict) -> dict:
             session["transcriptomics"].get("background_symbols") if config.get("use_background") else None
         ),
         msigdb_collections=config.get("msigdb_collections"),
-        kegg_confirmed_organism_code=_transcriptomics_kegg_confirmed_code(session),
+        kegg_confirmed_organism_code=_kegg_confirmed_code(session, "transcriptomics"),
         progress_callback=_progress,
         verbose=False,
     )
@@ -3392,41 +3413,44 @@ def transcriptomics_download_resolved(x_session_id: Optional[str] = Header(defau
 
 
 # ---------------------------------------------------------------------------
-# Transcriptomics — KEGG organism resolution. Shared by ORA and GSEA (both
-# derive KEGG's organism from retrieval's taxon_id/taxon_name rather than
-# offering a separate KEGG organism control - see
-# Transcriptomics_module.resolve_kegg_organism_code's docstring for why),
-# so this lives here rather than under either analysis's own section.
+# KEGG organism resolution. Shared by every module that derives KEGG's
+# organism from retrieval's taxon_id/taxon_name rather than offering a
+# separate KEGG organism control (Transcriptomics ORA+GSEA, Proteomics
+# ORA+Quantitative Enrichment - see resolve_kegg_organism_code's docstring
+# for why: a second, independently-settable picker is what caused the
+# silent-divergence bug fixed in commit 27ce033). One pair of endpoints per
+# module (different session key, same underlying resolver, since
+# resolve_kegg_organism_code takes only taxon_id/taxon_name - it has no
+# module-specific behaviour at all), backed by these two shared helpers so
+# the note-construction/validation logic exists exactly once.
 # ---------------------------------------------------------------------------
 
-@app.post("/api/transcriptomics/kegg/resolve-organism")
-def transcriptomics_kegg_resolve_organism(x_session_id: Optional[str] = Header(default=None)):
+def _kegg_resolve_organism_for(session: dict, module: str) -> dict:
     """Read-only check: can KEGG's organism be derived automatically for this
-    session's current organism, and if not, what are the candidates?
+    session's current organism (in the given module), and if not, what are
+    the candidates?
 
-    Touches no session state - the config screen calls this whenever KEGG is
+    Touches no session state - a config screen calls this whenever KEGG is
     checked, purely to decide whether to show a confirmation picker. Returns
     resolve_kegg_organism_code's result as-is; a non-empty "candidates" list
     is the signal to offer a picker."""
-    session = session_dep(x_session_id)
-    taxon_id = session["transcriptomics"].get("taxon_id", "")
-    taxon_name = session["transcriptomics"].get("taxon_name", "")
+    taxon_id = session[module].get("taxon_id", "")
+    taxon_name = session[module].get("taxon_name", "")
     return transcriptomics_engine.resolve_kegg_organism_code(taxon_id, taxon_name, verbose=False)
 
 
-@app.post("/api/transcriptomics/kegg/confirm-organism")
-def transcriptomics_kegg_confirm_organism(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+def _kegg_confirm_organism_for(session: dict, module: str, payload: dict) -> dict:
     """Confirm one KEGG organism for the genuinely-ambiguous case (see
-    resolve_kegg_organism_code) and persist it for this session's runs.
+    resolve_kegg_organism_code) and persist it for this session's runs in the
+    given module.
 
     Re-derives candidates for the session's CURRENT taxon_id/taxon_name and
     only accepts organism_code if it is really one of them - the same guard
     resolve_kegg_organism_code applies internally, applied again here so a
     stale or forged code from the client is rejected at the API boundary
     too, not just silently ignored three layers down inside a job."""
-    session = session_dep(x_session_id)
-    taxon_id = session["transcriptomics"].get("taxon_id", "")
-    taxon_name = session["transcriptomics"].get("taxon_name", "")
+    taxon_id = session[module].get("taxon_id", "")
+    taxon_name = session[module].get("taxon_name", "")
     organism_code = str(payload.get("organism_code") or "").strip().lower()
     if not organism_code:
         raise HTTPException(status_code=400, detail="organism_code is required.")
@@ -3443,15 +3467,27 @@ def transcriptomics_kegg_confirm_organism(payload: dict, x_session_id: Optional[
             status_code=400,
             detail=(
                 f"'{organism_code}' is not one of the KEGG organisms matched for "
-                f"\"{taxon_name}\". Re-check /api/transcriptomics/kegg/resolve-organism's "
+                f"\"{taxon_name}\". Re-check /api/{module}/kegg/resolve-organism's "
                 "candidates and confirm one of those exactly."
             ),
         )
-    session["transcriptomics"]["kegg_organism_confirmation"] = {
+    session[module]["kegg_organism_confirmation"] = {
         "taxon_id": taxon_id, "taxon_name": taxon_name,
         "organism_code": result["organism_code"], "organism_name": result["organism_name"],
     }
     return result
+
+
+@app.post("/api/transcriptomics/kegg/resolve-organism")
+def transcriptomics_kegg_resolve_organism(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    return _kegg_resolve_organism_for(session, "transcriptomics")
+
+
+@app.post("/api/transcriptomics/kegg/confirm-organism")
+def transcriptomics_kegg_confirm_organism(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    return _kegg_confirm_organism_for(session, "transcriptomics", payload)
 
 
 @app.get("/api/transcriptomics/example")
@@ -3763,6 +3799,23 @@ def proteomics_download_resolved(x_session_id: Optional[str] = Header(default=No
     if resolved_df is None:
         raise HTTPException(status_code=400, detail="No resolved table available.")
     return df_to_csv_response(resolved_df, "proteomics_resolved.csv")
+
+
+# KEGG organism resolution for Proteomics (ORA + Quantitative Enrichment) -
+# see the shared _kegg_resolve_organism_for/_kegg_confirm_organism_for
+# helpers and their surrounding comment (Transcriptomics section above) for
+# why this is a thin per-module wrapper, not separate logic.
+
+@app.post("/api/proteomics/kegg/resolve-organism")
+def proteomics_kegg_resolve_organism(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    return _kegg_resolve_organism_for(session, "proteomics")
+
+
+@app.post("/api/proteomics/kegg/confirm-organism")
+def proteomics_kegg_confirm_organism(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    return _kegg_confirm_organism_for(session, "proteomics", payload)
 
 
 @app.get("/api/proteomics/example")
