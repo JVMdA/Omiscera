@@ -92,7 +92,7 @@ regenerated (`tests/r_reference/README.txt` — only needed if you touch `Multio
 ## Citation
 
 If you use Omiscera in your research, please cite it — see [`CITATION.cff`](CITATION.cff) (GitHub turns this into a
-"Cite this repository" button automatically).
+"Cite this repository" button automatically). DOI: [10.5281/zenodo.23480028](https://doi.org/10.5281/zenodo.23480028).
 
 ## License
 
