@@ -365,14 +365,14 @@ try:
     # table, since the whole point of this module is finding genes the user
     # never uploaded.
     modules = [{"module_id": "M1", "string_ids": [P["P1"], P["P2"], P["P3"]], "size": 3}]
-    enr = txnet.enrich_modules_by_symbol(modules, GRAPH, TAX, database="GO", min_term_size=1)
+    enr = txnet.enrich_modules_by_symbol(modules, GRAPH, TAX, databases=["GO"], min_term_size=1)
 finally:
     tx.fetch_go_sets = _real_fetch_go_sets
 
 check(enr["universe_size"] == 9,
       f"universe_size is the GRAPH's distinct symbol count (9, matching build_string_id_index's n_symbols "
       f"above), NOT the DE table's (got {enr['universe_size']})")
-block = enr["results"]["M1"]["block"]
+block = enr["results"]["M1"]["best"]["block"]
 check(not block["table"].empty, "module M1 got a real enrichment result, not an empty/skipped block")
 top = block["table"].iloc[0]
 check(int(top["k"]) == 3 and "GENE3" in top["Overlapping Genes"],
@@ -425,7 +425,7 @@ FAKE_GO_SETS_TWO_NS = {
 }
 tx.fetch_go_sets = lambda *a, **kw: FAKE_GO_SETS_TWO_NS
 try:
-    enr2 = txnet.enrich_modules_by_symbol(modules, GRAPH, TAX, database="GO", min_term_size=1)
+    enr2 = txnet.enrich_modules_by_symbol(modules, GRAPH, TAX, databases=["GO"], min_term_size=1)
 finally:
     tx.fetch_go_sets = _real_fetch_go_sets
 
@@ -433,14 +433,78 @@ e = enr2["results"]["M1"]
 check(e is not None and e["n_namespaces_compared"] == 2,
       f"both populated namespaces (bp, mf) actually got tested for module M1 "
       f"(n_namespaces_compared={e.get('n_namespaces_compared') if e else None})")
-raw_fdr = float(e["block"]["table"].iloc[0]["FDR"])
+raw_fdr = float(e["best"]["block"]["table"].iloc[0]["FDR"])
 expected_corrected = min(raw_fdr * 2, 1.0)
-check(abs(e["top_fdr_corrected"] - expected_corrected) < 1e-12,
+check(abs(e["best"]["top_fdr_corrected"] - expected_corrected) < 1e-12,
       f"top_fdr_corrected = min(raw_FDR * n_namespaces_compared, 1.0) = min({raw_fdr:.4g}*2, 1.0) = "
-      f"{expected_corrected:.4g} (got {e['top_fdr_corrected']:.4g})")
-check(abs(e["top_fdr_corrected"] - raw_fdr) > 1e-9,
+      f"{expected_corrected:.4g} (got {e['best']['top_fdr_corrected']:.4g})")
+check(abs(e["best"]["top_fdr_corrected"] - raw_fdr) > 1e-9,
       f"SENSITIVITY: the corrected value genuinely differs from the raw, within-namespace value "
-      f"(corrected={e['top_fdr_corrected']:.4g}, raw={raw_fdr:.4g}) - not a no-op relabelling")
+      f"(corrected={e['best']['top_fdr_corrected']:.4g}, raw={raw_fdr:.4g}) - not a no-op relabelling")
+check(set(e["candidates"].keys()) == {"biological_process", "molecular_function"},
+      f"candidates keeps BOTH tested namespaces, not just the winner (got {list(e['candidates'].keys())})")
+check(all(e["candidates"][ns] is not None for ns in ("biological_process", "molecular_function")),
+      "both namespaces' candidates are non-None (each had a real term for this module)")
+
+# =============================================================================
+print("=== NEW: multiple databases at once (GO + MSigDB) - genuinely different results per database ===")
+# =============================================================================
+# Each database's namespace carries its own non-overlapping FILLER term too
+# (same reason FAKE_GO_SETS_TWO_NS above needs one: with only the real term
+# in a namespace, that term's own gene set IS the annotated universe, making
+# K == N and the test degenerate - p forced to exactly 1.0 regardless of
+# overlap, a tie neither side can "genuinely win"). With fillers, MSigDB's
+# tighter match (K=3, exact) gets a smaller p-value than GO's looser one
+# (K=4, one non-overlapping gene) - MSigDB must deterministically win
+# "best", while GO's own candidate must still be present and inspectable
+# separately. This is the headline claim of the multi-database feature: BOTH
+# results survive, not just whichever happened to win.
+FAKE_GO_SETS_FOR_MULTIDB = {
+    "biological_process": {
+        "GO:TEST": {"name": "Test term", "genes": ["GENE1", "GENE2", "GENE3", "GENE4"]},
+        "GO:FILLER": {"name": "GO filler", "genes": ["GENE5", "GENE6", "DUPGENE"]},
+    },
+    "molecular_function": {}, "cellular_component": {},
+}
+_real_msigdb_available = tx.msigdb_collection_available
+_real_fetch_msigdb = tx.fetch_msigdb_sets
+tx.msigdb_collection_available = lambda key, taxon_id: True
+tx.fetch_msigdb_sets = lambda key, taxon_id, verbose=False: {
+    "fetch_failed": False,
+    "sets": {
+        "MSIG:HALLMARK1": {"name": "Hallmark filler", "genes": ["GENE1", "GENE2", "GENE3"]},
+        "MSIG:FILLER": {"name": "MSigDB filler", "genes": ["EGENE9", "EGENE10", "GENE4"]},
+    },
+}
+tx.fetch_go_sets = lambda *a, **kw: FAKE_GO_SETS_FOR_MULTIDB
+try:
+    enr_multi = txnet.enrich_modules_by_symbol(
+        modules, GRAPH, TAX, databases=["GO", "MSigDB"], msigdb_collections=["hallmark"], min_term_size=1)
+finally:
+    tx.fetch_go_sets = _real_fetch_go_sets
+    tx.msigdb_collection_available = _real_msigdb_available
+    tx.fetch_msigdb_sets = _real_fetch_msigdb
+
+check(enr_multi["databases"] == ["GO", "MSigDB"], f"the return dict reports BOTH requested databases (got {enr_multi['databases']})")
+m1_multi = enr_multi["results"]["M1"]
+check(m1_multi is not None, "M1 gets a result when GO + MSigDB are both selected")
+candidate_keys = set(m1_multi["candidates"].keys())
+check("biological_process" in candidate_keys and "MSigDB: Hallmark" in candidate_keys,
+      f"candidates spans BOTH databases (GO's own namespace key AND MSigDB's collection key), "
+      f"not just whichever won (got {candidate_keys})")
+check(m1_multi["candidates"]["biological_process"] is not None and m1_multi["candidates"]["MSigDB: Hallmark"] is not None,
+      "both candidates are real (non-None) results, not one masking the other")
+check(m1_multi["best"]["namespace"] == "MSigDB: Hallmark",
+      f"MSigDB wins 'best' here (its term is a tighter match), but GO's OWN result is still present "
+      f"in candidates above - the point of this feature (got winner={m1_multi['best']['namespace']!r})")
+check(m1_multi["n_namespaces_compared"] == 2,
+      f"n_namespaces_compared spans BOTH databases' namespaces (GO's 1 populated + MSigDB's 1 collection), "
+      f"the SAME best-of-N correction pool now covering more than one database (got "
+      f"{m1_multi['n_namespaces_compared']})")
+go_candidate_table = m1_multi["candidates"]["biological_process"]["block"]["table"]
+check(not go_candidate_table.empty and int(go_candidate_table.iloc[0]["k"]) == 3,
+      f"GO's own candidate table is independently usable (not discarded just because it lost) "
+      f"(got empty={go_candidate_table.empty})")
 
 print("=== SENSITIVITY: the correction above is not vacuous ===")
 # Break it for real: an uncorrected "best of N" (what this fix replaces)
@@ -454,18 +518,18 @@ def _uncorrected_enrich_modules_by_symbol(*a, **kw):
     result = _orig_enrich(*a, **kw)
     for mod_id, entry in result["results"].items():
         if entry is not None:
-            entry["top_fdr_corrected"] = float(entry["block"]["table"].iloc[0]["FDR"])  # pre-fix behaviour
+            entry["best"]["top_fdr_corrected"] = float(entry["best"]["block"]["table"].iloc[0]["FDR"])  # pre-fix behaviour
     return result
 
 
 tx.fetch_go_sets = lambda *a, **kw: FAKE_GO_SETS_TWO_NS
 try:
-    broken_enr = _uncorrected_enrich_modules_by_symbol(modules, GRAPH, TAX, database="GO", min_term_size=1)
+    broken_enr = _uncorrected_enrich_modules_by_symbol(modules, GRAPH, TAX, databases=["GO"], min_term_size=1)
 finally:
     tx.fetch_go_sets = _real_fetch_go_sets
 check(open(_txnet_src.__file__, "rb").read() == _src_before_tx,
       "the module's source file on disk was never touched by this sensitivity test (monkeypatch only)")
-broken_e = broken_enr["results"]["M1"]
+broken_e = broken_enr["results"]["M1"]["best"]
 check(abs(broken_e["top_fdr_corrected"] - broken_e["block"]["table"].iloc[0]["FDR"]) < 1e-12
       and abs(broken_e["top_fdr_corrected"] - expected_corrected) > 1e-9,
       f"the PRE-FIX (uncorrected) value equals the raw FDR ({broken_e['top_fdr_corrected']:.4g}), not the "

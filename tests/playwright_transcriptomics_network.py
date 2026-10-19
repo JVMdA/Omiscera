@@ -80,6 +80,19 @@ with sync_playwright() as p:
     page.wait_for_timeout(300)
     check(page.evaluate("STATE.aaPage") == "transcriptomics_network_config", "navigated to the config screen")
 
+    print("=== module-label database choices are checkboxes now (was a single dropdown) ===")
+    db_pills = page.locator("label.ora-db-pill")
+    pill_labels = db_pills.all_inner_texts()
+    check(any("GO" in t for t in pill_labels) and any("MSigDB" in t for t in pill_labels),
+          f"module-label checkboxes offer GO and MSigDB (got {pill_labels})")
+    go_checkbox = db_pills.filter(has_text="GO").locator("input.ora-db-checkbox")
+    check(go_checkbox.is_checked(), "GO is checked by default")
+    msigdb_checkbox = db_pills.filter(has_text="MSigDB").locator("input.ora-db-checkbox")
+    check(not msigdb_checkbox.is_checked(), "MSigDB starts unchecked")
+    check(page.evaluate("STATE.transcriptomics._networkDraft.enrichmentDatabases") == ["GO"],
+          f"the draft's own enrichmentDatabases is an ARRAY (was a single string) "
+          f"(got {page.evaluate('STATE.transcriptomics._networkDraft.enrichmentDatabases')})")
+
     # Keep the run fast: fewest permutations offered. 200 is deliberately not
     # an option any more - see NETWORK_N_PERMUTATIONS_CHOICES's own comment
     # (measured to underestimate the null variance badly enough to report

@@ -1,4 +1,4 @@
-const PUBLIC_PAGES = ["Home", "Information", "Contact", "References", "Citation"];
+const PUBLIC_PAGES = ["Home", "Information", "Contact", "References"];
 const DISPLAY_COLUMNS = ["Name", "KEGG ID", "PubChem ID", "SMILES", "InChIKey", "HMDB ID", "Formula", "Mapping_status"];
 
 const STATE = {
@@ -26,7 +26,60 @@ const STATE = {
     transcriptomics: null,
     proteomics: null,
     proteomicsModuleName: "",
+    metabolomics: null,
+    metabolomicsModuleName: "",
+    multiomics: null,
 };
+
+// Metabolomics enrichment state. Entirely separate from STATE.mc (the
+// Metabolic Connection workflow, which answers "does this compound occur in
+// organism X" rather than running enrichment) - the two share no state and no
+// server route, by design. Entering a tile resets it (see
+// renderMetabolomicsScreen), so `run` only ever holds the ONE active tile's
+// config/results.
+function freshMetabolomicsRun() {
+    return { config: null, results: null, locked: false, draft: null, sigAlpha: 0.05 };
+}
+
+function freshMetabolomicsState() {
+    return {
+        taxonId: "", taxonName: "",
+        uploadedFilename: "",
+        // compound-list path (ORA / Chemical Class / Lipid Class / Pathway
+        // Topology when topologyInput === "list")
+        listTable: null, listIdColumns: [],
+        // concentration-table path (Quantitative Enrichment / Pathway
+        // Topology when topologyInput === "conc")
+        concInfo: null, concFile: null, concOverrides: null,
+        resolved: null, resolveMeta: null,
+        background: null,
+        statsMeta: null, statsPreview: null, compoundLog2fc: null,
+        // Pathway Topology's OWN statistics preview (concentration mode) -
+        // kept separate from statsMeta/statsPreview above (Quantitative
+        // Enrichment's) so configuring one tile never overwrites the other's
+        // already-displayed preview.
+        topologyStatsMeta: null, topologyStatsPreview: null,
+        run: freshMetabolomicsRun(),
+        // Pathway Topology Analysis only: which of the two upload paths
+        // above it is currently pointed at (_metabolomicsSpec() overrides
+        // that tile's spec.input from this, so every existing spec.input
+        // branch throughout this file - upload widget, resolve route,
+        // download route - handles it with no change of its own).
+        topologyInput: "list",
+    };
+}
+
+function _clearMetabolomicsResolutionDependentState() {
+    const mx = STATE.metabolomics;
+    if (!mx) return;
+    mx.resolved = null; mx.resolveMeta = null;
+    mx.statsMeta = null; mx.statsPreview = null; mx.compoundLog2fc = null;
+    mx.topologyStatsMeta = null; mx.topologyStatsPreview = null;
+    mx.run = freshMetabolomicsRun();
+    // KEGG's organism is derived from taxonId/taxonName; a check or manual
+    // confirmation made for the previous organism must not outlive it.
+    delete mx._keggOrganismCheck;
+}
 
 function freshOraState() {
     return {
@@ -91,8 +144,51 @@ function freshProteomicsState() {
         oraSigAlpha: 0.05,
         quantConfig: null, quantResults: null, quantRunLocked: false,
         quantSigAlpha: 0.05,
+        // PPI Network / Module Detection. Also shares retrieval above; seeds
+        // the STRING interaction network with significant proteins (server:
+        // Proteomics_network.py, which reuses Transcriptomics_network's
+        // orchestrator with accession-space hooks).
+        networkConfig: null, networkResults: null, networkRunLocked: false,
+        networkSigAlpha: 0.05,
+        // PTM / Phosphosite Enrichment. A SEPARATE, SITE-level upload/resolve
+        // path (server: Proteomics_ptm_retriever.py + Proteomics_ptm.py) -
+        // ptmSitesTable/resolvedSites are independent of deTable/resolved
+        // above; only taxonId/taxonName are shared (one organism selection
+        // per Proteomics session).
+        ptmSitesTable: null, ptmUploadedFilename: "", ptmColumnMapping: null,
+        resolvedSites: null,
+        ptmConfig: null, ptmActivityResults: null, ptmOraResults: null, ptmRunLocked: false,
+        ptmSigAlpha: 0.05,
         customDb: null, background: null,
     };
+}
+
+// Clears every piece of Proteomics state that depends on the resolved table -
+// shared by the organism-change handler and the upload handler, mirroring
+// _clearTranscriptomicsResolutionDependentState (see that function's comment
+// for why a shared helper, not two independently-maintained inline copies,
+// is the pattern here: a quant-clearing gap between these two call sites was
+// a real bug fixed alongside the KEGG work).
+function _clearProteomicsResolutionDependentState() {
+    const px = STATE.proteomics;
+    px.resolved = null;
+    px.oraConfig = null; px.oraResults = null; px.oraRunLocked = false;
+    px.quantConfig = null; px.quantResults = null; px.quantRunLocked = false;
+    px.networkConfig = null; px.networkResults = null; px.networkRunLocked = false;
+    // PTM uses a SEPARATE resolved table (resolvedSites, not resolved) but is
+    // still cleared here: the server's own protein-level upload route does a
+    // FULL session reset (API.py's proteomics_upload calls
+    // _fresh_proteomics_state() wholesale, which wipes ptm_sites_df/
+    // resolved_sites_df too) - this mirrors that, so the client can never
+    // show a resolvedSites table the server has already discarded.
+    px.resolvedSites = null;
+    px.ptmConfig = null; px.ptmActivityResults = null; px.ptmOraResults = null; px.ptmRunLocked = false;
+    delete px._oraDraft;
+    delete px._quantDraft;
+    delete px._networkDraft;
+    delete px._ptmDraft;
+    delete px._keggOrganismCheck;
+    delete px._keggOrganismConfirmed;
 }
 
 function freshTranscriptomicsState() {
@@ -434,13 +530,14 @@ function fileInputWidget(opts) {
 // the row-height explosion at the source, and vertical-align:top is kept as
 // a second, independent safeguard for any other column that turns out to
 // hold unexpectedly long content.
-// "Overlapping Proteins" is Proteomics' own name for the same kind of long
+// "Overlapping Compounds" is Metabolomics' (semicolon-joined, since compound
+// names contain commas). "Overlapping Proteins" is Proteomics' own name for the same kind of long
 // comma-joined member list (Proteomics_module.OVERLAP_COLUMN) - it MUST be
 // listed here too, or that module's result tables reintroduce the exact
 // row-height explosion this clamp exists to prevent (see
 // tests/test_table_long_list_rendering.py).
 const TABLE_LONG_LIST_COLUMNS = new Set([
-    "Overlapping Genes", "Overlapping Proteins", "Leading Edge Genes", "Genes",
+    "Overlapping Genes", "Overlapping Proteins", "Overlapping Compounds", "Leading Edge Genes", "Genes",
 ]);
 
 // scipy p-values/FDRs (hypergeom.sf, a normal-tail p, BH correction on either)
@@ -656,6 +753,9 @@ function render() {
     if (STATE.view === "metabolic_connection") app.appendChild(renderMetabolicConnection());
     else if (STATE.view === "annotation_analytics") app.appendChild(renderAnnotationAnalytics());
     else if (STATE.publicPage === "Home") app.appendChild(renderHome());
+    else if (STATE.publicPage === "Information") app.appendChild(renderInformation());
+    else if (STATE.publicPage === "Contact") app.appendChild(renderContact());
+    else if (STATE.publicPage === "References") app.appendChild(renderReferences());
     else app.appendChild(renderPlaceholder(STATE.publicPage));
     if (_chartQueue.length > 0) {
         const queue = _chartQueue.slice();
@@ -725,6 +825,141 @@ function renderPlaceholder(title) {
     const wrap = el("div", {});
     wrap.appendChild(el("h2", {}, title));
     wrap.appendChild(el("p", {}, "This section is not implemented in the first desktop prototype. Please use the Metabolic Connection workflow."));
+    return wrap;
+}
+
+// ---- Information: every module README (info/*.txt), picked and served live by the server - a new doc added to
+// info/ shows up here with no frontend change needed. -------------------------------------------------------------
+function renderInformation() {
+    const wrap = el("div", { class: "public-page-screen" });
+    wrap.appendChild(el("h2", {}, "Information"));
+    wrap.appendChild(el("p", { class: "caption" }, "What each module computes, its statistics, its inputs, and what its results do and do not mean."));
+    if (!STATE.infoDocs) {
+        wrap.appendChild(el("p", {}, "Loading..."));
+        apiJson("/api/info").then((data) => {
+            STATE.infoDocs = data.docs || [];
+            if (STATE.infoDocs.length && !STATE.infoSelected) STATE.infoSelected = STATE.infoDocs[0].filename;
+            render();
+        }).catch((err) => {
+            STATE.infoDocs = [];
+            STATE.infoError = err.message;
+            render();
+        });
+        return wrap;
+    }
+    if (STATE.infoError) {
+        wrap.appendChild(el("p", {}, "Could not load the documentation: " + STATE.infoError));
+        return wrap;
+    }
+    const layout = el("div", { class: "info-layout" });
+    const list = el("div", { class: "info-doc-list" });
+    STATE.infoDocs.forEach((doc) => {
+        const btn = el("button", {
+            class: "info-doc-btn" + (STATE.infoSelected === doc.filename ? " active" : ""),
+        }, doc.title);
+        btn.addEventListener("click", () => { STATE.infoSelected = doc.filename; render(); });
+        list.appendChild(btn);
+    });
+    layout.appendChild(list);
+    const content = el("div", { class: "info-doc-content rank-card" });
+    if (STATE.infoSelected) {
+        STATE.infoContent = STATE.infoContent || {};
+        const cached = STATE.infoContent[STATE.infoSelected];
+        if (cached === undefined) {
+            content.appendChild(el("p", {}, "Loading..."));
+            apiJson("/api/info/" + encodeURIComponent(STATE.infoSelected)).then((data) => {
+                STATE.infoContent[data.filename] = data.text;
+                render();
+            }).catch((err) => {
+                STATE.infoContent[STATE.infoSelected] = "Could not load this document: " + err.message;
+                render();
+            });
+        } else {
+            content.appendChild(el("pre", { class: "info-doc-text" }, cached));
+        }
+    }
+    layout.appendChild(content);
+    wrap.appendChild(layout);
+    return wrap;
+}
+
+// Every external database / API Omiscera fetches data from or queries live, audited directly from the source code
+// (not from memory) - grep every https?:// URL and SPARQL endpoint constant across every .py module, then confirm by
+// reading the surrounding code what each one is actually used for. Grouped by the omics area that mainly uses it;
+// several are used by more than one (e.g. UniProt, Reactome, Wikidata) and are listed once, under their main use.
+const REFERENCES = {
+    "Shared / cross-cutting": [
+        ["NCBI Entrez / E-utilities", "https://www.ncbi.nlm.nih.gov/home/develop/api/", "Gene and literature identifier lookups used across modules."],
+        ["Wikidata", "https://www.wikidata.org/", "Structured cross-references (SPARQL), including LOTUS and Rhea context lookups in Metabolic Connection."],
+    ],
+    "Genomics": [
+        ["NCBI BLAST", "https://blast.ncbi.nlm.nih.gov/", "Sequence similarity search, used to resolve ambiguous gene identifiers."],
+        ["Gene Ontology (GO)", "https://geneontology.org/", "GO terms and the ontology structure for Over-Representation Analysis."],
+        ["QuickGO (EBI)", "https://www.ebi.ac.uk/QuickGO/", "GO annotation lookups."],
+        ["Reactome", "https://reactome.org/", "Pathway gene sets, used across Genomics, Transcriptomics, Proteomics and Multi-omics."],
+        ["KEGG", "https://www.kegg.jp/", "Pathway maps, gene sets, and (in Metabolomics) compound/enzyme data."],
+        ["STRING", "https://string-db.org/", "Protein-protein interaction networks for network propagation / module detection."],
+        ["GWAS Catalog (EBI)", "https://www.ebi.ac.uk/gwas/", "Genome-wide association records for the gene-set burden test."],
+    ],
+    "Transcriptomics": [
+        ["Ensembl", "https://www.ensembl.org/", "Gene identifier cross-referencing (BioMart) and the Ensembl REST API."],
+        ["mygene.info", "https://mygene.info/", "Gene identifier resolution."],
+        ["MSigDB (Broad Institute)", "https://www.gsea-msigdb.org/", "Curated gene sets for GSEA and ORA."],
+        ["ChEA3 (Ma'ayan Lab)", "https://maayanlab.cloud/chea3/", "Transcription factor target gene libraries."],
+        ["TRRUST", "https://www.grnpedia.org/trrust/", "Curated transcription factor-target interactions."],
+        ["OmniPath", "https://omnipathdb.org/", "Combined signalling / gene-regulatory interaction database."],
+    ],
+    "Proteomics": [
+        ["UniProt", "https://www.uniprot.org/", "Protein identifiers, sequences, and functional annotation."],
+        ["Complex Portal (EBI)", "https://www.ebi.ac.uk/complexportal/", "Curated protein complexes."],
+        ["iPTMnet", "https://research.bioinformatics.udel.edu/iptmnet/", "Post-translational modification sites."],
+        ["DISEASES (Jensen Lab)", "https://diseases.jensenlab.org/", "Gene-disease associations."],
+    ],
+    "Metabolomics": [
+        ["PubChem", "https://pubchem.ncbi.nlm.nih.gov/", "Compound identifiers and structures."],
+        ["ChEBI (EBI)", "https://www.ebi.ac.uk/chebi/", "Chemical entity ontology and identifiers."],
+        ["UniChem (EBI)", "https://www.ebi.ac.uk/unichem/", "Cross-referencing compound identifiers between databases."],
+        ["HMDB", "https://hmdb.ca/", "Human metabolite identifiers; optional HMDB export import in Metabolic Connection."],
+        ["LIPID MAPS", "https://www.lipidmaps.org/", "Lipid structure database."],
+        ["Metabolomics Workbench (RefMet)", "https://www.metabolomicsworkbench.org/", "Standardised metabolite nomenclature."],
+        ["PathBank", "https://pathbank.org/", "Metabolic pathway diagrams and metabolite-pathway membership."],
+        ["SMPDB", "https://www.smpdb.ca/", "Small Molecule Pathway Database - metabolite-pathway membership."],
+        ["NPAtlas", "https://www.npatlas.org/", "Natural product structures."],
+        ["LOTUS", "https://lotus.naturalproducts.net/", "Natural product occurrence records (queried via Wikidata)."],
+        ["Rhea", "https://www.rhea-db.org/", "Biochemical reaction database."],
+    ],
+};
+
+function renderReferences() {
+    const wrap = el("div", { class: "public-page-screen" });
+    wrap.appendChild(el("h2", {}, "References"));
+    wrap.appendChild(el("p", { class: "caption" }, "Every external database or API Omiscera fetches data from or queries live, grouped by the omics area that mainly uses it."));
+    Object.keys(REFERENCES).forEach((group) => {
+        wrap.appendChild(el("div", { class: "section-label" }, group));
+        const card = el("div", { class: "rank-card" });
+        const list = el("ul", { class: "reference-list" });
+        REFERENCES[group].forEach(([name, url, note]) => {
+            const li = el("li", {});
+            li.appendChild(el("a", { href: url, target: "_blank", rel: "noopener noreferrer" }, name));
+            li.appendChild(document.createTextNode(" — " + note));
+            list.appendChild(li);
+        });
+        card.appendChild(list);
+        wrap.appendChild(card);
+    });
+    return wrap;
+}
+
+function renderContact() {
+    const wrap = el("div", { class: "public-page-screen" });
+    wrap.appendChild(el("h2", {}, "Contact"));
+    const card = el("div", { class: "rank-card" });
+    card.appendChild(el("p", {}, "For questions, bug reports, or feedback about Omiscera, get in touch:"));
+    card.appendChild(el("p", {}, [
+        el("strong", {}, "Email: "),
+        el("a", { href: "mailto:jvmacedoalmeida@gmail.com" }, "jvmacedoalmeida@gmail.com"),
+    ]));
+    wrap.appendChild(card);
     return wrap;
 }
 
@@ -1265,6 +1500,27 @@ function renderAnnotationAnalytics() {
     if (STATE.aaPage === "proteomics_ora_results") return renderProteomicsOraResultsScreen();
     if (STATE.aaPage === "proteomics_quant_config") return renderProteomicsQuantConfigScreen();
     if (STATE.aaPage === "proteomics_quant_results") return renderProteomicsQuantResultsScreen();
+    if (STATE.aaPage === "proteomics_network_config") return renderProteomicsNetworkConfigScreen();
+    if (STATE.aaPage === "proteomics_network_results") return renderProteomicsNetworkResultsScreen();
+    if (STATE.aaPage === "proteomics_ptm_config") return renderProteomicsPtmConfigScreen();
+    if (STATE.aaPage === "proteomics_ptm_results") return renderProteomicsPtmResultsScreen();
+    if (STATE.aaPage === "metabolomics") return renderMetabolomicsScreen();
+    if (STATE.aaPage === "metabolomics_module") return renderMetabolomicsModuleScreen();
+    if (STATE.aaPage === "metabolomics_config") return renderMetabolomicsConfigScreen();
+    if (STATE.aaPage === "metabolomics_results") return renderMetabolomicsResultsScreen();
+    if (STATE.aaPage === "multiomics_home") return renderMultiomicsHomeScreen();
+    if (STATE.aaPage === "multiomics") return renderMultiomicsScreen();
+    if (STATE.aaPage === "multiomics_config") return renderMultiomicsConfigScreen();
+    if (STATE.aaPage === "multiomics_map") return renderMultiomicsMapScreen();
+    if (STATE.aaPage === "multiomics_results") return renderMultiomicsResultsScreen();
+    if (STATE.aaPage === "multiomics_corr") return renderMultiomicsCorrScreen();
+    if (STATE.aaPage === "multiomics_net") return renderMultiomicsNetScreen();
+    if (STATE.aaPage === "multiomics_net_results") return renderMultiomicsNetResultsScreen();
+    if (STATE.aaPage === "multiomics_corr_results") return renderMultiomicsCorrResultsScreen();
+    if (STATE.aaPage === "multiomics_mofa") return renderMultiomicsMofaScreen();
+    if (STATE.aaPage === "multiomics_mofa_results") return renderMultiomicsMofaResultsScreen();
+    if (STATE.aaPage === "multiomics_diablo") return renderMultiomicsDiabloScreen();
+    if (STATE.aaPage === "multiomics_diablo_results") return renderMultiomicsDiabloResultsScreen();
 
     const wrap = el("div", {});
     wrap.appendChild(aaHeader());
@@ -1279,8 +1535,12 @@ function renderAnnotationAnalytics() {
 
     const bottomGrid = el("div", { class: "aa-module-grid aa-module-grid-bottom" });
     bottomGrid.appendChild(el("div", { class: "spacer" }));
-    bottomGrid.appendChild(el("button", { class: "module-btn metabolomics" }, "Metabolomics"));
-    bottomGrid.appendChild(el("button", { class: "module-btn multiomics" }, "Multi-Omics"));
+    const metabBtn = el("button", { class: "module-btn metabolomics" }, "Metabolomics");
+    metabBtn.addEventListener("click", () => { STATE.aaPage = "metabolomics"; render(); });
+    bottomGrid.appendChild(metabBtn);
+    const multiBtn = el("button", { class: "module-btn multiomics" }, "Multi-Omics");
+    multiBtn.addEventListener("click", () => { STATE.aaPage = "multiomics_home"; render(); });
+    bottomGrid.appendChild(multiBtn);
     bottomGrid.appendChild(el("div", { class: "spacer" }));
     wrap.appendChild(bottomGrid);
     return wrap;
@@ -1308,6 +1568,8 @@ function renderGenomicsAnnotationScreen() {
         grid.appendChild(btn);
     });
     wrap.appendChild(grid);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToAnnotationAnalyticsActions());
     return wrap;
 }
 
@@ -1346,6 +1608,8 @@ function renderTranscriptomicsScreen() {
         grid.appendChild(btn);
     });
     wrap.appendChild(grid);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToAnnotationAnalyticsActions());
     return wrap;
 }
 
@@ -2888,14 +3152,13 @@ function renderTranscriptomicsOraResultsScreen() {
 //
 // Identifier space is UniProt accession ONLY - no identifierType choice,
 // unlike Transcriptomics (see Proteomics_module_retriever.py's module
-// docstring for why). Only ORA is wired this milestone; the other three
-// tiles (Quantitative Enrichment, PPI Network, PTM) are visible but
-// disabled, matching TRANSCRIPTOMICS_TILES_NOT_YET_IMPLEMENTED's pattern.
+// docstring for why). All four tiles are now wired. PTM / Phosphosite
+// Enrichment is the odd one out: it uses a SEPARATE, SITE-level upload/
+// resolve path (ptmSites/resolvedSites below), not the shared protein-level
+// resolved table the other three tiles read.
 // ---------------------------------------------------------------------------
 
-const PROTEOMICS_TILES_NOT_YET_IMPLEMENTED = new Set([
-    "PPI Network / Module Detection", "PTM / Phosphosite Enrichment",
-]);
+const PROTEOMICS_TILES_NOT_YET_IMPLEMENTED = new Set([]);
 
 // Mirrors Proteomics_module.PROTEOMICS_ORA_DATABASES - keep in sync.
 const PROTEOMICS_ORA_DATABASES = [
@@ -2937,6 +3200,8 @@ function renderProteomicsScreen() {
         grid.appendChild(btn);
     });
     wrap.appendChild(grid);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToAnnotationAnalyticsActions());
     return wrap;
 }
 
@@ -2950,8 +3215,16 @@ function backToProteomicsActions() {
 
 function renderProteomicsOrganismSelector() {
     const wrap = el("div", {});
+    // PPI Network / Module Detection searches STRING's own species list
+    // instead of the whole UniProt taxonomy - same idiom as
+    // renderTranscriptomicsOrganismSelector's isNetworkTile switch (see that
+    // function's comment for why: STRING covers ~12,500 organisms against
+    // UniProt's much larger taxonomy, and picking one STRING has no network
+    // for would otherwise only fail AFTER a full upload and resolve).
+    const isNetworkTile = STATE.proteomicsModuleName === "PPI Network / Module Detection";
     const input = el("input", { class: "text-input", type: "text",
-        placeholder: "Species / organism (name or UniProt taxon ID)" });
+        placeholder: isNetworkTile ? "Species / organism in STRING (name or NCBI taxon ID)"
+                                   : "Species / organism (name or UniProt taxon ID)" });
     const resultsSelect = el("select", { class: "hidden" });
     const selectedCaption = el("div", { class: "caption" });
 
@@ -2976,15 +3249,22 @@ function renderProteomicsOrganismSelector() {
             if (query === lastQuery) return;
             lastQuery = query;
             try {
-                const data = await apiJson("/api/contexts/search?database=" + encodeURIComponent("Rhea + UniProt") + "&query=" + encodeURIComponent(query) + "&limit=10");
+                const data = isNetworkTile
+                    ? await apiJson("/api/netprop/species?query=" + encodeURIComponent(query))
+                    : await apiJson("/api/contexts/search?database=" + encodeURIComponent("Rhea + UniProt") + "&query=" + encodeURIComponent(query) + "&limit=10");
                 resultsSelect.innerHTML = "";
                 resultsSelect.appendChild(el("option", { value: "" }, "Select organism"));
-                (data.results || []).forEach((rec, idx) => {
+                // The two endpoints name their fields differently; normalize to
+                // the {context_id, context_name} shape the change handler reads.
+                const records = (data.results || []).map((rec) => (
+                    isNetworkTile ? { context_id: String(rec.taxon_id || ""), context_name: String(rec.name || "") } : rec
+                ));
+                records.forEach((rec, idx) => {
                     const label = rec.context_id && rec.context_name ? rec.context_id + " | " + rec.context_name : (rec.context_name || rec.context_id || "");
                     resultsSelect.appendChild(el("option", { value: String(idx) }, label));
                 });
-                resultsSelect._records = data.results || [];
-                resultsSelect.classList.toggle("hidden", (data.results || []).length === 0);
+                resultsSelect._records = records;
+                resultsSelect.classList.toggle("hidden", records.length === 0);
             } catch (err) { /* keep prior dropdown contents on transient search errors */ }
         }, 350);
     });
@@ -2994,31 +3274,21 @@ function renderProteomicsOrganismSelector() {
         const rec = resultsSelect._records[parseInt(resultsSelect.value, 10)];
         const newTaxonId = String(rec.context_id || "");
         const hadResolvedForDifferentOrganism =
-            !!STATE.proteomics.resolved && newTaxonId !== STATE.proteomics.taxonId;
+            (!!STATE.proteomics.resolved || !!STATE.proteomics.resolvedSites)
+            && newTaxonId !== STATE.proteomics.taxonId;
         STATE.proteomics.taxonId = newTaxonId;
         STATE.proteomics.taxonName = String(rec.context_name || "");
         if (hadResolvedForDifferentOrganism) {
-            STATE.proteomics.resolved = null;
-            STATE.proteomics.oraConfig = null;
-            STATE.proteomics.oraResults = null;
-            STATE.proteomics.oraRunLocked = false;
-            // Pre-existing gap fixed alongside the KEGG work: this used to
-            // clear ONLY the ORA fields, leaving Quantitative Enrichment's
-            // results/config/lock from the OLD organism still sitting in
-            // state after switching to a new one (reachable only via
-            // "Continue to Quantitative Enrichment", which does reset these
-            // itself - so low-impact in practice, but a real inconsistency
-            // with the ORA branch above, and there's no reason the two
-            // analyses should behave differently here).
-            STATE.proteomics.quantConfig = null;
-            STATE.proteomics.quantResults = null;
-            STATE.proteomics.quantRunLocked = false;
+            _clearProteomicsResolutionDependentState();
         }
         // KEGG organism resolution/confirmation (renderKeggOrganismWidget) is
         // also organism-gated - the widget itself re-checks these against the
         // CURRENT taxonId/taxonName before trusting them (same as
         // Transcriptomics), so this isn't the only guard, but clearing here
         // too avoids a stale check result ever being visible for one render.
+        // (Also cleared inside _clearProteomicsResolutionDependentState above
+        // when a resolved table existed - this covers the "no resolved table
+        // yet" case too, since the KEGG check is organism-gated regardless.)
         delete STATE.proteomics._keggOrganismCheck;
         delete STATE.proteomics._keggOrganismConfirmed;
         render();
@@ -3049,22 +3319,19 @@ function renderProteomicsUploadSection() {
                 // Server's upload endpoint resets the whole session sub-dict -
                 // clear client-side too, or the UI would keep showing state
                 // the server can no longer serve (mirrors Transcriptomics).
-                // Was missing quantConfig/quantResults/quantRunLocked (fixed
-                // alongside the KEGG work) despite this comment's own stated
-                // intent of a FULL mirror - a stale Quantitative Enrichment
-                // result from the previous file could otherwise survive a
-                // brand new upload.
+                // Uses the shared helper (see _clearProteomicsResolutionDependentState)
+                // so ORA/Quant/Network can never again drift apart the way
+                // quantConfig/quantResults/quantRunLocked once did here.
                 STATE.proteomics.customDb = null;
                 STATE.proteomics.background = null;
-                STATE.proteomics.resolved = null;
-                STATE.proteomics.oraConfig = null;
-                STATE.proteomics.oraResults = null;
-                STATE.proteomics.oraRunLocked = false;
-                STATE.proteomics.quantConfig = null;
-                STATE.proteomics.quantResults = null;
-                STATE.proteomics.quantRunLocked = false;
-                delete STATE.proteomics._keggOrganismCheck;
-                delete STATE.proteomics._keggOrganismConfirmed;
+                // PTM's own raw upload (not just its resolved table, already
+                // cleared inside the shared helper) is ALSO wiped by the
+                // server's full session reset - clear it here too, matching
+                // customDb/background's own explicit treatment just above.
+                STATE.proteomics.ptmSitesTable = null;
+                STATE.proteomics.ptmUploadedFilename = "";
+                STATE.proteomics.ptmColumnMapping = null;
+                _clearProteomicsResolutionDependentState();
                 render();
             } catch (err) {
                 alert(err.message);
@@ -3198,21 +3465,193 @@ function renderProteomicsResults() {
             render();
         });
         wrap.appendChild(continueBtn);
+    } else if (STATE.proteomicsModuleName === "PPI Network / Module Detection") {
+        const continueBtn = el("button", { class: "btn btn-primary", style: { marginTop: "0.8rem" } }, "Continue to PPI Network / Module Detection");
+        continueBtn.addEventListener("click", () => {
+            STATE.proteomics.networkConfig = null;
+            STATE.proteomics.networkResults = null;
+            STATE.proteomics.networkRunLocked = false;
+            STATE.aaPage = "proteomics_network_config";
+            render();
+        });
+        wrap.appendChild(continueBtn);
     } else {
         wrap.appendChild(el("div", { class: "caption" }, "This analysis module is not available yet."));
     }
     return wrap;
 }
 
+// ---------------------------------------------------------------------------
+// PTM / Phosphosite Enrichment - a SEPARATE, SITE-level upload/resolve path
+// (ptmSites/resolvedSites in freshProteomicsState), not the shared
+// protein-level one the other three tiles use. Mirrors
+// renderProteomicsUploadSection/ResolveControls/Results structurally, but
+// against /api/proteomics/ptm/* and Proteomics_ptm_retriever's own
+// RESOLVED_SITE_COLUMNS shape.
+// ---------------------------------------------------------------------------
+
+function renderProteomicsPtmUploadSection() {
+    const wrap = el("div", {});
+    wrap.appendChild(el("div", { class: "section-label" }, "Upload phosphosite differential-abundance table"));
+    wrap.appendChild(fileInputWidget({
+        accept: ".csv",
+        buttonLabel: "Choose CSV file",
+        initialFilename: STATE.proteomics.ptmUploadedFilename,
+        onChange: async (file) => {
+            if (!file) return;
+            const formData = new FormData();
+            formData.append("file", file);
+            try {
+                const data = await apiUpload("/api/proteomics/ptm/upload", formData);
+                STATE.proteomics.ptmSitesTable = data.preview;
+                STATE.proteomics.ptmUploadedFilename = file.name;
+                STATE.proteomics.ptmColumnMapping = data.column_mapping;
+                STATE.proteomics.resolvedSites = null;
+                STATE.proteomics.ptmConfig = null;
+                STATE.proteomics.ptmActivityResults = null;
+                STATE.proteomics.ptmOraResults = null;
+                STATE.proteomics.ptmRunLocked = false;
+                delete STATE.proteomics._ptmDraft;
+                render();
+            } catch (err) {
+                alert(err.message);
+            }
+        },
+    }));
+
+    wrap.appendChild(el("div", { class: "caption" },
+        "One row per modified residue, not per protein. Required: a protein identifier (accession or " +
+        "protein group) + EITHER a combined site column (e.g. \"S473\") OR separate residue + position " +
+        "columns (MaxQuant's own \"Amino acid\" + \"Positions within proteins\") + log2FC + pvalue. " +
+        "Optional: padj/FDR, multiplicity, localization probability. MaxQuant's own " +
+        "\"Phospho (STY)Sites.txt\" export is accepted directly."));
+
+    const exLink = el("button", { class: "ora-inline-example-link", type: "button" }, "Example file");
+    exLink.addEventListener("click", () => downloadFile("/api/proteomics/ptm/example", "example_proteomics_phosphosites.csv"));
+    wrap.appendChild(exLink);
+
+    if (STATE.proteomics.ptmSitesTable) {
+        if (STATE.proteomics.ptmColumnMapping) {
+            const cm = STATE.proteomics.ptmColumnMapping;
+            const parts = Object.keys(cm).map((k) => k + " -> " + cm[k]);
+            wrap.appendChild(el("div", { class: "caption" }, "Detected columns: " + parts.join(", ")));
+        }
+        const maxHeight = Math.min(400, Math.max(200, (STATE.proteomics.ptmSitesTable.rows.length + 1) * 35));
+        wrap.appendChild(buildTable(STATE.proteomics.ptmSitesTable, { maxHeight }));
+    }
+    return wrap;
+}
+
+function renderProteomicsPtmResolveControls() {
+    const wrap = el("div", {});
+    const disabled = !STATE.proteomics.ptmSitesTable || !STATE.proteomics.taxonId;
+    const btn = el("button", { class: "btn" }, "Resolve sites");
+    btn.disabled = disabled;
+    btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        const spinner = el("div", { class: "caption" }, "Resolving phosphosites via UniProt ID Mapping...");
+        wrap.appendChild(spinner);
+        try {
+            const { job_id } = await apiPostJson("/api/proteomics/ptm/resolve", {
+                taxon_id: STATE.proteomics.taxonId,
+                taxon_name: STATE.proteomics.taxonName,
+            });
+            pollJob(job_id, {
+                onDone: (result) => {
+                    STATE.proteomics.resolvedSites = result;
+                    render();
+                },
+                onError: (err) => { alert(err); render(); },
+            });
+        } catch (err) {
+            alert(err.message);
+            render();
+        }
+    });
+    wrap.appendChild(btn);
+    return wrap;
+}
+
+function renderProteomicsPtmResults() {
+    const wrap = el("div", {});
+    const resolved = STATE.proteomics.resolvedSites;
+    const meta = resolved.metrics;
+    wrap.appendChild(el("div", { class: "section-label" }, "Resolved phosphosite table"));
+    wrap.appendChild(buildTable(resolved.resolved_table, { maxHeight: 420 }));
+    wrap.appendChild(metricCards([
+        ["Mapped", meta.n_mapped],
+        ["Unmapped", meta.n_unmapped],
+        ["Duplicates collapsed", meta.n_duplicates_collapsed],
+        ["Ambiguous protein group", meta.n_group_ambiguous],
+        ["Unparsed site", meta.n_unparsed_site],
+    ], 5));
+
+    if (meta.contaminants && meta.contaminants.n_total_removed > 0) {
+        wrap.appendChild(alertBox("info",
+            meta.contaminants.n_total_removed + " contaminant/decoy row(s) removed before resolution."));
+    }
+    if (meta.padj_computed) {
+        wrap.appendChild(alertBox("info",
+            "No adjusted p-value (padj/FDR) column was found - it was computed automatically via " +
+            "Benjamini-Hochberg from the p-value column."));
+    }
+    if (meta.has_localization_prob) {
+        wrap.appendChild(alertBox("info",
+            "Localization probability filter (Class I, >= " + meta.localization_threshold + "): " +
+            meta.n_dropped_localization + " site(s) below threshold were dropped."));
+    } else {
+        wrap.appendChild(alertBox("warning",
+            "No localization-probability column was found, so low-confidence site assignments could not " +
+            "be filtered out - if your search engine reports one (e.g. MaxQuant's \"Localization prob\"), " +
+            "including it is recommended."));
+    }
+    if (meta.n_group_ambiguous > 0) {
+        wrap.appendChild(alertBox("warning",
+            meta.n_group_ambiguous + " site(s) came from an AMBIGUOUS protein group (more than one " +
+            "possible protein) - the site's position is only guaranteed valid for the leading member; " +
+            "read those rows with that in mind."));
+    }
+    if (meta.n_fetch_failures > 0) {
+        wrap.appendChild(alertBox("warning",
+            meta.n_fetch_failures + " UniProt ID Mapping batch(es) failed after retries. Consider " +
+            "re-running if this table looks incomplete."));
+    }
+
+    const dlResolvedBtn = el("button", { class: "btn" }, "Download resolved table (CSV)");
+    dlResolvedBtn.addEventListener("click", () => {
+        downloadFile("/api/proteomics/ptm/download/resolved.csv", "proteomics_ptm_resolved.csv");
+    });
+    wrap.appendChild(dlResolvedBtn);
+
+    const continueBtn = el("button", { class: "btn btn-primary", style: { marginTop: "0.8rem" } }, "Continue to PTM / Phosphosite Enrichment");
+    continueBtn.addEventListener("click", () => {
+        STATE.proteomics.ptmConfig = null;
+        STATE.proteomics.ptmActivityResults = null;
+        STATE.proteomics.ptmOraResults = null;
+        STATE.proteomics.ptmRunLocked = false;
+        STATE.aaPage = "proteomics_ptm_config";
+        render();
+    });
+    wrap.appendChild(continueBtn);
+    return wrap;
+}
+
 function renderProteomicsModuleScreen() {
+    const isPtm = STATE.proteomicsModuleName === "PTM / Phosphosite Enrichment";
     const wrap = el("div", { class: "ora-config-screen ora-module-screen" });
     wrap.appendChild(aaHeader());
     wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Proteomics — " + STATE.proteomicsModuleName));
     wrap.appendChild(el("div", { class: "section-label" }, "Organism"));
     wrap.appendChild(renderProteomicsOrganismSelector());
-    wrap.appendChild(renderProteomicsUploadSection());
-    wrap.appendChild(renderProteomicsResolveControls());
-    if (STATE.proteomics.resolved) wrap.appendChild(renderProteomicsResults());
+    if (isPtm) {
+        wrap.appendChild(renderProteomicsPtmUploadSection());
+        wrap.appendChild(renderProteomicsPtmResolveControls());
+        if (STATE.proteomics.resolvedSites) wrap.appendChild(renderProteomicsPtmResults());
+    } else {
+        wrap.appendChild(renderProteomicsUploadSection());
+        wrap.appendChild(renderProteomicsResolveControls());
+        if (STATE.proteomics.resolved) wrap.appendChild(renderProteomicsResults());
+    }
     wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
     wrap.appendChild(backToProteomicsActions());
     return wrap;
@@ -6023,13 +6462,21 @@ function buildRegulonActivityBarPlot(div, table, slug, alpha, opts) {
     if (typeof Plotly === "undefined") return;
     opts = opts || {};
     const fontSize = opts.fontSize || 12;
+    // nameCol/countCol let this same builder serve any "N targets/sites
+    // tested, one Activity Score, FDR (calibrated)" table - e.g. kinase
+    // activity's "Kinase"/"Substrate Sites Tested" columns instead of TF
+    // activity's own "TF"/"Signed Targets Tested" - defaulting to today's
+    // exact TF behaviour, so the Transcriptomics call site is unchanged.
+    const nameCol = opts.nameCol || "TF";
+    const countCol = opts.countCol || "Signed Targets Tested";
+    const entityNounPlural = opts.entityNounPlural || "TFs";
     let rows = _regulonActivityRows(table, alpha).sort((a, b) => Math.abs(Number(b["Activity Score"])) - Math.abs(Number(a["Activity Score"])));
     const topN = opts.topN || 25;
     if (isFinite(topN)) rows = rows.slice(0, topN);
-    if (!rows.length) { div.textContent = "No significant TFs to plot."; return; }
+    if (!rows.length) { div.textContent = "No significant " + entityNounPlural + " to plot."; return; }
     // Ascending by score so the diverging bars read bottom(repressed)-to-top(active).
     rows = rows.slice().sort((a, b) => Number(a["Activity Score"]) - Number(b["Activity Score"]));
-    const names = rows.map(r => String(r["TF"] || ""));
+    const names = rows.map(r => String(r[nameCol] || ""));
     const scores = rows.map(r => Number(r["Activity Score"]));
     const chartHeight = _oraCategoricalChartHeight(names, fontSize);
     const trace = {
@@ -6038,8 +6485,8 @@ function buildRegulonActivityBarPlot(div, table, slug, alpha, opts) {
         type: "bar",
         orientation: "h",
         marker: { color: scores.map(s => s >= 0 ? "#c0392b" : "#2874a6") },
-        customdata: rows.map(r => [Number(r["Signed Targets Tested"]), Number(r["FDR (calibrated)"])]),
-        hovertemplate: "<b>%{y}</b><br>Activity score: %{x:.3f}<br>Signed targets tested: %{customdata[0]}<br>FDR (calibrated): %{customdata[1]:.3g}<extra></extra>",
+        customdata: rows.map(r => [Number(r[countCol]), Number(r["FDR (calibrated)"])]),
+        hovertemplate: "<b>%{y}</b><br>Activity score: %{x:.3f}<br>" + countCol + ": %{customdata[0]}<br>FDR (calibrated): %{customdata[1]:.3g}<extra></extra>",
     };
     const layout = {
         font: { size: fontSize },
@@ -6443,38 +6890,90 @@ function buildRegulonCoherenceBars(div, row, detail, geneLog2FC, tf) {
 // deliberately NOT offered (see that constant's own comment: measured to
 // underestimate the null variance badly enough to report false extreme
 // significance on real data).
-const TX_NETWORK_PERMUTATION_CHOICES = [["500", "500"], ["1000", "1000"], ["2000", "2000"]];
-const TX_NETWORK_DIRECTIONS = [["All DE genes", "all"], ["Up-regulated only", "up"], ["Down-regulated only", "down"]];
-const TX_NETWORK_WEIGHTINGS = [
+const NETWORK_PERMUTATION_CHOICES = [["500", "500"], ["1000", "1000"], ["2000", "2000"]];
+const NETWORK_DIRECTIONS = [["All significant", "all"], ["Up-regulated only", "up"], ["Down-regulated only", "down"]];
+const NETWORK_WEIGHTINGS = [
     ["Equal weight (recommended)", "equal"],
     ["Weighted by |ranking metric|", "abs_metric"],
 ];
 const TX_NETWORK_ENRICHMENT_DBS = [["GO", "GO"], ["MSigDB", "MSigDB"]];
+// Mirrors Proteomics_network.PPI_ENRICHMENT_DATABASES - keep in sync. Unlike
+// Transcriptomics' own Network tile, Reactome/Complex Portal work here
+// because the identifier bridge is anchored on STRING's own accessions, not
+// the uploaded table - see Proteomics_network.py's module docstring.
+const PROTEOMICS_NETWORK_ENRICHMENT_DBS = [["GO", "GO"], ["Reactome", "Reactome"], ["Complex Portal", "Complex Portal"]];
 
 // Rough wall-clock guide so a user isn't surprised by a multi-minute run.
 // Anchored on measurements across the full offered range (500/1000/2000
 // permutations over the human network took ~154/301/582 s - see
 // tests/calibration_network_production_scale.py, Part B): cost is very
-// close to linear in the permutation count, ~0.3 s/permutation.
-function _txNetworkRuntimeHint(nPermutations) {
+// close to linear in the permutation count, ~0.3 s/permutation. Shared by
+// both Network tiles - the cost driver is permutation count, not which
+// identifier space seeded the walk.
+function _networkRuntimeHint(nPermutations) {
     const seconds = Math.round((Number(nPermutations) || 1000) * 0.3);
     if (seconds < 90) return "about " + seconds + " seconds";
     return "about " + Math.round(seconds / 60) + " minute(s)";
 }
 
-function renderTranscriptomicsNetworkConfigScreen() {
+// Everything Network / Module Detection's three screens (config, run, results)
+// need to know to behave like EITHER tile - see this file's module-level
+// comment near freshProteomicsState for the project's general stance on
+// generalizing shared UI code. Built once the constants/helpers above exist;
+// read from at call time so it can reference functions defined later in
+// this file (backToTranscriptomicsActions, backToProteomicsActions).
+const NETWORK_TILE_DESCRIPTORS = {
+    transcriptomics: {
+        stateKey: "transcriptomics",
+        moduleName: "Network / Module Detection",
+        apiBase: "/api/transcriptomics/network",
+        title: "Transcriptomics — Network / Module Detection",
+        noun: "gene", nounPlural: "genes", nounCapPlural: "Genes",
+        enrichmentDbChoices: TX_NETWORK_ENRICHMENT_DBS,
+        showMsigdb: true,
+        otherTiles: "Over-Representation Analysis and GSEA",
+        mappingTierCaption: (tiers) =>
+            "Matched by gene symbol: " + (tiers.gene_symbol || 0) + ", by Ensembl ID: " + (tiers.ensembl_id || 0) +
+            ", by Entrez ID: " + (tiers.entrez_id || 0) + ". ",
+        moduleLabelExtraNote:
+            "Reactome is not offered here because its identifier bridge is built from your uploaded table, so " +
+            "recruited genes would be dropped entirely.",
+        backPage: "transcriptomics_module",
+        backActions: () => backToTranscriptomicsActions(),
+    },
+    proteomics: {
+        stateKey: "proteomics",
+        moduleName: "PPI Network / Module Detection",
+        apiBase: "/api/proteomics/network",
+        title: "Proteomics — PPI Network / Module Detection",
+        noun: "protein", nounPlural: "proteins", nounCapPlural: "Proteins",
+        enrichmentDbChoices: PROTEOMICS_NETWORK_ENRICHMENT_DBS,
+        showMsigdb: false,
+        otherTiles: "Over-Representation Analysis and Quantitative Enrichment",
+        mappingTierCaption: (tiers) =>
+            "Matched by accession: " + (tiers.accession || 0) + ", by gene symbol: " + (tiers.gene_symbol || 0) + ". ",
+        moduleLabelExtraNote:
+            "Reactome and Complex Portal ARE offered here (unlike Transcriptomics' Network tile) because the " +
+            "identifier bridge is anchored on STRING's own accessions, not your uploaded table, so a recruited " +
+            "protein still keeps its module's label.",
+        backPage: "proteomics_module",
+        backActions: () => backToProteomicsActions(),
+    },
+};
+
+function renderNetworkConfigScreen(desc) {
+    const state = STATE[desc.stateKey];
     const wrap = el("div", { class: "ora-config-screen" });
     wrap.appendChild(aaHeader());
-    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" },
-        "Transcriptomics — Network / Module Detection: setup"));
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, desc.title + ": setup"));
 
-    const locked = STATE.transcriptomics.networkRunLocked;
+    const locked = state.networkRunLocked;
     if (locked) {
         wrap.appendChild(alertBox("info", "Configuration is locked for the in-progress/completed run. Use \"Start new run\" on the results screen to change settings."));
     }
 
-    if (!STATE.transcriptomics._networkDraft) {
-        STATE.transcriptomics._networkDraft = {
+    if (!state._networkDraft) {
+        state._networkDraft = {
             confidence: 700,
             direction: "all",
             weighting: "equal",
@@ -6486,21 +6985,22 @@ function renderTranscriptomicsNetworkConfigScreen() {
             moduleDetection: true,
             minModuleSize: 3,
             maxHitsForModules: 600,
-            enrichmentDatabase: "GO",
+            enrichmentDatabases: ["GO"],
             msigdbCollections: [],
             includeIea: true,
         };
     }
-    const draft = STATE.transcriptomics._networkDraft;
-    const taxonId = STATE.transcriptomics.taxonId;
+    const draft = state._networkDraft;
+    const taxonId = state.taxonId;
 
     wrap.appendChild(el("div", { class: "caption" },
-        "Organism: " + (STATE.transcriptomics.taxonName || "?") + " (STRING taxon " + (taxonId || "?") + "). " +
-        "This analysis spreads your differential-expression signal through the STRING protein-interaction " +
-        "network, so it can surface genes you did NOT upload but that sit at the centre of the response."));
+        "Organism: " + (state.taxonName || "?") + " (STRING taxon " + (taxonId || "?") + "). " +
+        "This analysis spreads your differential " + desc.noun + "-abundance signal through the STRING " +
+        "protein-interaction network, so it can surface " + desc.nounPlural + " you did NOT upload but that " +
+        "sit at the centre of the response."));
 
     // --- seeding ---
-    wrap.appendChild(el("div", { class: "section-label" }, "Seed genes"));
+    wrap.appendChild(el("div", { class: "section-label" }, "Seed " + desc.nounPlural));
     const seedBox = el("div", { class: "rank-card ora-db-card" });
 
     function selectRow(box, label, choices, current, onChange) {
@@ -6533,9 +7033,9 @@ function renderTranscriptomicsNetworkConfigScreen() {
     numberRow(seedBox, "Minimum |log2 fold-change|", draft.lfcCutoff, 0.1, 0, (v) => {
         const x = parseFloat(v); draft.lfcCutoff = (isFinite(x) && x >= 0) ? x : 1.0;
     });
-    selectRow(seedBox, "Direction", TX_NETWORK_DIRECTIONS, draft.direction, (v) => { draft.direction = v; });
+    selectRow(seedBox, "Direction", NETWORK_DIRECTIONS, draft.direction, (v) => { draft.direction = v; });
     const metricRow = el("div", {});
-    selectRow(seedBox, "Seed weighting", TX_NETWORK_WEIGHTINGS, draft.weighting, (v) => {
+    selectRow(seedBox, "Seed weighting", NETWORK_WEIGHTINGS, draft.weighting, (v) => {
         draft.weighting = v;
         metricRow.classList.toggle("hidden", v !== "abs_metric");
     });
@@ -6544,10 +7044,11 @@ function renderTranscriptomicsNetworkConfigScreen() {
     metricRow.classList.toggle("hidden", draft.weighting !== "abs_metric");
     seedBox.appendChild(metricRow);
     seedBox.appendChild(el("div", { class: "caption ora-custom-help" },
-        "Only genes passing BOTH cutoffs seed the network. \"Equal weight\" is recommended: the cutoffs have " +
-        "already made the evidence call, so re-weighting by the same p-values counts it twice. Direction is " +
-        "applied by choosing WHICH genes seed - never as a positive/negative weight, because the random walk " +
-        "spreads an unsigned quantity and a signed weight would silently bias the whole run."));
+        "Only " + desc.nounPlural + " passing BOTH cutoffs seed the network. \"Equal weight\" is recommended: " +
+        "the cutoffs have already made the evidence call, so re-weighting by the same p-values counts it " +
+        "twice. Direction is applied by choosing WHICH " + desc.nounPlural + " seed - never as a positive/" +
+        "negative weight, because the random walk spreads an unsigned quantity and a signed weight would " +
+        "silently bias the whole run."));
     wrap.appendChild(seedBox);
 
     // --- network + significance ---
@@ -6560,16 +7061,17 @@ function renderTranscriptomicsNetworkConfigScreen() {
         const x = parseFloat(v); draft.fdrAlpha = (isFinite(x) && x > 0 && x <= 1) ? x : 0.05;
     });
     const runtimeCaption = el("div", { class: "caption ora-custom-help" },
-        "Estimated run time: " + _txNetworkRuntimeHint(draft.nPermutations) + ".");
-    selectRow(netBox, "Number of permutations", TX_NETWORK_PERMUTATION_CHOICES, draft.nPermutations, (v) => {
+        "Estimated run time: " + _networkRuntimeHint(draft.nPermutations) + ".");
+    selectRow(netBox, "Number of permutations", NETWORK_PERMUTATION_CHOICES, draft.nPermutations, (v) => {
         draft.nPermutations = Number(v);
-        runtimeCaption.textContent = "Estimated run time: " + _txNetworkRuntimeHint(draft.nPermutations) + ".";
+        runtimeCaption.textContent = "Estimated run time: " + _networkRuntimeHint(draft.nPermutations) + ".";
     });
     netBox.appendChild(runtimeCaption);
     netBox.appendChild(el("div", { class: "caption ora-custom-help" },
         "STRING's combined score folds in text-mining and cross-organism transfer as well as experiments, so " +
-        "it is not purely experimental evidence and leans toward well-studied genes - which is why 0.7 (high) " +
-        "is the default. Each permutation re-runs the whole propagation, so the count drives the run time."));
+        "it is not purely experimental evidence and leans toward well-studied " + desc.nounPlural + " - which " +
+        "is why 0.7 (high) is the default. Each permutation re-runs the whole propagation, so the count " +
+        "drives the run time."));
     wrap.appendChild(netBox);
 
     // --- modules ---
@@ -6594,25 +7096,51 @@ function renderTranscriptomicsNetworkConfigScreen() {
     numberRow(modOptions, "Maximum hits used for clustering", draft.maxHitsForModules, 50, 50, (v) => {
         const x = parseInt(v, 10); draft.maxHitsForModules = (isFinite(x) && x >= 50) ? x : 600;
     });
+    // Several databases can be checked at once - each one's own namespaces/
+    // collections join ONE shared best-of-N-namespaces correction pool (see
+    // enrich_modules_by_symbol/enrich_modules_by_accession's docstrings), so
+    // a module can end up with a GO result AND a Reactome result, not just
+    // whichever one wins - see the results screen's own database selector.
+    // Same checkbox-row pattern ORA already uses (PROTEOMICS_ORA_DATABASES/
+    // TRANSCRIPTOMICS_ORA_DATABASES), reused here rather than reimplemented.
+    modOptions.appendChild(el("div", { class: "chart-option-label" }, "Label modules using"));
+    const dbCheckRow = el("div", { class: "db-checkbox-row ora-db-checkbox-row" });
     const msigRow = el("div", {});
-    selectRow(modOptions, "Label modules using", TX_NETWORK_ENRICHMENT_DBS, draft.enrichmentDatabase, (v) => {
-        draft.enrichmentDatabase = v;
-        msigRow.classList.toggle("hidden", v !== "MSigDB");
-        renderRunBtn();
+    desc.enrichmentDbChoices.forEach(([label, value]) => {
+        const cbLabel = el("label", { class: "ora-db-pill" });
+        const cb = el("input", { type: "checkbox", class: "ora-db-checkbox" });
+        cb.disabled = locked;
+        cb.checked = draft.enrichmentDatabases.indexOf(value) !== -1;
+        cb.addEventListener("change", () => {
+            if (cb.checked) {
+                if (draft.enrichmentDatabases.indexOf(value) === -1) draft.enrichmentDatabases.push(value);
+            } else {
+                draft.enrichmentDatabases = draft.enrichmentDatabases.filter((d) => d !== value);
+            }
+            if (desc.showMsigdb) {
+                msigRow.classList.toggle("hidden", draft.enrichmentDatabases.indexOf("MSigDB") === -1);
+            }
+            renderRunBtn();
+        });
+        cbLabel.appendChild(cb);
+        cbLabel.appendChild(document.createTextNode(" " + label));
+        dbCheckRow.appendChild(cbLabel);
     });
-    // Same helper (and same draft.msigdbCollections field name) ORA and GSEA
-    // use, so the collection list and its per-organism gating stay identical
-    // across all three without a second implementation.
-    msigRow.appendChild(renderMsigdbCollectionSelector(locked, draft, taxonId, () => renderRunBtn()));
-    msigRow.classList.toggle("hidden", draft.enrichmentDatabase !== "MSigDB");
-    modOptions.appendChild(msigRow);
+    modOptions.appendChild(dbCheckRow);
+    if (desc.showMsigdb) {
+        // Same helper (and same draft.msigdbCollections field name) ORA and
+        // GSEA use, so the collection list and its per-organism gating stay
+        // identical across all three without a second implementation.
+        msigRow.appendChild(renderMsigdbCollectionSelector(locked, draft, taxonId, () => renderRunBtn()));
+        msigRow.classList.toggle("hidden", draft.enrichmentDatabases.indexOf("MSigDB") === -1);
+        modOptions.appendChild(msigRow);
+    }
     modOptions.appendChild(el("div", { class: "caption ora-custom-help" },
-        "Modules are labelled against the whole network's genes, not just the genes you uploaded - otherwise " +
-        "every recruited gene would silently vanish from its own module's label. Clustering uses the strongest " +
-        "hits by Z-score up to the cap, which keeps the grouping stable: on a very large hit set the algorithm " +
-        "can otherwise collapse everything into one giant, uninformative \"module\". " +
-        "Reactome is not offered here because its identifier bridge is built from your uploaded table, so " +
-        "recruited genes would be dropped entirely."));
+        "Modules are labelled against the whole network's " + desc.nounPlural + ", not just the " +
+        desc.nounPlural + " you uploaded - otherwise every recruited " + desc.noun + " would silently vanish " +
+        "from its own module's label. Clustering uses the strongest hits by Z-score up to the cap, which " +
+        "keeps the grouping stable: on a very large hit set the algorithm can otherwise collapse everything " +
+        "into one giant, uninformative \"module\". " + desc.moduleLabelExtraNote));
     modOptions.classList.toggle("hidden", !draft.moduleDetection);
     modBox.appendChild(modOptions);
     wrap.appendChild(modBox);
@@ -6621,7 +7149,7 @@ function renderTranscriptomicsNetworkConfigScreen() {
     const actions = el("div", { class: "right-actions ora-config-actions" });
     const btnRow = el("div", { class: "btn-row ora-config-btn-row" });
     const backBtn = el("button", { class: "btn ora-back-btn" }, "Back");
-    backBtn.addEventListener("click", () => { STATE.aaPage = "transcriptomics_module"; render(); });
+    backBtn.addEventListener("click", () => { STATE.aaPage = desc.backPage; render(); });
     btnRow.appendChild(backBtn);
     const runWrap = el("div", { class: "col" });
     btnRow.appendChild(runWrap);
@@ -6630,21 +7158,25 @@ function renderTranscriptomicsNetworkConfigScreen() {
     function renderRunBtn() {
         runWrap.innerHTML = "";
         const runBtn = el("button", { class: "btn btn-primary ora-run-btn" }, "Run");
-        const needsCollection = draft.enrichmentDatabase === "MSigDB" && draft.moduleDetection
+        const needsDatabase = draft.moduleDetection && (draft.enrichmentDatabases || []).length === 0;
+        const needsCollection = draft.moduleDetection && draft.enrichmentDatabases.indexOf("MSigDB") !== -1
             && (draft.msigdbCollections || []).length === 0;
-        runBtn.disabled = locked || !taxonId || needsCollection;
-        runBtn.addEventListener("click", () => startTranscriptomicsNetworkRun(draft));
+        runBtn.disabled = locked || !taxonId || needsDatabase || needsCollection;
+        runBtn.addEventListener("click", () => startNetworkRun(desc, draft));
         runWrap.appendChild(runBtn);
     }
     renderRunBtn();
     wrap.appendChild(actions);
 
     wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
-    wrap.appendChild(backToTranscriptomicsActions());
+    wrap.appendChild(desc.backActions());
     return wrap;
 }
+function renderTranscriptomicsNetworkConfigScreen() { return renderNetworkConfigScreen(NETWORK_TILE_DESCRIPTORS.transcriptomics); }
+function renderProteomicsNetworkConfigScreen() { return renderNetworkConfigScreen(NETWORK_TILE_DESCRIPTORS.proteomics); }
 
-function startTranscriptomicsNetworkRun(draft) {
+function startNetworkRun(desc, draft) {
+    const state = STATE[desc.stateKey];
     const payload = {
         confidence: draft.confidence,
         direction: draft.direction,
@@ -6657,54 +7189,56 @@ function startTranscriptomicsNetworkRun(draft) {
         module_detection: !!draft.moduleDetection,
         min_module_size: draft.minModuleSize,
         max_hits_for_modules: draft.maxHitsForModules,
-        enrichment_database: draft.enrichmentDatabase,
+        enrichment_databases: draft.enrichmentDatabases || [],
         msigdb_collections: draft.msigdbCollections || [],
         include_iea: !!draft.includeIea,
     };
-    apiPostJson("/api/transcriptomics/network/configure", payload).then(() => {
-        STATE.transcriptomics.networkConfig = payload;
-        STATE.transcriptomics.networkRunLocked = true;
-        STATE.transcriptomics.networkResults = null;
+    apiPostJson(desc.apiBase + "/configure", payload).then(() => {
+        state.networkConfig = payload;
+        state.networkRunLocked = true;
+        state.networkResults = null;
         // Navigate BEFORE starting the run so the progress bar divs exist by
         // the time pollJob's first tick arrives.
-        STATE.aaPage = "transcriptomics_network_results";
+        STATE.aaPage = desc.stateKey + "_network_results";
         render();
-        return apiPostJson("/api/transcriptomics/network/run", {});
+        return apiPostJson(desc.apiBase + "/run", {});
     }).then(({ job_id }) => {
         pollJob(job_id, {
             onProgress: (job) => {
-                const bar = document.getElementById("transcriptomics-network-progress-inner");
-                const label = document.getElementById("transcriptomics-network-progress-label");
+                const bar = document.getElementById(desc.stateKey + "-network-progress-inner");
+                const label = document.getElementById(desc.stateKey + "-network-progress-label");
                 if (bar) bar.style.width = Math.round((job.progress || 0) * 100) + "%";
                 if (label) label.textContent = job.message || "";
             },
-            onDone: (result) => { STATE.transcriptomics.networkResults = result; render(); },
+            onDone: (result) => { state.networkResults = result; render(); },
             onError: (err) => {
                 alert("Network / Module Detection run failed: " + err);
-                STATE.transcriptomics.networkRunLocked = false;
+                state.networkRunLocked = false;
                 render();
             },
         });
     }).catch((err) => {
         alert(err.message);
-        STATE.transcriptomics.networkRunLocked = false;
+        state.networkRunLocked = false;
         render();
     });
 }
+function startTranscriptomicsNetworkRun(draft) { return startNetworkRun(NETWORK_TILE_DESCRIPTORS.transcriptomics, draft); }
 
-function renderTranscriptomicsNetworkResultsScreen() {
+function renderNetworkResultsScreen(desc) {
+    const state = STATE[desc.stateKey];
+    const nounCap = desc.noun.charAt(0).toUpperCase() + desc.noun.slice(1);
     const wrap = el("div", { class: "ora-config-screen ora-results-screen" });
     wrap.appendChild(aaHeader());
-    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" },
-        "Transcriptomics — Network / Module Detection: results"));
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, desc.title + ": results"));
 
-    const payload = STATE.transcriptomics.networkResults;
+    const payload = state.networkResults;
     if (!payload) {
         wrap.appendChild(alertBox("info", "Running analysis... (downloading the STRING network and running the permutation test can take a few minutes)"));
         const progressWrap = el("div", { class: "progress-wrap" });
-        const progressInner = el("div", { id: "transcriptomics-network-progress-inner", class: "progress-bar-inner", style: { width: "0%" } });
+        const progressInner = el("div", { id: desc.stateKey + "-network-progress-inner", class: "progress-bar-inner", style: { width: "0%" } });
         progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, progressInner));
-        progressWrap.appendChild(el("div", { id: "transcriptomics-network-progress-label", class: "progress-label" }, ""));
+        progressWrap.appendChild(el("div", { id: desc.stateKey + "-network-progress-label", class: "progress-label" }, ""));
         wrap.appendChild(progressWrap);
         return wrap;
     }
@@ -6713,7 +7247,7 @@ function renderTranscriptomicsNetworkResultsScreen() {
     const mapping = payload.mapping || {};
     const seeds = payload.seeds || {};
     const params = payload.parameters || {};
-    const DB = "transcriptomics_network";   // keeps chart ids/filenames distinct from the Genomics tile
+    const DB = desc.stateKey + "_network";   // keeps chart ids/filenames distinct per tile
 
     (payload.caveats || []).forEach((c) => wrap.appendChild(alertBox("warning", c)));
 
@@ -6721,21 +7255,21 @@ function renderTranscriptomicsNetworkResultsScreen() {
     wrap.appendChild(card);
     const navHost = el("div", {});
     card.appendChild(navHost);
-    const nav = makeResultNav(navHost, { stateKey: "transcriptomics_network" });
+    const nav = makeResultNav(navHost, { stateKey: DB });
 
     // ----- Overview -----
     const overview = nav.pane("Overview");
     overview.appendChild(metricCards([
-        ["Genes seeded", seeds.n_seeds || 0],
+        [desc.nounCapPlural + " seeded", seeds.n_seeds || 0],
         ["Significant", prop.n_hits || 0],
         ["Recruited", prop.n_recruited || 0],
         ["Modules", (payload.modules && (payload.modules.table.rows || []).length) || 0],
         ["Network proteins", prop.n_proteins || 0],
     ], 5));
     overview.appendChild(el("div", { class: "caption" },
-        "\"Recruited\" genes are proteins you did NOT upload that the network places at the centre of your " +
-        "response - the information this analysis adds over Over-Representation Analysis and GSEA. A seed " +
-        "scoring significantly is largely expected: it receives signal directly and is compared against " +
+        "\"Recruited\" " + desc.nounPlural + " are proteins you did NOT upload that the network places at " +
+        "the centre of your response - the information this analysis adds over " + desc.otherTiles + ". A " +
+        "seed scoring significantly is largely expected: it receives signal directly and is compared against " +
         "permutations in which it is usually not a seed, so read the recruited set as the discovery."));
     const nd = prop.null_diagnostics || {};
     overview.appendChild(el("div", { class: "caption" },
@@ -6746,35 +7280,35 @@ function renderTranscriptomicsNetworkResultsScreen() {
         (nd.null_skew_at_max !== undefined && nd.null_skew_at_max !== null ? Number(nd.null_skew_at_max).toFixed(2) : "n/a") +
         " (0 = perfectly normal); treat the ranking as more reliable than any single protein's exact FDR."));
 
-    // ----- Gene mapping -----
-    const mapPane = nav.pane("Gene mapping");
+    // ----- Identifier mapping -----
+    const mapPane = nav.pane(nounCap + " mapping");
     mapPane.appendChild(metricCards([
-        ["Uploaded genes", mapping.n_input || 0],
+        ["Uploaded " + desc.nounPlural, mapping.n_input || 0],
         ["Matched to STRING", mapping.n_mapped || 0],
         ["Not matched", mapping.n_unmapped || 0],
         ["Coverage", ((mapping.fraction_mapped || 0) * 100).toFixed(1) + "%"],
     ], 4));
     const tiers = mapping.n_by_tier || {};
     mapPane.appendChild(el("div", { class: "caption" },
-        "Matched by gene symbol: " + (tiers.gene_symbol || 0) + ", by Ensembl ID: " + (tiers.ensembl_id || 0) +
-        ", by Entrez ID: " + (tiers.entrez_id || 0) + ". " +
+        desc.mappingTierCaption(tiers) +
         (mapping.n_collisions_used ? mapping.n_collisions_used + " identifier(s) matched more than one protein; " +
             "the best-connected protein was used. " : "") +
         (seeds.n_multi_row_proteins ? seeds.n_multi_row_proteins + " seed protein(s) were mapped by MORE THAN " +
-            "ONE row of your table (e.g. duplicate probes/transcripts for one gene); each still counts as a " +
-            "single seed, weighted by its strongest evidence, not summed across rows. " : "") +
+            "ONE row of your table (e.g. duplicate probes/transcripts for one " + desc.noun + "); each still " +
+            "counts as a single seed, weighted by its strongest evidence, not summed across rows. " : "") +
         "STRING names proteins using each organism's own nomenclature, so coverage varies by species."));
     if (mapping.table) mapPane.appendChild(buildTable(mapping.table, { maxHeight: 420 }));
-    const mapDl = el("button", { class: "btn" }, "Download gene mapping (CSV)");
+    const mapDl = el("button", { class: "btn" }, "Download " + desc.noun + " mapping (CSV)");
     mapDl.addEventListener("click", () => downloadFile(
-        "/api/transcriptomics/network/download?which=mapping", "transcriptomics_network_gene_mapping.csv"));
+        desc.apiBase + "/download?which=mapping", DB + "_" + desc.noun + "_mapping.csv"));
     mapPane.appendChild(mapDl);
 
     // ----- Hit table -----
     const hitPane = nav.pane("Hit table");
     hitPane.appendChild(el("div", { class: "caption" },
-        "Every protein in the network, ranked by FDR. \"Seed\" marks genes you uploaded that passed the " +
-        "cutoffs; rows with no log2FC/padj were never in your table at all - those are the recruited ones."));
+        "Every protein in the network, ranked by FDR. \"Seed\" marks " + desc.nounPlural + " you uploaded " +
+        "that passed the cutoffs; rows with no log2FC/padj were never in your table at all - those are the " +
+        "recruited ones."));
     const hitAlpha = params.fdr_alpha || 0.05;
     const hitCellFormatFn = (col, val) => {
         if (col === "p-value" || col === "Empirical p-value" || col === "FDR"
@@ -6802,8 +7336,8 @@ function renderTranscriptomicsNetworkResultsScreen() {
     hitFilterCheckbox.checked = hitShowRecruitedOnly;
     hitFilterLabel.appendChild(hitFilterCheckbox);
     hitFilterLabel.appendChild(document.createTextNode(
-        " Show RECRUITED genes only (" + (prop.n_recruited || 0) + " of " + (prop.n_hits || 0) +
-        " significant proteins - genes you never uploaded)"));
+        " Show RECRUITED " + desc.nounPlural + " only (" + (prop.n_recruited || 0) + " of " + (prop.n_hits || 0) +
+        " significant proteins - " + desc.nounPlural + " you never uploaded)"));
     hitFilterRow.appendChild(hitFilterLabel);
     hitPane.appendChild(hitFilterRow);
     const hitTableHost = el("div", {});
@@ -6839,7 +7373,7 @@ function renderTranscriptomicsNetworkResultsScreen() {
     renderHitTable();
     const hitDl = el("button", { class: "btn" }, "Download hit table (CSV)");
     hitDl.addEventListener("click", () => downloadFile(
-        "/api/transcriptomics/network/download?which=hits", "transcriptomics_network_hits.csv"));
+        desc.apiBase + "/download?which=hits", DB + "_hits.csv"));
     hitPane.appendChild(hitDl);
     hitPane.appendChild(el("div", { class: "caption" },
         "The download always includes every protein, seeds and recruited alike, regardless of this toggle."));
@@ -6885,13 +7419,13 @@ function renderTranscriptomicsNetworkResultsScreen() {
         const mods = payload.modules;
         const modPane = nav.pane("Modules");
         modPane.appendChild(el("div", { class: "caption" },
-            "Densely-connected groups among the significant genes. \"Up\"/\"Down\" count how many members " +
-            "moved in each direction in YOUR data, so a module mixing both is not a coherently regulated " +
-            "unit. Recruited members have no direction, since they were not in your table."));
+            "Densely-connected groups among the significant " + desc.nounPlural + ". \"Up\"/\"Down\" count how " +
+            "many members moved in each direction in YOUR data, so a module mixing both is not a coherently " +
+            "regulated unit. Recruited members have no direction, since they were not in your table."));
         if (mods.cap_info && mods.cap_info.capped) {
             modPane.appendChild(alertBox("info",
                 "Clustering used the " + mods.cap_info.n_used_for_modules + " strongest of " +
-                mods.cap_info.n_hits + " significant genes."));
+                mods.cap_info.n_hits + " significant " + desc.nounPlural + "."));
         }
         modPane.appendChild(buildTable(mods.table, {
             maxHeight: 460,
@@ -6903,7 +7437,7 @@ function renderTranscriptomicsNetworkResultsScreen() {
         }));
         const modDl = el("button", { class: "btn" }, "Download modules (CSV)");
         modDl.addEventListener("click", () => downloadFile(
-            "/api/transcriptomics/network/download?which=modules", "transcriptomics_network_modules.csv"));
+            desc.apiBase + "/download?which=modules", DB + "_modules.csv"));
         modPane.appendChild(modDl);
 
         const modNetToggle = _netpropChartToggle("Show module-coloured network", "modulenet",
@@ -6919,17 +7453,70 @@ function renderTranscriptomicsNetworkResultsScreen() {
             const enrPane = nav.pane("Module enrichment");
             enrPane.appendChild(el("div", { class: "caption" },
                 mods.selection_caveat || ""));
-            const sel = el("select", { class: "text-input" });
-            withEnr.forEach((mid) => sel.appendChild(el("option", { value: mid }, mid)));
-            enrPane.appendChild(el("div", { class: "row" }, el("div", { class: "col" }, sel)));
-            const host = el("div", {});
-            enrPane.appendChild(host);
-            function renderEnr(mid) {
-                host.innerHTML = "";
+            const modSel = el("select", { class: "text-input" });
+            withEnr.forEach((mid) => modSel.appendChild(el("option", { value: mid }, mid)));
+            enrPane.appendChild(el("div", { class: "row" }, el("div", { class: "col" }, modSel)));
+
+            // Chart controls persist across BOTH module and database
+            // switches, mirroring Genomics netprop's own "Per-module
+            // enrichment" pane (app.js's netpropModuleToggle section) -
+            // brought up to the same feature parity here (this pane used to
+            // hardcode topN=20/fontSize=12/default colors with no controls
+            // at all).
+            const enrichAlpha = (payload.parameters && payload.parameters.fdr_alpha) || 0.05;
+            const enrichState = { topN: 20, sortBy: "fdr", fontSize: 12,
+                                  dotColorScale: ORA_DOT_COLOR_SCALES[0][1], barColor: ORA_BAR_COLORS[0][1] };
+            const enrichControls = el("div", { class: "chart-toggle-row" });
+            function enrichOption(label, options, initialValue, onChange) {
+                const control = el("label", { class: "chart-option-control" });
+                control.appendChild(el("span", { class: "chart-option-label" }, label));
+                const select = el("select", { class: "chart-option-select" });
+                options.forEach(([optLabel, optVal]) => select.appendChild(el("option", { value: optVal }, optLabel)));
+                select.value = String(initialValue);
+                select.addEventListener("change", () => onChange(select.value));
+                control.appendChild(select);
+                enrichControls.appendChild(control);
+                return control;
+            }
+            const dbControl = enrichOption("Database", [], "", (v) => { selectedDbKey = v; renderSelectedDb(); });
+            const dbSelect = dbControl.querySelector("select");
+            enrichOption("Terms shown", [["5", "5"], ["10", "10"], ["15", "15"], ["20", "20"], ["30", "30"], ["50", "50"], ["All", "all"]],
+                String(enrichState.topN), (v) => { enrichState.topN = v === "all" ? Infinity : Number(v); enrichToggles.forEach((t) => t.redraw()); });
+            enrichOption("Rank & show by", [["FDR", "fdr"], ["Fold enrichment", "fold"], ["Gene count", "k"], ["Gene ratio", "ratio"]],
+                enrichState.sortBy, (v) => { enrichState.sortBy = v; enrichToggles.forEach((t) => t.redraw()); });
+            enrichOption("Font size", [["10", "10"], ["12", "12"], ["14", "14"], ["16", "16"], ["18", "18"]],
+                String(enrichState.fontSize), (v) => { enrichState.fontSize = Number(v); enrichToggles.forEach((t) => t.redraw()); });
+            enrichOption("Dot gradient", ORA_DOT_COLOR_SCALES.map(([lbl, val]) => [lbl, val]),
+                enrichState.dotColorScale, (v) => { enrichState.dotColorScale = v; enrichToggles.forEach((t) => t.redraw()); });
+            enrichOption("Bar color", ORA_BAR_COLORS,
+                enrichState.barColor, (v) => { enrichState.barColor = v; enrichToggles.forEach((t) => t.redraw()); });
+
+            // Layout: table (+ its download button) ABOVE the controls bar,
+            // the dot/bar plot IMAGES below it - the controls apply to the
+            // images, not the table, so they sit between the two rather than
+            // above both. tableHost/chartHost are two independently-rebuilt
+            // containers (not one) specifically so enrichControls - a single
+            // persistent element whose listeners must not be torn down on
+            // every redraw - can sit fixed between them in the DOM.
+            const tableHost = el("div", {});
+            enrPane.appendChild(tableHost);
+            enrPane.appendChild(enrichControls);
+            const chartHost = el("div", {});
+            enrPane.appendChild(chartHost);
+            let enrichToggles = [];
+            let selectedDbKey = "";
+
+            function renderSelectedDb() {
+                tableHost.innerHTML = "";
+                chartHost.innerHTML = "";
+                enrichToggles = [];
+                const mid = modSel.value;
                 const e = mods.enrichment[mid];
-                if (!e) return;
-                host.appendChild(el("div", { class: "caption" }, "Annotation source: " + e.namespace));
-                host.appendChild(buildTable(e.table, {
+                const candidate = e && e.candidates ? e.candidates[selectedDbKey] : null;
+                if (!e || !candidate) return;
+                tableHost.appendChild(el("div", { class: "caption" }, "Annotation source: " + selectedDbKey +
+                    (selectedDbKey === e.namespace ? " (this module's top label)" : "")));
+                tableHost.appendChild(buildTable(candidate.table, {
                     maxHeight: 380,
                     cellFormatFn: (col, val) => {
                         if (col === "p-value" || col === "FDR" || col === "Bonferroni") return _fmtSci(val, 3);
@@ -6939,19 +7526,38 @@ function renderTranscriptomicsNetworkResultsScreen() {
                 }));
                 const dl = el("button", { class: "btn" }, "Download this module's enrichment (CSV)");
                 dl.addEventListener("click", () => downloadFile(
-                    "/api/transcriptomics/network/download?which=enrichment&key=" + encodeURIComponent(mid),
-                    "transcriptomics_network_enrichment_" + mid.toLowerCase() + ".csv"));
-                host.appendChild(dl);
+                    desc.apiBase + "/download?which=enrichment&key=" + encodeURIComponent(mid) +
+                        "&db=" + encodeURIComponent(selectedDbKey),
+                    DB + "_enrichment_" + mid.toLowerCase() + "_" + selectedDbKey.toLowerCase().replace(/[^a-z0-9]+/g, "_") + ".csv"));
+                tableHost.appendChild(dl);
                 const dot = _netpropChartToggle("Show dot plot", "dot",
-                    (d) => buildDotPlot(d, e.table, DB, "enrichment", ORA_DOT_COLOR_SCALES[0][1], { topN: 20, fontSize: 12 }),
+                    (d) => buildDotPlot(d, candidate.table, DB, "enrichment", enrichState.dotColorScale,
+                        { topN: enrichState.topN, sortBy: enrichState.sortBy, fontSize: enrichState.fontSize, alpha: enrichAlpha }),
                     _oraChartId("dot", DB, "enrichment"), DB);
                 const bar = _netpropChartToggle("Show bar plot", "bar",
-                    (d) => buildBarPlot(d, e.table, DB, "enrichment", ORA_BAR_COLORS[0][1], { topN: 20, fontSize: 12 }),
+                    (d) => buildBarPlot(d, candidate.table, DB, "enrichment", enrichState.barColor,
+                        { topN: enrichState.topN, sortBy: enrichState.sortBy, fontSize: enrichState.fontSize, alpha: enrichAlpha }),
                     _oraChartId("bar", DB, "enrichment"), DB);
-                host.appendChild(dot.el);
-                host.appendChild(bar.el);
+                enrichToggles.push(dot, bar);
+                chartHost.appendChild(dot.el);
+                chartHost.appendChild(bar.el);
             }
-            sel.addEventListener("change", () => renderEnr(sel.value));
+
+            function renderEnr(mid) {
+                const e = mods.enrichment[mid];
+                dbSelect.innerHTML = "";
+                if (!e) { tableHost.innerHTML = ""; chartHost.innerHTML = ""; return; }
+                const keys = Object.keys(e.candidates || {}).filter((k) => e.candidates[k]);
+                // The winner ("best") sorts first, so it is the default
+                // selection - everything else keeps the candidates' own
+                // (already meaningful) key order.
+                keys.sort((a, b) => (a === e.namespace ? -1 : b === e.namespace ? 1 : 0));
+                keys.forEach((k) => dbSelect.appendChild(el("option", { value: k }, k)));
+                selectedDbKey = keys[0] || "";
+                dbSelect.value = selectedDbKey;
+                renderSelectedDb();
+            }
+            modSel.addEventListener("change", () => renderEnr(modSel.value));
             renderEnr(withEnr[0]);
         }
     }
@@ -6970,29 +7576,2288 @@ function renderTranscriptomicsNetworkResultsScreen() {
         ["MCL inflation", params.mcl_inflation],
         ["Min module size", params.min_module_size],
         ["Max hits clustered", params.max_hits_for_modules],
-        ["Module labels", params.enrichment_database + ((params.msigdb_collections || []).length ? " (" + params.msigdb_collections.join(", ") + ")" : "")],
+        ["Module labels", (params.enrichment_databases || []).join(" + ") + ((params.msigdb_collections || []).length ? " (" + params.msigdb_collections.join(", ") + ")" : "")],
     ].forEach(([k, v]) => paramBox.appendChild(el("div", { class: "caption" }, "- " + k + ": " + v)));
     paramPane.appendChild(paramBox);
     paramPane.appendChild(el("div", { class: "caption" },
         "STRING's combined score includes text-mining and cross-organism transfer as well as experimental " +
-        "evidence, so modules lean toward well-studied genes. Module labels are descriptive: modules are " +
-        "chosen for being connected and carrying signal and only then tested, so their FDR is not a " +
-        "hypothesis test."));
+        "evidence, so modules lean toward well-studied " + desc.nounPlural + ". Module labels are descriptive: " +
+        "modules are chosen for being connected and carrying signal and only then tested, so their FDR is not " +
+        "a hypothesis test."));
 
     nav.finish();
 
     const newRunBtn = el("button", { class: "btn", style: { marginTop: "0.8rem" } }, "Start new run");
     newRunBtn.addEventListener("click", () => {
-        STATE.transcriptomics.networkConfig = null;
-        STATE.transcriptomics.networkResults = null;
-        STATE.transcriptomics.networkRunLocked = false;
-        STATE.transcriptomics._networkDraft = null;
-        STATE.aaPage = "transcriptomics_network_config";
+        state.networkConfig = null;
+        state.networkResults = null;
+        state.networkRunLocked = false;
+        state._networkDraft = null;
+        STATE.aaPage = desc.stateKey + "_network_config";
         render();
     });
     wrap.appendChild(newRunBtn);
     wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
-    wrap.appendChild(backToTranscriptomicsActions());
+    wrap.appendChild(desc.backActions());
+    return wrap;
+}
+function renderTranscriptomicsNetworkResultsScreen() { return renderNetworkResultsScreen(NETWORK_TILE_DESCRIPTORS.transcriptomics); }
+function renderProteomicsNetworkResultsScreen() { return renderNetworkResultsScreen(NETWORK_TILE_DESCRIPTORS.proteomics); }
+
+
+// ---------------------------------------------------------------------------
+// Proteomics — PTM / Phosphosite Enrichment: config + results.
+// Kinase activity (A1) and kinase substrate ORA (A2) run together in ONE
+// job (server: API._job_run_ptm) and share one config screen - see that
+// function's own docstring for why (shared iPTMnet fetch, cheap together).
+// ---------------------------------------------------------------------------
+
+function renderProteomicsPtmConfigScreen() {
+    const wrap = el("div", { class: "ora-config-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Proteomics — PTM / Phosphosite Enrichment: setup"));
+
+    const locked = STATE.proteomics.ptmRunLocked;
+    if (locked) {
+        wrap.appendChild(alertBox("info", "Configuration is locked for the in-progress/completed run. Use \"Start new run\" on the results screen to change settings."));
+    }
+
+    if (!STATE.proteomics._ptmDraft) {
+        STATE.proteomics._ptmDraft = {
+            padjCutoff: 0.05, lfcCutoff: 1.0,
+            minTermSize: 3, maxTermSize: "",
+            minKinaseSites: 5, metric: "signed_log_pvalue",
+            nPermutations: 1000, minScore: "",
+        };
+    }
+    const draft = STATE.proteomics._ptmDraft;
+
+    wrap.appendChild(el("div", { class: "caption" },
+        "Kinase ACTIVITY inference (ULM/KSEA-style): for each kinase, are ITS known substrate sites " +
+        "(iPTMnet) systematically more/less phosphorylated than everything else you measured? Kinase " +
+        "SUBSTRATE ENRICHMENT: are your significantly changed sites over-represented among any kinase's " +
+        "substrates? Both use the SAME significance/ranking settings below and run together."));
+
+    wrap.appendChild(el("div", { class: "section-label" }, "Site selection (for substrate enrichment and the activity ranking)"));
+    const threshBox = el("div", { class: "rank-card ora-db-card" });
+    function numberRow(box, label, value, step, min, onChange) {
+        const row = el("div", { class: "ora-term-size-row" });
+        row.appendChild(el("span", { class: "chart-option-label" }, label));
+        const inp = el("input", { type: "number", class: "ora-term-size-input", step: String(step), min: String(min) });
+        inp.value = value;
+        inp.disabled = locked;
+        inp.addEventListener("change", () => onChange(inp.value));
+        row.appendChild(inp);
+        box.appendChild(row);
+        return inp;
+    }
+    function selectRow(box, label, choices, current, onChange) {
+        const row = el("div", { class: "ora-term-size-row" });
+        row.appendChild(el("span", { class: "chart-option-label" }, label));
+        const sel = el("select", { class: "chart-option-select" });
+        choices.forEach(([lbl, val]) => sel.appendChild(el("option", { value: val }, lbl)));
+        sel.value = String(current);
+        sel.disabled = locked;
+        sel.addEventListener("change", () => onChange(sel.value));
+        row.appendChild(sel);
+        box.appendChild(row);
+        return sel;
+    }
+    numberRow(threshBox, "Adjusted p-value cutoff (padj <=)", draft.padjCutoff, 0.001, 0, (v) => {
+        const x = parseFloat(v); draft.padjCutoff = (isFinite(x) && x > 0 && x <= 1) ? x : 0.05;
+    });
+    numberRow(threshBox, "Minimum |log2 fold-change|", draft.lfcCutoff, 0.1, 0, (v) => {
+        const x = parseFloat(v); draft.lfcCutoff = (isFinite(x) && x >= 0) ? x : 1.0;
+    });
+    threshBox.appendChild(el("div", { class: "caption ora-custom-help" },
+        "Substrate enrichment tests, separately, sites passing BOTH cutoffs in each direction (all/up/down)."));
+    wrap.appendChild(threshBox);
+
+    wrap.appendChild(el("div", { class: "section-label" }, "Kinase activity"));
+    const activityBox = el("div", { class: "rank-card ora-db-card" });
+    selectRow(activityBox, "Ranking metric", Object.keys(GSEA_RANKING_METRIC_LABELS).map(
+        (k) => [GSEA_RANKING_METRIC_LABELS[k], k]), draft.metric, (v) => { draft.metric = v; });
+    numberRow(activityBox, "Minimum substrate sites tested per kinase", draft.minKinaseSites, 1, 1, (v) => {
+        const x = parseInt(v, 10); draft.minKinaseSites = (isFinite(x) && x >= 1) ? x : 5;
+    });
+    selectRow(activityBox, "Number of permutations", [["500", "500"], ["1000", "1000"], ["2000", "2000"], ["5000", "5000"]],
+        draft.nPermutations, (v) => { draft.nPermutations = Number(v); });
+    activityBox.appendChild(el("div", { class: "caption ora-custom-help" },
+        "Known substrate counts are wildly uneven across kinases (a few, like CK2/CDK1/PKA, carry far " +
+        "more curated sites than most others) - statistical power is NOT uniform, and a top hit can " +
+        "reflect annotation depth rather than biology. Read the table alongside \"Substrate Sites Tested\", " +
+        "not the rank alone."));
+    wrap.appendChild(activityBox);
+
+    wrap.appendChild(el("div", { class: "section-label" }, "Advanced"));
+    const advBox = el("div", { class: "rank-card ora-db-card" });
+    const scoreInput = numberRow(advBox, "Minimum iPTMnet confidence score (blank = no filter)", draft.minScore, 0.1, 0, (v) => {
+        draft.minScore = v.trim();
+    });
+    scoreInput.placeholder = "no filter";
+    advBox.appendChild(el("div", { class: "caption ora-custom-help" },
+        "Optional. Applies iPTMnet's own per-relationship confidence score (score.txt) as a floor on " +
+        "which kinase-site edges are used. A site with no score at all is KEPT, not dropped."));
+    wrap.appendChild(advBox);
+
+    const actions = el("div", { class: "right-actions ora-config-actions" });
+    const btnRow = el("div", { class: "btn-row ora-config-btn-row" });
+    const backBtn = el("button", { class: "btn ora-back-btn" }, "Back");
+    backBtn.addEventListener("click", () => { STATE.aaPage = "proteomics_module"; render(); });
+    btnRow.appendChild(backBtn);
+    const runWrap = el("div", { class: "col" });
+    btnRow.appendChild(runWrap);
+    actions.appendChild(btnRow);
+
+    function renderRunBtn() {
+        runWrap.innerHTML = "";
+        const runBtn = el("button", { class: "btn btn-primary ora-run-btn" }, "Run");
+        runBtn.disabled = locked || !STATE.proteomics.taxonId;
+        runBtn.addEventListener("click", () => startProteomicsPtmRun(draft));
+        runWrap.appendChild(runBtn);
+    }
+    renderRunBtn();
+    wrap.appendChild(actions);
+
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToProteomicsActions());
+    return wrap;
+}
+
+function startProteomicsPtmRun(draft) {
+    const payload = {
+        padj_cutoff: draft.padjCutoff, lfc_cutoff: draft.lfcCutoff,
+        min_term_size: draft.minTermSize,
+        max_term_size: draft.maxTermSize === "" ? null : draft.maxTermSize,
+        min_kinase_sites: draft.minKinaseSites, metric: draft.metric,
+        n_permutations: draft.nPermutations,
+        min_score: draft.minScore === "" ? null : Number(draft.minScore),
+    };
+    apiPostJson("/api/proteomics/ptm/configure", payload).then(() => {
+        STATE.proteomics.ptmConfig = payload;
+        STATE.proteomics.ptmRunLocked = true;
+        STATE.proteomics.ptmActivityResults = null;
+        STATE.proteomics.ptmOraResults = null;
+        STATE.aaPage = "proteomics_ptm_results";
+        render();
+        return apiPostJson("/api/proteomics/ptm/run", {});
+    }).then(({ job_id }) => {
+        pollJob(job_id, {
+            onProgress: (job) => {
+                const bar = document.getElementById("proteomics-ptm-progress-inner");
+                const label = document.getElementById("proteomics-ptm-progress-label");
+                if (bar) bar.style.width = Math.round((job.progress || 0) * 100) + "%";
+                if (label) label.textContent = job.message || "";
+            },
+            onDone: (result) => {
+                STATE.proteomics.ptmActivityResults = result.activity;
+                STATE.proteomics.ptmOraResults = result.ora;
+                render();
+            },
+            onError: (err) => {
+                alert("PTM / Phosphosite Enrichment run failed: " + err);
+                STATE.proteomics.ptmRunLocked = false;
+                render();
+            },
+        });
+    }).catch((err) => {
+        alert(err.message);
+        STATE.proteomics.ptmRunLocked = false;
+        render();
+    });
+}
+
+function renderProteomicsPtmResultsScreen() {
+    const wrap = el("div", { class: "ora-config-screen ora-results-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Proteomics — PTM / Phosphosite Enrichment: results"));
+
+    if (!STATE.proteomics.ptmActivityResults && !STATE.proteomics.ptmOraResults) {
+        wrap.appendChild(alertBox("info", "Running analysis... (fetching iPTMnet and testing every kinase can take from a few seconds to a couple of minutes)"));
+        const progressWrap = el("div", { class: "progress-wrap" });
+        const progressInner = el("div", { id: "proteomics-ptm-progress-inner", class: "progress-bar-inner", style: { width: "0%" } });
+        progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, progressInner));
+        progressWrap.appendChild(el("div", { id: "proteomics-ptm-progress-label", class: "progress-label" }, ""));
+        wrap.appendChild(progressWrap);
+        return wrap;
+    }
+
+    const card = el("div", { class: "rank-card ora-db-card ora-result-card" });
+    wrap.appendChild(card);
+    const navHost = el("div", {});
+    card.appendChild(navHost);
+    const nav = makeResultNav(navHost, { stateKey: "proteomics_ptm" });
+
+    const activityTables = (STATE.proteomics.ptmActivityResults || {}).tables || {};
+    const activityBlock = activityTables["iPTMnet"] || null;
+    const oraTables = (STATE.proteomics.ptmOraResults || {}).tables || {};
+
+    // ----- Overview -----
+    const overview = nav.pane("Overview");
+    const nKinases = activityBlock ? activityBlock.n_kinases_tested : 0;
+    const nSites = activityBlock ? activityBlock.n_sites : 0;
+    overview.appendChild(metricCards([
+        ["Sites tested", nSites],
+        ["Kinases tested", nKinases],
+    ], 4));
+    if (activityBlock && activityBlock.note) {
+        overview.appendChild(alertBox("warning", activityBlock.note));
+    }
+    if (STATE.proteomics.ptmOraResults && STATE.proteomics.ptmOraResults.caveat) {
+        overview.appendChild(alertBox("warning", STATE.proteomics.ptmOraResults.caveat));
+    }
+    overview.appendChild(el("div", { class: "caption" },
+        "iPTMnet (research.bioinformatics.udel.edu/iptmnet) is CC BY-NC-SA 4.0 - non-commercial use only, " +
+        "and any redistribution of ITS data must carry the same licence and attribution. If you use " +
+        "results from this tile, cite iPTMnet alongside Omiscera."));
+
+    // ----- Kinase activity -----
+    if (activityBlock && activityBlock.table && (activityBlock.table.rows || []).length) {
+        const actPane = nav.pane("Kinase activity");
+        actPane.appendChild(el("div", { class: "caption" },
+            "Sorted by calibrated FDR (the primary column - see \"Parameters used\"). A positive Activity " +
+            "Score means that kinase's substrates moved UP relative to the rest of the experiment; " +
+            "negative means DOWN. There is no \"repressed targets\" concept here (unlike TF activity) - " +
+            "every kinase-substrate edge is a phosphorylation event, never a sign."));
+        actPane.appendChild(buildTable(activityBlock.table, {
+            maxHeight: 460,
+            cellFormatFn: (col, val) => {
+                if (col.indexOf("p-value") === 0 || col.indexOf("FDR") === 0) return _fmtSci(val, 3);
+                if (col === "Activity Score" || col === "Calibrated Score (z)") return _fmtFixed(val, 3);
+                return val;
+            },
+        }));
+        const dlActBtn = el("button", { class: "btn" }, "Download kinase activity (CSV)");
+        dlActBtn.addEventListener("click", () => downloadFile(
+            "/api/proteomics/ptm/download?which=activity", "proteomics_ptm_kinase_activity.csv"));
+        actPane.appendChild(dlActBtn);
+        if (activityBlock.calibration_note) {
+            actPane.appendChild(alertBox("info", activityBlock.calibration_note));
+        }
+
+        let actBarTopN = 20;
+        const actBarControls = el("div", { class: "chart-toggle-row" });
+        const actBarTopNControl = el("label", { class: "chart-option-control" },
+            [el("span", { class: "chart-option-label" }, "Kinases shown (bar plot)")]);
+        const actBarTopNSelect = el("select", { class: "chart-option-select" });
+        [["10", "10"], ["20", "20"], ["50", "50"], ["All significant", "all"]].forEach(([lbl, val]) =>
+            actBarTopNSelect.appendChild(el("option", { value: val }, lbl)));
+        actBarTopNSelect.value = "20";
+        actBarTopNSelect.addEventListener("change", () => {
+            actBarTopN = actBarTopNSelect.value === "all" ? Infinity : Number(actBarTopNSelect.value);
+            barToggle.redraw();
+        });
+        actBarTopNControl.appendChild(actBarTopNSelect);
+        actBarControls.appendChild(actBarTopNControl);
+        actPane.appendChild(actBarControls);
+        const barToggle = _netpropChartToggle("Show bar plot (top kinases by |calibrated score|)", "bar",
+            (d) => buildRegulonActivityBarPlot(d, activityBlock.table, "proteomics_ptm", 0.05,
+                { topN: actBarTopN, fontSize: 12, nameCol: "Kinase", countCol: "Substrate Sites Tested", entityNounPlural: "kinases" }),
+            _oraChartId("bar", "proteomics_ptm", "activity"), "proteomics_ptm");
+        actPane.appendChild(barToggle.el);
+    }
+
+    // ----- Kinase substrate enrichment -----
+    const withOra = Object.keys(oraTables).filter((k) => oraTables[k].table && (oraTables[k].table.rows || []).length);
+    if (withOra.length) {
+        const oraPane = nav.pane("Kinase substrate enrichment");
+        oraPane.appendChild(el("div", { class: "caption" },
+            "Are your significantly changed sites (per direction) over-represented among any kinase's " +
+            "known substrates? Same Fisher's-exact + BH-FDR engine as every other enrichment tile."));
+        const oraSel = el("select", { class: "text-input" });
+        withOra.forEach((k) => oraSel.appendChild(el("option", { value: k }, k)));
+        oraPane.appendChild(el("div", { class: "row" }, el("div", { class: "col" }, oraSel)));
+        const tableHost = el("div", {});
+        oraPane.appendChild(tableHost);
+
+        // Chart controls persist across direction switches (same reasoning as
+        // the PPI Network Module enrichment pane's own parity fix) - this pane
+        // used to hardcode topN=20/fontSize=12/default colors with no controls
+        // at all.
+        const oraState = { topN: 20, sortBy: "fdr", fontSize: 12,
+                           dotColorScale: ORA_DOT_COLOR_SCALES[0][1], barColor: ORA_BAR_COLORS[0][1] };
+        const oraControls = el("div", { class: "chart-toggle-row" });
+        function oraOption(label, options, initialValue, onChange) {
+            const control = el("label", { class: "chart-option-control" });
+            control.appendChild(el("span", { class: "chart-option-label" }, label));
+            const select = el("select", { class: "chart-option-select" });
+            options.forEach(([optLabel, optVal]) => select.appendChild(el("option", { value: optVal }, optLabel)));
+            select.value = String(initialValue);
+            select.addEventListener("change", () => onChange(select.value));
+            control.appendChild(select);
+            oraControls.appendChild(control);
+            return control;
+        }
+        oraOption("Kinases shown", [["5", "5"], ["10", "10"], ["15", "15"], ["20", "20"], ["30", "30"], ["50", "50"], ["All", "all"]],
+            String(oraState.topN), (v) => { oraState.topN = v === "all" ? Infinity : Number(v); oraToggles.forEach((t) => t.redraw()); });
+        oraOption("Rank & show by", [["FDR", "fdr"], ["Fold enrichment", "fold"], ["Gene count", "k"], ["Gene ratio", "ratio"]],
+            oraState.sortBy, (v) => { oraState.sortBy = v; oraToggles.forEach((t) => t.redraw()); });
+        oraOption("Font size", [["10", "10"], ["12", "12"], ["14", "14"], ["16", "16"], ["18", "18"]],
+            String(oraState.fontSize), (v) => { oraState.fontSize = Number(v); oraToggles.forEach((t) => t.redraw()); });
+        oraOption("Dot gradient", ORA_DOT_COLOR_SCALES.map(([l, v]) => [l, v]),
+            oraState.dotColorScale, (v) => { oraState.dotColorScale = v; oraToggles.forEach((t) => t.redraw()); });
+        oraOption("Bar color", ORA_BAR_COLORS,
+            oraState.barColor, (v) => { oraState.barColor = v; oraToggles.forEach((t) => t.redraw()); });
+        oraPane.appendChild(oraControls);
+        const chartHost = el("div", {});
+        oraPane.appendChild(chartHost);
+
+        let oraToggles = [];
+        function renderOraTable(key) {
+            tableHost.innerHTML = "";
+            chartHost.innerHTML = "";
+            oraToggles = [];
+            const block = oraTables[key];
+            tableHost.appendChild(buildTable(block.table, {
+                maxHeight: 400,
+                cellFormatFn: (col, val) => {
+                    if (col === "p-value" || col === "FDR" || col === "Bonferroni") return _fmtSci(val, 3);
+                    if (col === "Fold Enrichment") return _fmtFixed(val, 2);
+                    return val;
+                },
+            }));
+            const dl = el("button", { class: "btn" }, "Download this table (CSV)");
+            dl.addEventListener("click", () => downloadFile(
+                "/api/proteomics/ptm/download?which=ora&key=" + encodeURIComponent(key),
+                "proteomics_ptm_ora_" + key.toLowerCase().replace(/[^a-z0-9]+/g, "_") + ".csv"));
+            tableHost.appendChild(dl);
+            const dot = _netpropChartToggle("Show dot plot", "dot",
+                (d) => buildDotPlot(d, block.table, "proteomics_ptm", "ora", oraState.dotColorScale,
+                    { topN: oraState.topN, sortBy: oraState.sortBy, fontSize: oraState.fontSize }),
+                _oraChartId("dot", "proteomics_ptm", "ora"), "proteomics_ptm");
+            const bar = _netpropChartToggle("Show bar plot", "bar",
+                (d) => buildBarPlot(d, block.table, "proteomics_ptm", "ora", oraState.barColor,
+                    { topN: oraState.topN, sortBy: oraState.sortBy, fontSize: oraState.fontSize }),
+                _oraChartId("bar", "proteomics_ptm", "ora"), "proteomics_ptm");
+            oraToggles.push(dot, bar);
+            chartHost.appendChild(dot.el);
+            chartHost.appendChild(bar.el);
+        }
+        oraSel.addEventListener("change", () => renderOraTable(oraSel.value));
+        renderOraTable(withOra[0]);
+    }
+
+    // ----- Parameters -----
+    const paramPane = nav.pane("Parameters used");
+    const paramBox = el("div", { class: "rank-card ora-db-card" });
+    const cfg = STATE.proteomics.ptmConfig || {};
+    [
+        ["Site selection", "padj <= " + cfg.padj_cutoff + ", |log2FC| >= " + cfg.lfc_cutoff],
+        ["Kinase activity metric", cfg.metric],
+        ["Minimum substrate sites per kinase", cfg.min_kinase_sites],
+        ["Permutations", cfg.n_permutations],
+        ["Minimum iPTMnet confidence", cfg.min_score === null || cfg.min_score === undefined ? "no filter" : cfg.min_score],
+        ["Minimum term size", cfg.min_term_size],
+    ].forEach(([k, v]) => paramBox.appendChild(el("div", { class: "caption" }, "- " + k + ": " + v)));
+    paramPane.appendChild(paramBox);
+    paramPane.appendChild(el("div", { class: "caption" },
+        "Kinase activity's THREE p-value columns (parametric/calibrated/permutation) mirror " +
+        "Transcriptomics' TF activity tile exactly - see that tile's README for the full statistical " +
+        "rationale of each; the same three caveats apply here (parametric assumes independent, normally-" +
+        "distributed ranking values; calibrated corrects using an empirical null from this run's OWN " +
+        "kinase scores; permutation is a deliberately uncalibrated diagnostic)."));
+
+    nav.finish();
+
+    const newRunBtn = el("button", { class: "btn", style: { marginTop: "0.8rem" } }, "Start new run");
+    newRunBtn.addEventListener("click", () => {
+        STATE.proteomics.ptmConfig = null;
+        STATE.proteomics.ptmActivityResults = null;
+        STATE.proteomics.ptmOraResults = null;
+        STATE.proteomics.ptmRunLocked = false;
+        STATE.proteomics._ptmDraft = null;
+        STATE.aaPage = "proteomics_ptm_config";
+        render();
+    });
+    wrap.appendChild(newRunBtn);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToProteomicsActions());
+    return wrap;
+}
+
+
+// ---------------------------------------------------------------------------
+// Metabolomics — five tiles, two upload paths.
+//
+//   Over-Representation Analysis            compound list   KEGG / Reactome / SMPDB / PathBank
+//   Chemical Class Enrichment               compound list   RefMet taxonomy
+//   Lipid Class / Structural Enrichment     compound list   LIPID MAPS taxonomy
+//   Quantitative Enrichment                 concentration table   all of the above
+//   Pathway Topology Analysis               EITHER (user's choice)   KEGG only
+//
+// The list tiles take a plain compound-NAME list (no statistics - a
+// metabolomics researcher does not have per-compound log2FC/p-values to
+// upload; MetaboAnalyst does not ask for them either) and test it against
+// each database's own reference set. Quantitative Enrichment takes a
+// samples x compounds concentration table plus a group label and computes
+// the statistics itself. Screens are parameterised on the tile's spec below
+// because - unlike Proteomics, where each tile has genuinely different
+// options - the tiles differ only in which fields the config screen shows;
+// the module/config/results structure is otherwise identical.
+//
+// Pathway Topology Analysis is the one exception: its spec.input is not a
+// fixed string but OVERRIDDEN by _metabolomicsSpec() from mx.topologyInput
+// (the user's own list/concentration choice on that tile's module screen) -
+// every existing spec.input==="conc" branch throughout this file (upload
+// widget, resolve route, resolved-table download route) then handles it
+// automatically, with no separate topology-specific branch of its own.
+// ---------------------------------------------------------------------------
+
+const METABOLOMICS_PATHWAY_DATABASES = ["KEGG", "Reactome", "SMPDB", "PathBank"];
+const METABOLOMICS_QUANT_DATABASES = METABOLOMICS_PATHWAY_DATABASES.concat(["Chemical Class", "Lipid Class"]);
+const METABOLOMICS_TILE_SPECS = {
+    "Over-Representation Analysis": {
+        kind: "ora", input: "list", needsOrganism: true, databases: METABOLOMICS_PATHWAY_DATABASES,
+    },
+    "Chemical Class Enrichment": {
+        kind: "chemclass", input: "list", needsOrganism: false, databases: ["Chemical Class"],
+    },
+    "Lipid Class / Structural Enrichment": {
+        kind: "lipidclass", input: "list", needsOrganism: false, databases: ["Lipid Class"],
+    },
+    "Quantitative Enrichment": {
+        kind: "quant", input: "conc", needsOrganism: true, databases: METABOLOMICS_QUANT_DATABASES,
+    },
+    "Pathway Topology Analysis": {
+        // input is a placeholder here - always read it via _metabolomicsSpec(),
+        // never METABOLOMICS_TILE_SPECS[...] directly, or it will be stale.
+        kind: "topology", input: "list", needsOrganism: true, databases: ["KEGG"],
+    },
+};
+const METABOLOMICS_RANKING_METRICS = [
+    ["log2 fold change (Group A vs Group B)", "log2fc"],
+    ["Welch t-statistic", "t_stat"],
+];
+const PATHWAY_TOPOLOGY_MEASURES = [
+    ["Relative betweenness centrality", "betweenness"],
+    ["Out-degree", "outdegree"],
+];
+
+function _metabolomicsSpec() {
+    const spec = METABOLOMICS_TILE_SPECS[STATE.metabolomicsModuleName] || METABOLOMICS_TILE_SPECS["Over-Representation Analysis"];
+    if (spec.kind === "topology") {
+        const mx = STATE.metabolomics;
+        return Object.assign({}, spec, { input: (mx && mx.topologyInput) || "list" });
+    }
+    return spec;
+}
+
+function renderMetabolomicsScreen() {
+    const wrap = el("div", {});
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle" }, "Metabolomics"));
+    const grid = el("div", { class: "aa-genomics-grid" });
+    Object.keys(METABOLOMICS_TILE_SPECS).forEach((name) => {
+        const btn = el("button", { class: "module-btn metabolomics" }, name);
+        btn.addEventListener("click", () => {
+            STATE.aaPage = "metabolomics_module";
+            STATE.metabolomicsModuleName = name;
+            STATE.metabolomics = freshMetabolomicsState();
+            render();
+        });
+        grid.appendChild(btn);
+    });
+    wrap.appendChild(grid);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToAnnotationAnalyticsActions());
+    return wrap;
+}
+
+function backToMetabolomicsActions() {
+    const actions = el("div", { class: "right-actions" });
+    const btn = el("button", { class: "btn" }, "Back to Metabolomics");
+    btn.addEventListener("click", () => { STATE.aaPage = "metabolomics"; render(); });
+    actions.appendChild(el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, btn));
+    return actions;
+}
+
+function renderMetabolomicsOrganismSelector() {
+    const wrap = el("div", {});
+    const input = el("input", { class: "text-input", type: "text",
+        placeholder: "Species / organism (name or UniProt taxon ID)" });
+    const resultsSelect = el("select", { class: "hidden" });
+    const selectedCaption = el("div", { class: "caption" });
+
+    function refreshCaption() {
+        selectedCaption.textContent = STATE.metabolomics.taxonId
+            ? "Selected: " + STATE.metabolomics.taxonName + " (taxon " + STATE.metabolomics.taxonId + ")"
+            : "";
+    }
+    refreshCaption();
+
+    let lastQuery = "";
+    let timer = null;
+    input.addEventListener("input", () => {
+        const query = input.value.trim();
+        if (timer) clearTimeout(timer);
+        if (query.length < 3) {
+            resultsSelect.innerHTML = "";
+            resultsSelect.classList.add("hidden");
+            return;
+        }
+        timer = setTimeout(async () => {
+            if (query === lastQuery) return;
+            lastQuery = query;
+            try {
+                const data = await apiJson("/api/contexts/search?database=" + encodeURIComponent("Rhea + UniProt")
+                    + "&query=" + encodeURIComponent(query) + "&limit=10");
+                resultsSelect.innerHTML = "";
+                resultsSelect.appendChild(el("option", { value: "" }, "Select organism"));
+                const records = data.results || [];
+                records.forEach((rec, idx) => {
+                    const label = rec.context_id && rec.context_name
+                        ? rec.context_id + " | " + rec.context_name
+                        : (rec.context_name || rec.context_id || "");
+                    resultsSelect.appendChild(el("option", { value: String(idx) }, label));
+                });
+                resultsSelect._records = records;
+                resultsSelect.classList.toggle("hidden", records.length === 0);
+            } catch (err) { /* keep prior dropdown contents on transient search errors */ }
+        }, 350);
+    });
+
+    resultsSelect.addEventListener("change", () => {
+        if (resultsSelect.value === "") return;
+        const rec = resultsSelect._records[parseInt(resultsSelect.value, 10)];
+        const newTaxonId = String(rec.context_id || "");
+        const hadResolvedForDifferentOrganism = !!STATE.metabolomics.resolved && newTaxonId !== STATE.metabolomics.taxonId;
+        STATE.metabolomics.taxonId = newTaxonId;
+        STATE.metabolomics.taxonName = String(rec.context_name || "");
+        if (hadResolvedForDifferentOrganism) _clearMetabolomicsResolutionDependentState();
+        // Unconditionally: the KEGG check is organism-gated even when nothing
+        // was resolved yet (same as the Proteomics selector's handler).
+        delete STATE.metabolomics._keggOrganismCheck;
+        render();
+    });
+
+    wrap.appendChild(input);
+    wrap.appendChild(resultsSelect);
+    wrap.appendChild(selectedCaption);
+    return wrap;
+}
+
+function renderMetabolomicsUploadSection() {
+    const mx = STATE.metabolomics;
+    const spec = _metabolomicsSpec();
+    const isConc = spec.input === "conc";
+    const wrap = el("div", {});
+    wrap.appendChild(el("div", { class: "section-label" },
+        isConc ? "Upload concentration table" : "Upload compound list"));
+
+    async function uploadFile(file, overrides) {
+        const formData = new FormData();
+        formData.append("file", file);
+        try {
+            if (isConc) {
+                const qs = [];
+                if (overrides && overrides.orientation && overrides.orientation !== "auto") {
+                    qs.push("orientation=" + encodeURIComponent(overrides.orientation));
+                }
+                if (overrides && overrides.groupColumn) qs.push("group_column=" + encodeURIComponent(overrides.groupColumn));
+                const data = await apiUpload("/api/metabolomics/quant/upload" + (qs.length ? "?" + qs.join("&") : ""), formData);
+                mx.concInfo = data;
+                mx.concFile = file;
+                mx.concOverrides = overrides || { orientation: "auto", groupColumn: "" };
+            } else {
+                const data = await apiUpload("/api/metabolomics/list/upload", formData);
+                mx.listTable = data.preview;
+                mx.listIdColumns = data.identifier_columns || [];
+            }
+            mx.uploadedFilename = file.name;
+            // The server's upload endpoint resets everything built on the
+            // previous upload - clear client-side too, or the UI would keep
+            // showing state the server can no longer serve.
+            _clearMetabolomicsResolutionDependentState();
+            render();
+        } catch (err) {
+            alert(err.message);
+        }
+    }
+
+    wrap.appendChild(fileInputWidget({
+        accept: ".csv,.tsv,.txt",
+        buttonLabel: "Choose CSV file",
+        initialFilename: mx.uploadedFilename,
+        onChange: (file) => { if (file) uploadFile(file, null); },
+    }));
+
+    if (!isConc) {
+        wrap.appendChild(el("div", { class: "caption" },
+            "One compound per row in a column named \"Name\" (e.g. Citrate, L-Glutamic acid, PC 34:1). " +
+            "No statistics columns are needed: the list is tested for enrichment against each database's " +
+            "own reference set. Optional identifier columns - InChIKey, PubChem ID, KEGG ID, HMDB ID, " +
+            "ChEBI ID, LIPID MAPS ID - are used in preference to a name lookup when present, which makes " +
+            "matching markedly more reliable (a name alone is ambiguous: synonyms, isomers, conjugate-base forms)."));
+        const exLink = el("button", { class: "ora-inline-example-link", type: "button" }, "Example file");
+        exLink.addEventListener("click", () => downloadFile("/api/metabolomics/list/example", "example_metabolomics_list.csv"));
+        wrap.appendChild(exLink);
+        if (mx.listTable) {
+            wrap.appendChild(el("div", { class: "caption" },
+                mx.listIdColumns.length
+                    ? "Identifier columns detected: " + mx.listIdColumns.join(", ")
+                    : "No identifier columns detected - matching will rely on names."));
+            const maxHeight = Math.min(400, Math.max(200, (mx.listTable.rows.length + 1) * 35));
+            wrap.appendChild(buildTable(mx.listTable, { maxHeight }));
+        }
+        return wrap;
+    }
+
+    wrap.appendChild(el("div", { class: "caption" },
+        "Samples in rows: one sample-ID column, one group-label column (e.g. Control / Treated), and every other " +
+        "column a compound's concentration or intensity. Compounds-in-rows exports (samples as columns) are also " +
+        "accepted. Omiscera computes the per-compound statistics itself - you do not upload log2FC or p-values."));
+    const exLink = el("button", { class: "ora-inline-example-link", type: "button" }, "Example file");
+    exLink.addEventListener("click", () => downloadFile("/api/metabolomics/quant/example", "example_metabolomics_concentrations.csv"));
+    wrap.appendChild(exLink);
+
+    const info = mx.concInfo;
+    if (info) {
+        const counts = info.group_counts || {};
+        const levels = (info.group_levels || []).map((g) => g + " (n=" + counts[g] + ")").join(", ");
+        wrap.appendChild(el("div", { class: "caption" },
+            "Read " + info.n_samples + " samples x " + info.n_compounds + " compounds (" +
+            (info.orientation === "transposed" ? "compounds in rows" : "samples in rows") + "). Group column: \"" +
+            info.group_column + "\" - " + levels + "."));
+        const ignoredParts = [];
+        if (info.n_empty_dropped) ignoredParts.push(info.n_empty_dropped + " empty column(s)/row(s)");
+        if (info.n_unnamed_dropped) ignoredParts.push(info.n_unnamed_dropped + " unnamed column(s)/row(s)");
+        if (ignoredParts.length) {
+            wrap.appendChild(el("div", { class: "caption" },
+                "Ignored: " + ignoredParts.join(", ") + " (no name or no numeric value)."));
+        }
+        if (info.n_repeated_names) {
+            wrap.appendChild(el("div", { class: "caption" },
+                info.n_repeated_names + " compound name" + (info.n_repeated_names === 1 ? "" : "s") +
+                (info.n_repeated_names === 1 ? " appears" : " appear") + " more than once (e.g. two adducts/features of the same compound) - kept as separate " +
+                "measurements and averaged into one score after the statistics."));
+        }
+
+        // Auto-detection can be wrong on an ambiguous file; say what was
+        // detected (above) and let the user override it, rather than
+        // silently trusting a guess.
+        const overrides = mx.concOverrides || { orientation: "auto", groupColumn: "" };
+        const overrideRow = el("div", { class: "row" });
+        const orientCol = el("div", { class: "col" });
+        orientCol.appendChild(el("div", { class: "chart-option-label" }, "Table layout"));
+        const orientSel = el("select", { class: "text-input" });
+        [["Detect automatically", "auto"], ["Samples in rows", "standard"], ["Compounds in rows", "transposed"]]
+            .forEach(([label, value]) => orientSel.appendChild(el("option", { value }, label)));
+        orientSel.value = overrides.orientation || "auto";
+        orientCol.appendChild(orientSel);
+        overrideRow.appendChild(orientCol);
+        const groupCol = el("div", { class: "col" });
+        groupCol.appendChild(el("div", { class: "chart-option-label" }, "Group column"));
+        const groupSel = el("select", { class: "text-input" });
+        const groupChoices = (info.candidate_group_columns || []).slice();
+        if (groupChoices.indexOf(info.group_column) === -1) groupChoices.unshift(info.group_column);
+        groupChoices.forEach((c) => groupSel.appendChild(el("option", { value: c }, c)));
+        groupSel.value = overrides.groupColumn || info.group_column;
+        groupCol.appendChild(groupSel);
+        overrideRow.appendChild(groupCol);
+        wrap.appendChild(overrideRow);
+        const reapply = () => {
+            if (!mx.concFile) return;
+            uploadFile(mx.concFile, { orientation: orientSel.value, groupColumn: groupSel.value });
+        };
+        orientSel.addEventListener("change", reapply);
+        groupSel.addEventListener("change", reapply);
+
+        const maxHeight = Math.min(400, Math.max(200, (info.preview.rows.length + 1) * 35));
+        wrap.appendChild(el("div", { class: "caption" }, "Preview (first 10 samples):"));
+        wrap.appendChild(buildTable(info.preview, { maxHeight }));
+    }
+    return wrap;
+}
+
+function renderMetabolomicsResolveControls() {
+    const mx = STATE.metabolomics;
+    const spec = _metabolomicsSpec();
+    const wrap = el("div", {});
+    const hasUpload = spec.input === "conc" ? !!mx.concInfo : !!mx.listTable;
+    const disabled = !hasUpload || (spec.needsOrganism && !mx.taxonId);
+    const btn = el("button", { class: "btn" }, "Resolve compounds");
+    btn.disabled = disabled;
+    if (hasUpload && spec.needsOrganism && !mx.taxonId) {
+        wrap.appendChild(el("div", { class: "caption" }, "Select an organism first."));
+    }
+    wrap.appendChild(el("div", { class: "caption" },
+        "Compound names are resolved to identifiers through PubChem and KEGG, then matched into a local " +
+        "cross-reference built from LIPID MAPS, RefMet and ChEBI. The first run downloads those reference " +
+        "files and takes a few minutes; later runs reuse the cache."));
+    const progressWrap = el("div", { class: "progress-wrap hidden" });
+    const progressInner = el("div", { class: "progress-bar-inner", style: { width: "0%" } });
+    const progressLabel = el("div", { class: "progress-label" }, "");
+    progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, progressInner));
+    progressWrap.appendChild(progressLabel);
+
+    btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        progressWrap.classList.remove("hidden");
+        const route = spec.input === "conc" ? "/api/metabolomics/quant/resolve" : "/api/metabolomics/list/resolve";
+        try {
+            const { job_id } = await apiPostJson(route, { taxon_id: mx.taxonId, taxon_name: mx.taxonName });
+            pollJob(job_id, {
+                onProgress: (job) => {
+                    progressInner.style.width = Math.round((job.progress || 0) * 100) + "%";
+                    progressLabel.textContent = job.message || "";
+                },
+                onDone: (result) => {
+                    mx.resolved = result.resolved_table;
+                    mx.resolveMeta = result.metrics;
+                    render();
+                },
+                onError: (err) => { alert(err); render(); },
+            });
+        } catch (err) {
+            alert(err.message);
+            render();
+        }
+    });
+    wrap.appendChild(btn);
+    wrap.appendChild(progressWrap);
+    return wrap;
+}
+
+function renderMetabolomicsResolveResults() {
+    const mx = STATE.metabolomics;
+    const spec = _metabolomicsSpec();
+    const meta = mx.resolveMeta || {};
+    const wrap = el("div", {});
+    wrap.appendChild(el("div", { class: "section-label" }, "Resolved compounds"));
+    wrap.appendChild(buildTable(mx.resolved, { maxHeight: 420 }));
+    wrap.appendChild(metricCards([
+        ["Compounds uploaded", meta.n_input],
+        ["Matched", meta.n_matched],
+        ["Unmatched", meta.n_unmatched],
+        ["Class-level only", meta.n_class_level_only],
+    ], 4));
+    // Only the list path (ORA/Chemical Class/Lipid Class) dedupes an exact-
+    // repeated Name; the concentration path never sets this (a repeated
+    // column Name there is a genuine second feature/adduct, kept on purpose).
+    if (meta.n_duplicate_names_removed) {
+        wrap.appendChild(el("div", { class: "caption" },
+            meta.n_input_rows + " row(s) uploaded, " + meta.n_duplicate_names_removed +
+            " duplicate name" + (meta.n_duplicate_names_removed === 1 ? "" : "s") +
+            " removed (kept the first occurrence) - " + meta.n_input + " compound(s) tested below."));
+    }
+
+    const tiers = meta.n_matched_by_tier || {};
+    const tierLabels = {
+        inchikey: "InChIKey (exact structure)", pubchem: "PubChem CID", chebi: "ChEBI ID",
+        kegg: "KEGG ID", hmdb: "HMDB ID", lm_id: "LIPID MAPS ID", name: "Name",
+        skeleton: "InChIKey skeleton (stereochemistry-insensitive)",
+        lipid_shorthand: "Lipid shorthand (class only)",
+    };
+    const tierLines = Object.keys(tierLabels).filter((t) => tiers[t]).map((t) => tierLabels[t] + ": " + tiers[t]);
+    if (tierLines.length) {
+        wrap.appendChild(el("div", { class: "caption" }, "Matched by - " + tierLines.join("; ") + "."));
+    }
+    if (meta.n_skeleton_only) {
+        wrap.appendChild(alertBox("info",
+            meta.n_skeleton_only + " compound(s) matched only on the InChIKey skeleton - the connectivity matched " +
+            "but stereochemistry/protonation did not. These can be a different stereoisomer of the intended " +
+            "compound; they are reported separately so you can judge how much of the result rests on them."));
+    }
+    if (meta.n_class_level_only) {
+        wrap.appendChild(alertBox("info",
+            meta.n_class_level_only + " compound(s) were given as lipid shorthand (e.g. \"PC 34:1\"). A sum " +
+            "composition covers many structures, so these are used for Lipid Class and Chemical Class " +
+            "enrichment but deliberately excluded from pathway membership, which they cannot support."));
+    }
+    if (meta.crosswalk_caveat) wrap.appendChild(alertBox("warning", meta.crosswalk_caveat));
+    if ((meta.crosswalk_sources || []).length) {
+        wrap.appendChild(el("div", { class: "caption" }, "Cross-reference built from: " + meta.crosswalk_sources.join(", ")));
+    }
+
+    const dlBtn = el("button", { class: "btn" }, "Download resolved table (CSV)");
+    dlBtn.addEventListener("click", () => downloadFile(
+        spec.input === "conc" ? "/api/metabolomics/quant/download/resolved.csv" : "/api/metabolomics/list/download/resolved.csv",
+        "metabolomics_resolved_compounds.csv"));
+    wrap.appendChild(dlBtn);
+
+    const continueBtn = el("button", { class: "btn btn-primary", style: { marginTop: "0.8rem" } },
+        "Continue to " + STATE.metabolomicsModuleName);
+    continueBtn.addEventListener("click", () => {
+        mx.run = freshMetabolomicsRun();
+        STATE.aaPage = "metabolomics_config";
+        render();
+    });
+    wrap.appendChild(continueBtn);
+    return wrap;
+}
+
+// Pathway Topology Analysis only: lets the user pick which of the two
+// shared upload paths to drive it from. Switching does not touch
+// mx.listTable/mx.concInfo/mx.resolved (shared with the other tiles, and
+// possibly already populated from one of them) - only this tile's own
+// in-progress run/config, since that was built for the mode being left.
+function renderMetabolomicsTopologyInputChoice() {
+    const mx = STATE.metabolomics;
+    const wrap = el("div", {});
+    wrap.appendChild(el("div", { class: "section-label" }, "Input"));
+    wrap.appendChild(el("div", { class: "caption" },
+        "Pathway Topology Analysis accepts either a plain compound list (Fisher's exact test, like " +
+        "Over-Representation Analysis) or a concentration table (competitive Wilcoxon test on the statistics " +
+        "Omiscera computes, like Quantitative Enrichment) - the topology Impact score is computed the same way " +
+        "either way."));
+    const sel = el("select", { class: "text-input" });
+    [["Compound list", "list"], ["Concentration table", "conc"]].forEach(([label, value]) =>
+        sel.appendChild(el("option", { value }, label)));
+    sel.value = mx.topologyInput || "list";
+    sel.addEventListener("change", () => {
+        if (mx.topologyInput === sel.value) return;
+        mx.topologyInput = sel.value;
+        mx.run = freshMetabolomicsRun();
+        render();
+    });
+    wrap.appendChild(sel);
+    return wrap;
+}
+
+function renderMetabolomicsModuleScreen() {
+    const spec = _metabolomicsSpec();
+    const wrap = el("div", { class: "ora-config-screen ora-module-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Metabolomics — " + STATE.metabolomicsModuleName));
+    if (spec.kind === "topology") {
+        wrap.appendChild(renderMetabolomicsTopologyInputChoice());
+    }
+    if (spec.needsOrganism) {
+        wrap.appendChild(el("div", { class: "section-label" }, "Organism"));
+        wrap.appendChild(renderMetabolomicsOrganismSelector());
+        wrap.appendChild(el("div", { class: "caption" },
+            "Selects which species' pathways Reactome and PathBank are tested against, which of KEGG's " +
+            "pathway maps exist for your organism, and whether SMPDB (human only) is available."));
+    }
+    wrap.appendChild(renderMetabolomicsUploadSection());
+    wrap.appendChild(renderMetabolomicsResolveControls());
+    if (STATE.metabolomics.resolved) wrap.appendChild(renderMetabolomicsResolveResults());
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToMetabolomicsActions());
+    return wrap;
+}
+
+// Optional background list. Restricts each database's reference set to
+// compounds present in BOTH the database and this list (e.g. the panel an
+// instrument can actually measure) - a plain list of names, same format as
+// the main upload.
+function renderMetabolomicsBackgroundWidget(locked, draft) {
+    const mx = STATE.metabolomics;
+    const spec = _metabolomicsSpec();
+    const wrap = el("div", { class: "ora-background-widget" });
+
+    const toggleRow = el("div", { class: "ora-iea-row ora-background-toggle-row" });
+    const toggleCb = el("input", { type: "checkbox", class: "ora-iea-checkbox ora-background-checkbox" });
+    toggleCb.checked = draft.useBackground;
+    toggleCb.disabled = locked;
+    toggleCb.addEventListener("change", () => { draft.useBackground = toggleCb.checked; render(); });
+    toggleRow.appendChild(toggleCb);
+    toggleRow.appendChild(document.createTextNode(" Background compound list (optional)"));
+    wrap.appendChild(toggleRow);
+    if (!draft.useBackground) return wrap;
+
+    const body = el("div", { class: "ora-background-body" });
+    if (!locked) {
+        body.appendChild(fileInputWidget({
+            accept: ".csv,.tsv,.txt",
+            buttonLabel: "Choose background file",
+            initialFilename: mx.background ? mx.background.filename : "",
+            onChange: async (file) => {
+                if (!file) return;
+                const formData = new FormData();
+                formData.append("file", file);
+                const status = el("div", { class: "caption" }, "Resolving background list...");
+                body.appendChild(status);
+                try {
+                    const { job_id } = await apiUpload("/api/metabolomics/list/background-upload", formData);
+                    pollJob(job_id, {
+                        onProgress: (job) => { status.textContent = job.message || "Resolving background list..."; },
+                        onDone: (result) => {
+                            mx.background = {
+                                filename: file.name,
+                                n_uploaded: result.metrics.n_uploaded,
+                                n_matched: result.metrics.n_matched,
+                            };
+                            render();
+                        },
+                        onError: (err) => { mx.background = null; alert(err); render(); },
+                    });
+                } catch (err) {
+                    mx.background = null;
+                    alert(err.message);
+                    render();
+                }
+            },
+        }));
+    }
+    if (mx.background) {
+        const s = mx.background;
+        body.appendChild(el("div", { class: "caption ora-background-summary" },
+            "Background: \"" + s.filename + "\" - " + s.n_matched + " of " + s.n_uploaded + " compound(s) matched. " +
+            (spec.input === "conc"
+                ? "Restricts the universe to measured compounds that are also in this list."
+                : "Restricts each database's reference set to compounds that are also in this list.")));
+        if (!locked) {
+            const removeBtn = el("button", { class: "btn btn-small ora-background-remove", type: "button" }, "Remove background");
+            removeBtn.addEventListener("click", async () => {
+                try { await apiPostJson("/api/metabolomics/list/background-remove", {}); } catch (err) { /* ignore */ }
+                mx.background = null;
+                render();
+            });
+            body.appendChild(removeBtn);
+        }
+    } else {
+        body.appendChild(el("div", { class: "caption ora-background-help" },
+            "A list of compound names in the same format as the main upload (a \"Name\" column), for a narrower " +
+            "reference set than the database's full annotation. Leave off to use the default."));
+    }
+    wrap.appendChild(body);
+    return wrap;
+}
+
+// KEGG organism box - same debounced search Metabolic Connection uses for its
+// organism/context box (/api/contexts/search), pointed at KEGG's own organism
+// list. KEGG tests only the pathway maps an organism has, so the organism matters.
+//
+// Default: the organism chosen above is matched to a KEGG genome automatically
+// (shared resolver). If that cannot be verified to ONE genome - E. coli matches
+// 64 - the automatic match is empty and the user picks here instead; an explicit
+// pick always wins. Safe to set separately from the main organism (unlike the
+// gene modules): Metabolomics has no gene-ID mapping that could be resolved for
+// one organism and tested against another - the organism only selects maps.
+function renderMetabolomicsKeggOrganismBox(container, draft, locked) {
+    const mx = STATE.metabolomics;
+    container.innerHTML = "";
+    container.appendChild(el("div", { class: "section-label" }, "KEGG organism"));
+    container.appendChild(el("div", { class: "caption" },
+        "KEGG tests only the pathway maps an organism has. By default your organism (above) is matched to " +
+        "KEGG's own list; search KEGG's organisms below to use a specific one instead - for example a " +
+        "particular strain, or a close relative KEGG covers better. An explicit choice always wins."));
+
+    const status = el("div", { class: "caption ora-selected-caption" });
+    const detail = el("div", { class: "caption" });
+    container.appendChild(status);
+    container.appendChild(detail);
+
+    async function choose(rec) {
+        try {
+            const org = await apiPostJson("/api/metabolomics/kegg/check-organism", { organism_code: String(rec.context_id || "") });
+            draft.keggOrganism = { code: org.organism_code, name: org.organism_name, nMaps: org.n_maps };
+            render();
+        } catch (err) {
+            detail.textContent = "Cannot use that KEGG organism: " + err.message;
+        }
+    }
+
+    const input = el("input", { class: "text-input", type: "text", placeholder: "KEGG organism (name or code)" });
+    input.disabled = locked;
+    const resultsSelect = el("select", { class: "hidden" });
+    const searchStatus = el("div", { class: "caption" });
+    let candidateRecords = [];
+
+    function fillSelect(records, firstLabel) {
+        resultsSelect.innerHTML = "";
+        resultsSelect.appendChild(el("option", { value: "" }, firstLabel));
+        records.forEach((rec, idx) => {
+            const label = rec.context_id && rec.context_name ? rec.context_id + " | " + rec.context_name : (rec.context_name || rec.context_id || "");
+            resultsSelect.appendChild(el("option", { value: String(idx) }, label));
+        });
+        resultsSelect._records = records;
+        resultsSelect.classList.toggle("hidden", records.length === 0);
+    }
+
+    if (draft.keggOrganism) {
+        const k = draft.keggOrganism;
+        status.textContent = "Selected: " + k.name + " (KEGG organism " + k.code + ") - " + k.nMaps + " pathway maps.";
+        if (!locked) {
+            const clearBtn = el("button", { class: "btn btn-small", type: "button" }, "Use the organism chosen above instead");
+            clearBtn.addEventListener("click", () => { draft.keggOrganism = null; render(); });
+            container.appendChild(clearBtn);
+        }
+    } else {
+        status.textContent = "Checking which KEGG organism matches yours...";
+        _fetchKeggOrganismCheck("metabolomics").then((result) => {
+            if (result.organism_code) {
+                status.textContent = "Using " + result.organism_name + " (KEGG organism " + result.organism_code +
+                    "), matched from " + (mx.taxonName || "your organism") + ".";
+                if (result.caveat) detail.textContent = result.caveat;
+            } else {
+                candidateRecords = (result.candidates || []).map((cand) => ({
+                    context_id: cand.organism_code, context_name: cand.organism_name,
+                }));
+                if (candidateRecords.length) {
+                    // The shared resolver's own note is written for the gene modules
+                    // ("... GO and MSigDB match on gene symbol ..."), so Metabolomics
+                    // words this itself.
+                    status.textContent = "Your organism matches " + candidateRecords.length +
+                        " KEGG genomes, so KEGG cannot pick one automatically - choose a KEGG organism below.";
+                    detail.textContent = "Pick one of the suggestions, or search KEGG's organisms by name or code. " +
+                        "Until you do, KEGG is skipped for this run.";
+                    fillSelect(candidateRecords, "Suggested KEGG organisms");
+                } else {
+                    status.textContent = "KEGG has no genome matching your organism - search KEGG's organisms below " +
+                        "for a close relative.";
+                    detail.textContent = "Until you pick one, KEGG is skipped for this run.";
+                }
+            }
+        }).catch((err) => { status.textContent = "Could not check KEGG organism availability: " + err.message; });
+    }
+
+    let lastQuery = "";
+    let inFlight = false;
+    let timer = null;
+    input.addEventListener("input", () => {
+        const query = input.value.trim();
+        if (timer) clearTimeout(timer);
+        if (query.length < 2) {
+            if (candidateRecords.length) fillSelect(candidateRecords, "Suggested KEGG organisms");
+            else { resultsSelect.innerHTML = ""; resultsSelect.classList.add("hidden"); }
+            searchStatus.textContent = "";
+            return;
+        }
+        timer = setTimeout(async () => {
+            if (query === lastQuery || inFlight) return;
+            lastQuery = query;
+            inFlight = true;
+            // KEGG's organism list has no fast REST source of its own, so the
+            // first search per server process can take a few seconds.
+            searchStatus.textContent = "Searching KEGG organisms...";
+            try {
+                const data = await apiJson("/api/contexts/search?database=KEGG&query=" + encodeURIComponent(query) + "&limit=10");
+                fillSelect(data.results || [], "Select KEGG organism");
+                searchStatus.textContent = (data.results || []).length ? "" : "No KEGG organism matches \"" + query + "\".";
+            } catch (err) {
+                searchStatus.textContent = "KEGG search failed - try again.";
+            } finally {
+                inFlight = false;
+            }
+        }, 350);
+    });
+    resultsSelect.addEventListener("change", () => {
+        if (resultsSelect.value === "") return;
+        choose(resultsSelect._records[parseInt(resultsSelect.value, 10)]);
+    });
+
+    container.appendChild(input);
+    container.appendChild(searchStatus);
+    container.appendChild(resultsSelect);
+}
+
+function renderMetabolomicsConfigScreen() {
+    const mx = STATE.metabolomics;
+    const spec = _metabolomicsSpec();
+    const kind = spec.kind;
+    const wrap = el("div", { class: "ora-config-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" },
+        "Metabolomics — " + STATE.metabolomicsModuleName + ": setup"));
+
+    if (!mx || !mx.resolved) {
+        wrap.appendChild(alertBox("warning", "Resolve the compounds first."));
+        wrap.appendChild(backToMetabolomicsActions());
+        return wrap;
+    }
+    const run = mx.run;
+    const locked = run.locked;
+    if (locked) {
+        wrap.appendChild(alertBox("info", "Configuration is locked for the in-progress/completed run. Use \"Start new run\" on the results screen to change settings."));
+    }
+
+    if (!run.draft) {
+        const levels = (mx.concInfo && mx.concInfo.group_levels) || [];
+        run.draft = {
+            databases: spec.databases.slice(),
+            chemicalClassLevel: "sub_class", lipidClassLevel: "lm_main_class",
+            pathbankPrimaryOnly: true,
+            // Class taxonomies (Chemical / Lipid Class) default to NO maximum:
+            // their useful main-class terms have thousands of members, far
+            // above the 500 that suits pathway-sized terms.
+            minTermSize: 3, maxTermSize: (kind === "chemclass" || kind === "lipidclass") ? "" : 500,
+            useBackground: false,
+            keggOrganism: null,
+            groupA: levels.length > 1 ? levels[1] : (levels[0] || ""),
+            groupB: levels[0] || "",
+            logTransform: true, minPerGroup: 3, metric: "log2fc",
+            // Pathway Topology Analysis only.
+            measure: "betweenness",
+        };
+    }
+    const draft = run.draft;
+    // Group contrast/statistics fields are shown for Quantitative Enrichment
+    // AND for Pathway Topology Analysis when it is reading a concentration
+    // table (spec.input, not kind - see _metabolomicsSpec()'s override).
+    const showGroupFields = kind === "quant" || (kind === "topology" && spec.input === "conc");
+
+    function selectField(labelText, options, value, onChange, caption) {
+        const col = el("div", { class: "col" });
+        col.appendChild(el("div", { class: "chart-option-label" }, labelText));
+        const sel = el("select", { class: "text-input" });
+        options.forEach(([optLabel, optValue]) => sel.appendChild(el("option", { value: optValue }, optLabel)));
+        sel.value = value;
+        sel.disabled = locked;
+        sel.addEventListener("change", () => onChange(sel.value));
+        col.appendChild(sel);
+        if (caption) col.appendChild(el("div", { class: "caption" }, caption));
+        return col;
+    }
+    function numberField(labelText, value, step, min, onChange, allowBlank) {
+        const col = el("div", { class: "col" });
+        col.appendChild(el("div", { class: "chart-option-label" }, labelText));
+        const input = el("input", { type: "number", class: "text-input", step: String(step), min: String(min) });
+        if (allowBlank) input.placeholder = "no limit";
+        input.value = value;
+        input.disabled = locked;
+        input.addEventListener("change", () => {
+            if (allowBlank && input.value.trim() === "") { onChange(""); return; }
+            const v = parseFloat(input.value);
+            if (isFinite(v) && v >= min) onChange(v);
+            else input.value = value;
+        });
+        col.appendChild(input);
+        return col;
+    }
+
+    const runBtnWrap = el("div", { class: "col" });
+    function renderRunBtn() {
+        runBtnWrap.innerHTML = "";
+        const runBtn = el("button", { class: "btn btn-primary ora-run-btn" }, "Run");
+        const groupsInvalid = showGroupFields && (!draft.groupA || !draft.groupB || draft.groupA === draft.groupB);
+        runBtn.disabled = locked || draft.databases.length === 0 || groupsInvalid;
+        runBtn.addEventListener("click", () => startMetabolomicsRun(draft));
+        runBtnWrap.appendChild(runBtn);
+    }
+
+    // ----- Group contrast and per-compound statistics (Quantitative, and
+    // Pathway Topology Analysis in concentration-table mode) -----
+    if (showGroupFields) {
+        const info = mx.concInfo;
+        const levels = info.group_levels || [];
+        wrap.appendChild(el("div", { class: "section-label" }, "Groups to compare"));
+        const groupOptions = levels.map((g) => [g + " (n=" + (info.group_counts || {})[g] + ")", g]);
+        const groupRow = el("div", { class: "row" });
+        groupRow.appendChild(selectField("Group A", groupOptions, draft.groupA, (v) => { draft.groupA = v; renderRunBtn(); }));
+        groupRow.appendChild(selectField("Group B (reference)", groupOptions, draft.groupB, (v) => { draft.groupB = v; renderRunBtn(); }));
+        wrap.appendChild(groupRow);
+        wrap.appendChild(el("div", { class: "caption" },
+            "Each compound is compared between the two groups with Welch's t-test (Benjamini-Hochberg-adjusted); " +
+            "a positive log2 fold change means higher in Group A. " +
+            (levels.length > 2
+                ? "Your table has " + levels.length + " groups, so choose the two to contrast - an unsigned multi-group test could not feed a direction-aware enrichment. "
+                : "") +
+            "Missing values are not imputed: a compound needs enough measured samples in both groups to be tested."));
+
+        const statsRow = el("div", { class: "row", style: { marginTop: "0.6rem" } });
+        statsRow.appendChild(numberField("Minimum samples per group", draft.minPerGroup, 1, 2, (v) => { draft.minPerGroup = Math.round(v); }));
+        statsRow.appendChild(selectField("Ranking metric", METABOLOMICS_RANKING_METRICS, draft.metric, (v) => { draft.metric = v; }));
+        wrap.appendChild(statsRow);
+
+        const logRow = el("div", { class: "row", style: { alignItems: "center", marginTop: "0.5rem" } });
+        const logLabel = el("label", { style: { display: "flex", alignItems: "center", gap: "0.4rem" } });
+        const logCb = el("input", { type: "checkbox" });
+        logCb.checked = draft.logTransform;
+        logCb.disabled = locked;
+        logCb.addEventListener("change", () => { draft.logTransform = logCb.checked; });
+        logLabel.appendChild(logCb);
+        logLabel.appendChild(document.createTextNode(" Log2-transform concentrations before testing"));
+        logRow.appendChild(logLabel);
+        wrap.appendChild(logRow);
+        wrap.appendChild(el("div", { class: "caption" },
+            "Recommended for concentration/intensity data, which are right-skewed. Zeros are handled by adding " +
+            "half the smallest positive value (reported on the results screen). Uncheck if your table is already log-scaled."));
+    }
+
+    // ----- Databases -----
+    if (spec.databases.length > 1) {
+        wrap.appendChild(el("div", { class: "section-label ora-select-label" }, "Select database(s)"));
+        const checkRow = el("div", { class: "db-checkbox-row ora-db-checkbox-row" });
+        const smpdbAvailable = String(mx.taxonId) === "9606";
+        spec.databases.forEach((dbName) => {
+            const unavailable = dbName === "SMPDB" && !smpdbAvailable;
+            if (unavailable) draft.databases = draft.databases.filter((d) => d !== dbName);
+            const label = el("label", { class: "ora-db-pill" });
+            const cb = el("input", { type: "checkbox", class: "ora-db-checkbox" });
+            cb.disabled = locked || unavailable;
+            cb.checked = !unavailable && draft.databases.indexOf(dbName) !== -1;
+            cb.addEventListener("change", () => {
+                if (cb.checked) {
+                    if (draft.databases.indexOf(dbName) === -1) draft.databases.push(dbName);
+                } else {
+                    draft.databases = draft.databases.filter((d) => d !== dbName);
+                }
+                render();
+            });
+            label.appendChild(cb);
+            label.appendChild(document.createTextNode(" " + dbName + (unavailable ? " (human only)" : "")));
+            checkRow.appendChild(label);
+        });
+        wrap.appendChild(checkRow);
+        if (spec.databases.indexOf("SMPDB") !== -1 && String(mx.taxonId) !== "9606") {
+            wrap.appendChild(el("div", { class: "caption" }, "SMPDB is disabled: it covers human pathways only."));
+        }
+        if (draft.databases.indexOf("KEGG") !== -1) {
+            const keggOrganismWrap = el("div", { class: "ora-kegg-organism-wrap" });
+            wrap.appendChild(keggOrganismWrap);
+            renderMetabolomicsKeggOrganismBox(keggOrganismWrap, draft, locked);
+        }
+        wrap.appendChild(el("div", { class: "caption" },
+            "KEGG: compound-pathway maps, restricted to the maps your organism has (KEGG's own list; overview " +
+            "maps are excluded). Reactome: " +
+            "curated human/species pathways, joined through ChEBI. SMPDB: the Small Molecule Pathway Database " +
+            "(human). PathBank: species-specific metabolic pathways." +
+            (kind === "quant"
+                ? " Chemical Class (RefMet) and Lipid Class (LIPID MAPS) test structural categories instead of pathways."
+                : "")));
+    }
+
+    // ----- Pathway Topology Analysis: KEGG only (no database picker needed -
+    // there is only one), its own organism box, and the node-importance
+    // measure. -----
+    if (kind === "topology") {
+        const keggOrganismWrap = el("div", { class: "ora-kegg-organism-wrap" });
+        wrap.appendChild(keggOrganismWrap);
+        renderMetabolomicsKeggOrganismBox(keggOrganismWrap, draft, locked);
+        wrap.appendChild(el("div", { class: "caption" },
+            "Pathway Topology Analysis tests KEGG only: the enrichment p-value is identical to the Over-" +
+            "Representation Analysis / Quantitative Enrichment tiles' own KEGG result for the same input and " +
+            "config - the extra Impact column comes from where your matched compounds sit in each pathway's " +
+            "own KEGG reaction graph, which (unlike compound membership) IS organism-specific."));
+
+        wrap.appendChild(el("div", { class: "section-label" }, "Node importance"));
+        const measureRow = el("div", { class: "row" });
+        measureRow.appendChild(selectField("Measure", PATHWAY_TOPOLOGY_MEASURES, draft.measure, (v) => { draft.measure = v; }));
+        wrap.appendChild(measureRow);
+        wrap.appendChild(el("div", { class: "caption" },
+            "Relative betweenness centrality (default, MetPA's convention): how often a compound lies on the " +
+            "shortest reaction path between two others. Out-degree: how many compounds it directly feeds. Impact " +
+            "= the sum of your matched compounds' importance divided by the sum for every compound in the pathway."));
+    }
+
+    const showClassCaption = (dbName) => draft.databases.indexOf(dbName) !== -1;
+    if (showClassCaption("Chemical Class") || kind === "chemclass") {
+        wrap.appendChild(el("div", { class: "section-label" }, "Chemical class level (RefMet)"));
+        const row = el("div", { class: "row" });
+        row.appendChild(selectField("Class level", [
+            ["Sub class (most specific)", "sub_class"], ["Main class", "main_class"], ["Super class (broadest)", "super_class"],
+        ], draft.chemicalClassLevel, (v) => { draft.chemicalClassLevel = v; }));
+        wrap.appendChild(row);
+        wrap.appendChild(el("div", { class: "caption" },
+            "RefMet's three-level taxonomy (Metabolomics Workbench; non-commercial terms of use - every other " +
+            "source here is freely licensed)."));
+    }
+    if (showClassCaption("Lipid Class") || kind === "lipidclass") {
+        wrap.appendChild(el("div", { class: "section-label" }, "Lipid class level (LIPID MAPS)"));
+        const row = el("div", { class: "row" });
+        row.appendChild(selectField("Class level", [
+            ["Main class", "lm_main_class"], ["Sub class (most specific)", "lm_sub_class"], ["Category (broadest)", "lm_category"],
+        ], draft.lipidClassLevel, (v) => { draft.lipidClassLevel = v; }));
+        wrap.appendChild(row);
+        wrap.appendChild(el("div", { class: "caption" },
+            "LIPID MAPS' own hierarchy. Bulk lipid shorthand such as \"PC 34:1\" is counted in its own class " +
+            "even though no single LIPID MAPS structure carries that name."));
+    }
+    if (showClassCaption("PathBank")) {
+        const row = el("div", { class: "row", style: { alignItems: "center", marginTop: "0.5rem" } });
+        const label = el("label", { style: { display: "flex", alignItems: "center", gap: "0.4rem" } });
+        const cb = el("input", { type: "checkbox" });
+        cb.checked = draft.pathbankPrimaryOnly;
+        cb.disabled = locked;
+        cb.addEventListener("change", () => { draft.pathbankPrimaryOnly = cb.checked; });
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(" PathBank: primary metabolic pathways only"));
+        row.appendChild(label);
+        wrap.appendChild(row);
+    }
+
+    wrap.appendChild(renderMetabolomicsBackgroundWidget(locked, draft));
+
+    const termSizeRow = el("div", { class: "row", style: { marginTop: "0.8rem" } });
+    termSizeRow.appendChild(numberField("Minimum term size (compounds)", draft.minTermSize, 1, 1, (v) => { draft.minTermSize = Math.round(v); }));
+    const classTile = kind === "chemclass" || kind === "lipidclass";
+    termSizeRow.appendChild(numberField(
+        classTile ? "Maximum term size (compounds, blank = no limit)" : "Maximum term size (compounds)",
+        draft.maxTermSize, 1, 1, (v) => { draft.maxTermSize = v === "" ? "" : Math.round(v); }, classTile));
+    wrap.appendChild(termSizeRow);
+    wrap.appendChild(el("div", { class: "caption" },
+        "Terms with fewer compounds than the minimum, or more than the maximum, are excluded before FDR " +
+        "correction. " + (classTile
+            ? "Class taxonomies have very large terms at their broad levels (thousands of compounds), so there is " +
+              "no maximum by default; set one to drop the most generic classes."
+            : "Very large terms are usually too generic to be informative.")));
+
+    const actions = el("div", { class: "right-actions", style: { marginTop: "1rem" } });
+    const btnRow = el("div", { class: "btn-row" });
+    const backBtn = el("button", { class: "btn" }, "Back");
+    backBtn.addEventListener("click", () => { STATE.aaPage = "metabolomics_module"; render(); });
+    btnRow.appendChild(backBtn);
+    renderRunBtn();
+    btnRow.appendChild(runBtnWrap);
+    actions.appendChild(btnRow);
+    wrap.appendChild(actions);
+    return wrap;
+}
+
+async function startMetabolomicsRun(draft) {
+    const mx = STATE.metabolomics;
+    const spec = _metabolomicsSpec();
+    const kind = spec.kind;
+    const run = mx.run;
+    if (!draft.databases.length) return;
+    const payload = {
+        databases: draft.databases,
+        min_term_size: draft.minTermSize,
+        max_term_size: draft.maxTermSize,
+        chemical_class_level: draft.chemicalClassLevel,
+        lipid_class_level: draft.lipidClassLevel,
+        pathbank_primary_only: draft.pathbankPrimaryOnly,
+        use_background: !!(draft.useBackground && mx.background),
+        // An explicit KEGG organism (chosen in the KEGG box), or "" to derive it
+        // from the organism chosen at retrieval.
+        kegg_organism_code: draft.keggOrganism ? draft.keggOrganism.code : "",
+    };
+    if (kind === "quant" || (kind === "topology" && spec.input === "conc")) {
+        payload.group_a = draft.groupA;
+        payload.group_b = draft.groupB;
+        payload.log_transform = draft.logTransform;
+        payload.min_per_group = draft.minPerGroup;
+        payload.metric = draft.metric;
+    }
+    if (kind === "topology") {
+        payload.input_mode = spec.input;
+        payload.measure = draft.measure;
+    }
+    try {
+        const cfg = await apiPostJson("/api/metabolomics/" + kind + "/configure", payload);
+        run.config = cfg.config;
+        if (kind === "quant") {
+            mx.statsMeta = cfg.stats_meta;
+            mx.statsPreview = cfg.stats_preview;
+        }
+        if (kind === "topology" && spec.input === "conc") {
+            mx.topologyStatsMeta = cfg.stats_meta;
+            mx.topologyStatsPreview = cfg.stats_preview;
+        }
+        run.locked = true;
+        run.results = null;
+        STATE.aaPage = "metabolomics_results";
+        render();
+        const { job_id } = await apiPostJson("/api/metabolomics/" + kind + "/run", {});
+        pollJob(job_id, {
+            onProgress: (job) => {
+                const bar = document.getElementById("metabolomics-progress-inner");
+                const label = document.getElementById("metabolomics-progress-label");
+                if (bar) bar.style.width = Math.round((job.progress || 0) * 100) + "%";
+                if (label) label.textContent = job.message || "";
+            },
+            onDone: (result) => {
+                run.results = result;
+                if (kind === "quant") mx.compoundLog2fc = result.compound_log2fc || {};
+                render();
+            },
+            onError: (err) => {
+                alert("Run failed: " + err);
+                run.locked = false;
+                STATE.aaPage = "metabolomics_config";
+                render();
+            },
+        });
+    } catch (err) {
+        alert(err.message);
+        run.locked = false;
+        if (STATE.aaPage === "metabolomics_results") STATE.aaPage = "metabolomics_config";
+        render();
+    }
+}
+
+const METABOLOMICS_RESULT_FAMILY_ORDER = METABOLOMICS_QUANT_DATABASES;
+function _sortedMetabolomicsKeys(tables) {
+    return Object.keys(tables).sort((a, b) =>
+        METABOLOMICS_RESULT_FAMILY_ORDER.indexOf(a) - METABOLOMICS_RESULT_FAMILY_ORDER.indexOf(b));
+}
+
+// ---------------------------------------------------------------------------
+// Class composition pie (Chemical Class and Lipid Class panels only).
+//
+// A DESCRIPTIVE figure - what fraction of the user's compounds fall in each
+// class - not an enrichment result, and a pie is valid ONLY because a compound
+// has exactly one class at a given taxonomy level (the slices then sum to the
+// whole). That is also why the enrichment map is dropped on these panels
+// (disjoint classes share no compounds, so it can never have an edge) and why
+// no equivalent pie is offered for KEGG/Reactome/SMPDB/PathBank, where one
+// compound sits in many pathways.
+//
+// Built from the RESOLVED compound table (mx.resolved), never from the result
+// table: that table is already filtered by term size, zero overlap and FDR, so
+// its slices would not sum to the user's compound set.
+// ---------------------------------------------------------------------------
+
+// Colour-blind-safe qualitative palette (Okabe-Ito, extended). Real classes
+// take these in rank order; "Other" and "Unclassified" get reserved greys so
+// they can never be mistaken for a class.
+const CLASS_PIE_PALETTE = [
+    "#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00",
+    "#882255", "#44AA99", "#117733", "#AA4499", "#332288", "#999933",
+];
+// Beyond the curated palette (sub-class level routinely yields dozens of
+// classes) colours are generated by stepping the hue by the golden angle, which
+// keeps successive colours far apart - so no two slices ever share a colour, a
+// pie with a repeated colour being ambiguous against its own legend.
+// <input type="color"> only accepts #rrggbb, hence the hex conversion.
+function _classPieDefaultColor(rank) {
+    if (rank < CLASS_PIE_PALETTE.length) return CLASS_PIE_PALETTE[rank];
+    const hue = (rank * 137.508) % 360;
+    const s = 0.55, l = 0.5;
+    const a = s * Math.min(l, 1 - l);
+    const channel = (n) => {
+        const k = (n + hue / 30) % 12;
+        const v = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+        return Math.round(255 * v).toString(16).padStart(2, "0");
+    };
+    return "#" + channel(0) + channel(8) + channel(4);
+}
+const CLASS_PIE_OTHER_COLOR = "#8C8C8C";
+const CLASS_PIE_UNCLASSIFIED_COLOR = "#CFCFCF";
+const METABOLOMICS_CHEM_LEVELS = [
+    ["Sub class (most specific)", "sub_class"], ["Main class", "main_class"], ["Super class (broadest)", "super_class"],
+];
+const METABOLOMICS_LIPID_LEVELS = [
+    ["Main class", "lm_main_class"], ["Sub class (most specific)", "lm_sub_class"], ["Category (broadest)", "lm_category"],
+];
+
+// {slices: [{label, count, kind: "class"|"other"|"unclassified", rank}], total}
+// One vote per compound_key: the analysis counts keys, and two uploaded names
+// can resolve to one key, so counting rows would exceed the "Matched" figure.
+function _metabolomicsClassSlices(level, classesShown) {
+    const rows = ((STATE.metabolomics.resolved || {}).rows) || [];
+    const seen = new Set();
+    const counts = new Map();
+    let unclassified = 0;
+    rows.forEach((r) => {
+        const key = String(r.compound_key || "").trim();
+        if (!key || seen.has(key)) return;
+        seen.add(key);
+        const label = String(r[level] || "").trim();
+        if (!label) { unclassified += 1; return; }
+        counts.set(label, (counts.get(label) || 0) + 1);
+    });
+    const ranked = Array.from(counts.entries()).sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])));
+    const keep = classesShown === Infinity ? ranked : ranked.slice(0, classesShown);
+    const rest = classesShown === Infinity ? [] : ranked.slice(classesShown);
+    const slices = keep.map(([label, count], i) => ({ label, count, kind: "class", rank: i }));
+    if (rest.length) {
+        slices.push({
+            label: "Other (" + rest.length + " classes)",
+            count: rest.reduce((s, e) => s + e[1], 0), kind: "other", rank: -1,
+        });
+    }
+    // Unclassified is shown, not dropped: the enrichment table silently omits
+    // these, and a composition chart that also omitted them would overstate
+    // how much of the compound set is actually classified.
+    if (unclassified) slices.push({ label: "Unclassified", count: unclassified, kind: "unclassified", rank: -1 });
+    return { slices, total: seen.size };
+}
+
+// The percentage labels are Plotly ANNOTATIONS, not the trace's own text, for
+// three reasons: Plotly silently drops or clips a pie's own labels on small
+// slices; annotations can be dragged (config edits.annotationTail) so the user
+// can move a label the way they move a node in the networks; and, unlike
+// DOM-level tweaks, an annotation's position lives in the figure, so it survives
+// redraws and appears in the SVG/PNG export.
+//
+// The figure SIZES ITSELF to its content. A fixed height cannot hold 50+ labels
+// (one per slice, each needing a line of its own down the side of the pie) or a
+// 50+ entry legend - the labels overprinted and clipped and the legend scrolled
+// so that classes were unreachable. Height is therefore the largest of: a base
+// size, the room the busiest side's labels need, and the room the whole legend
+// needs.
+//
+// Placement is computed from a layout the builder controls (explicit pie domain,
+// no Plotly-drawn labels), so a leader line's tip lands on its slice: the pie is
+// centred in its domain with radius min(w, h) / 2 of the PLOT AREA. That only
+// holds if the plot area is the size we asked for, and Plotly will quietly grow
+// a margin to fit a legend whose entries are wider than the space reserved for
+// it (long class names do exactly that) - which shrinks the plot area and slides
+// the pie out from under its leader tips. So the legend's width is reserved in
+// the right margin up front, AND after drawing the real plot size is read back
+// and, if it differs, the labels are re-placed for it.
+//   opts: {fontSize, zoom, showPercent, minPercent, borderColor, savedPos(label),
+//          onMoved(label, ax, ay)}
+// Zoom is a true magnifier: figure AND text scale together.
+function buildClassCompositionPie(div, composition, colorFor, slug, opts) {
+    if (typeof Plotly === "undefined") return;
+    if (!composition.slices.length) { div.textContent = "No classified compounds to plot."; return; }
+    const zoom = opts.zoom || 1;
+    const fontSize = Math.max(6, opts.fontSize * zoom);
+    const gap = fontSize * 1.55;
+    const total = composition.slices.reduce((s, sl) => s + sl.count, 0);
+    const minPct = opts.minPercent || 0;
+    const DOMAIN = { x: [0.2, 0.8], y: [0.04, 0.96] };      // the pie's box, as fractions of the plot area
+
+    // Angles and sides first: they do not depend on the size, and the size depends on them.
+    let acc = 0;
+    const items = composition.slices.map((slice) => {
+        const frac = slice.count / total;
+        const mid = (acc + frac / 2) * 2 * Math.PI;      // clockwise from 12 o'clock, like Plotly's pie
+        acc += frac;
+        return { slice, frac, mid, side: Math.sin(mid) >= 0 ? 1 : -1, labelled: opts.showPercent && frac * 100 >= minPct };
+    });
+    const labelled = items.filter((it) => it.labelled);
+    const perSide = Math.max(1, ...[1, -1].map((s) => labelled.filter((it) => it.side === s).length));
+    // Plotly's legend rows never get shorter than ~19px whatever the font.
+    const legendNeed = composition.slices.length * Math.max(fontSize * 1.55 + 2, 19.5) + 40;
+    const labelNeed = perSide * gap + 2 * gap;
+    const longest = Math.max(...composition.slices.map((s) => String(s.label).length));
+    const margin = { l: 20, r: Math.max(20, Math.ceil(longest * fontSize * 0.62 + 70)), t: 20, b: 20 };
+    // The plot area (pie + its labels) has a fixed pixel size, independent of the
+    // legend; the legend lives in the right margin. Fixed pixels, not responsive:
+    // a resize would move the pie but not its leader tips.
+    const baseW = Math.max(720, Math.min(div.clientWidth || 900, 1100));
+    const plotW = Math.round(baseW * 0.72 * zoom);
+    const plotH = Math.round(Math.max(520 * zoom, labelNeed, legendNeed));
+    const W = plotW + margin.l + margin.r, H = plotH + margin.t + margin.b;
+
+    // Position every leader tip and label for a plot area of pw x ph pixels.
+    function place(pw, ph) {
+        const cx = pw * (DOMAIN.x[0] + DOMAIN.x[1]) / 2, cy = ph * 0.5;
+        const R = Math.min(pw * (DOMAIN.x[1] - DOMAIN.x[0]), ph * (DOMAIN.y[1] - DOMAIN.y[0])) / 2;
+        items.forEach((it) => {
+            const sinT = Math.sin(it.mid), cosT = Math.cos(it.mid);
+            it.tx = cx + R * 0.97 * sinT; it.ty = cy - R * 0.97 * cosT;         // leader tip: just inside the rim
+            it.lx = cx + R * 1.14 * sinT; it.ly = cy - R * 1.14 * cosT;         // default label centre
+        });
+        // Spread each side's labels apart vertically so neighbours do not print on top
+        // of one another, then keep them clear of the circle. Order along a side is
+        // preserved, so leader lines never cross.
+        const minY = gap / 2, maxY = ph - gap / 2;
+        [1, -1].forEach((side) => {
+            const col = labelled.filter((it) => it.side === side).sort((p, q) => p.ly - q.ly);
+            col.forEach((it, i) => { if (i && it.ly < col[i - 1].ly + gap) it.ly = col[i - 1].ly + gap; });
+            for (let i = col.length - 1; i >= 0; i--) {
+                const limit = i === col.length - 1 ? maxY : col[i + 1].ly - gap;
+                if (col[i].ly > limit) col[i].ly = limit;
+            }
+            col.forEach((it, i) => { if (it.ly < minY) it.ly = minY; if (i && it.ly < col[i - 1].ly + gap) it.ly = col[i - 1].ly + gap; });
+            col.forEach((it) => {
+                const dy = it.ly - cy;
+                const clearDx = Math.sqrt(Math.max((R * 1.06) * (R * 1.06) - dy * dy, 0)) + 10;
+                it.lx = cx + side * Math.max(Math.abs(it.lx - cx), clearDx);
+            });
+        });
+        // annotations[i] corresponds to labelled[i] (the drag handler maps by index).
+        return labelled.map((it) => {
+            const saved = opts.savedPos(it.slice.label);
+            return {
+                x: it.tx / pw, y: 1 - it.ty / ph, xref: "paper", yref: "paper",
+                ax: saved ? saved.ax : it.lx - it.tx, ay: saved ? saved.ay : it.ly - it.ty,
+                axref: "pixel", ayref: "pixel",
+                text: (it.frac * 100).toFixed(1) + "%", showarrow: true, arrowhead: 0, arrowwidth: 1, arrowcolor: "#7A8699",
+                font: { size: fontSize, color: "#1B2A41" },
+                bgcolor: "rgba(255,255,255,0.85)", borderpad: 2, yanchor: "middle",
+            };
+        });
+    }
+
+    // Slice borders: a white/black hairline separates neighbouring slices, but on a
+    // pie with dozens of thin slices it becomes most of what you see - so it is a
+    // choice, including none at all.
+    const border = opts.borderColor === "none"
+        ? { color: "#FFFFFF", width: 0 }
+        : { color: opts.borderColor === "black" ? "#000000" : "#FFFFFF", width: opts.borderColor === "black" ? 1 : 1.5 };
+    const trace = {
+        type: "pie", sort: false, direction: "clockwise", hole: 0, rotation: 0,
+        domain: DOMAIN,
+        labels: composition.slices.map((s) => s.label),
+        values: composition.slices.map((s) => s.count),
+        marker: { colors: composition.slices.map(colorFor), line: border },
+        textinfo: "none",
+        hovertemplate: "%{label}<br>%{value} of " + composition.total + " Compounds (%{percent})<extra></extra>",
+    };
+    const layout = {
+        width: W, height: H, margin, font: { size: fontSize },
+        showlegend: true, legend: { x: 1.02, xanchor: "left", y: 0.5, yanchor: "middle" },
+        annotations: place(plotW, plotH),
+    };
+    div.style.overflowX = "auto";
+    _newOraPlot(div, [trace], layout, slug, null, "classpie", "Class composition pie", () => {
+        // Read the REAL plot size back: if Plotly adjusted a margin, re-place the labels for it.
+        const size = div._fullLayout && div._fullLayout._size;
+        if (size && (Math.abs(size.w - plotW) > 0.5 || Math.abs(size.h - plotH) > 0.5)) {
+            Plotly.relayout(div, { annotations: place(size.w, size.h) });
+        }
+        // Remember where the user drags each label, so a redraw (zoom, hide/show, a
+        // new level) keeps it. Registered once per draw.
+        if (typeof div.removeAllListeners === "function") div.removeAllListeners("plotly_relayout");
+        div.on("plotly_relayout", (ev) => {
+            const moved = {};
+            Object.keys(ev || {}).forEach((k) => {
+                const m = /^annotations\[(\d+)\]\.(ax|ay)$/.exec(k);
+                if (m) (moved[m[1]] = moved[m[1]] || {})[m[2]] = ev[k];
+            });
+            Object.keys(moved).forEach((idx) => {
+                const ann = (div.layout.annotations || [])[Number(idx)];
+                if (ann && labelled[Number(idx)]) opts.onMoved(labelled[Number(idx)].slice.label, ann.ax, ann.ay);
+            });
+        });
+    }, { responsive: false, edits: { annotationTail: true } });
+}
+
+// One chart pane (a row of option selects + show/hide buttons + chart area)
+// inside a makeResultNav "Charts" group. Same behaviour as the inline
+// makeChartPane in the Proteomics results screens; hoisted here so the four
+// Metabolomics tiles do not each carry a copy. Every chart is drawn through
+// _withChartNoun so hover text and axis titles say "Compound", not "Gene".
+function _metabolomicsChartPane(nav, slug, title) {
+    const p = nav.pane(title, { group: "Charts" });
+    const controls = el("div", { class: "chart-toggle-row" });
+    const area = el("div", { class: "chart-pair" });
+    p.appendChild(controls);
+    p.appendChild(area);
+    const toggles = [];
+    let swatchRow = null;
+    return {
+        el: p,
+        // One colour <input> per item, in a row of its own between the
+        // controls and the chart (a per-slice picker would swamp the shared
+        // toggle row). `input` fires while the OS colour wheel is dragged, so
+        // callers should debounce the redraw.
+        colorSwatches: (items, onChange) => {
+            if (!swatchRow) {
+                swatchRow = el("div", { class: "chart-toggle-row chart-color-row" });
+                p.insertBefore(swatchRow, area);
+            }
+            swatchRow.innerHTML = "";
+            items.forEach(({ label, color }) => {
+                const control = el("label", { class: "chart-option-control chart-color-control" });
+                control.appendChild(el("span", { class: "chart-option-label" }, label));
+                const input = el("input", { type: "color", class: "chart-option-color" });
+                input.value = color;
+                input.addEventListener("input", () => onChange(label, input.value));
+                control.appendChild(input);
+                swatchRow.appendChild(control);
+            });
+        },
+        action: (label, onClick) => {
+            const btn = el("button", { class: "btn chart-toggle-btn", type: "button" }, label);
+            btn.addEventListener("click", onClick);
+            controls.appendChild(btn);
+            return btn;
+        },
+        option: (label, options, initialValue, onChange, wide) => {
+            const control = el("label", { class: "chart-option-control" + (wide ? " chart-option-control-wide" : "") });
+            control.appendChild(el("span", { class: "chart-option-label" }, label));
+            const sel = el("select", { class: "chart-option-select" });
+            options.forEach(([optionLabel, optionValue]) => {
+                sel.appendChild(el("option", { value: optionValue }, optionLabel));
+            });
+            sel.value = initialValue;
+            sel.addEventListener("change", () => onChange(sel.value));
+            control.appendChild(sel);
+            controls.appendChild(control);
+            return sel;
+        },
+        toggle: (kind, label, buildFn) => {
+            const chartId = _oraChartId(kind, slug, null);
+            const isNetwork = kind === "enrichmap" || kind === "network";
+            const chartDiv = el("div", { id: chartId, class: "chart-container" + (isNetwork ? " chart-network" : ""), style: { display: "none" } });
+            const chartBtn = el("button", { class: "btn chart-toggle-btn" }, "Show " + label);
+            let chartShown = false;
+            let chartBuilt = false;
+            function renderChart() { _withChartNoun("Compound", () => buildFn(chartDiv)); chartBuilt = true; }
+            chartBtn.addEventListener("click", () => {
+                if (!chartShown) {
+                    chartDiv.style.display = "";
+                    if (!chartBuilt) renderChart();
+                    else if (typeof Plotly !== "undefined") Plotly.Plots.resize(chartDiv);
+                    chartShown = true;
+                    chartBtn.textContent = "Hide " + label;
+                } else {
+                    chartDiv.style.display = "none";
+                    chartShown = false;
+                    chartBtn.textContent = "Show " + label;
+                }
+            });
+            controls.appendChild(chartBtn);
+            area.appendChild(chartDiv);
+            const t = { redraw: () => { if (chartShown) renderChart(); } };
+            toggles.push(t);
+            return t;
+        },
+        redraw: () => toggles.forEach(t => t.redraw()),
+    };
+}
+
+// Pathway Topology Analysis's own chart section: a pathway-impact plot
+// (every TESTED pathway shown by default, not just significant ones - see
+// the note text below; x=Impact, same categorical-y-axis dot-plot
+// convention as buildDotPlot) and a per-pathway graph view drawn at KEGG's
+// own map coordinates (no equivalent at all on the other tiles - draggable
+// node labels, not reused from elsewhere).
+function renderTopologyCharts(nav, slug, block, alpha, run) {
+    const impactPane = _metabolomicsChartPane(nav, slug, "Pathway impact");
+    impactPane.el.insertBefore(el("div", { class: "ora-chart-threshold-note" },
+        "Every TESTED pathway is plotted by default, regardless of significance - Impact describes where your " +
+        "matched compounds sit in the reaction graph, not a threshold-gated result (MetPA's convention); narrow " +
+        "it with 'Terms shown' if the list runs long. Bigger circle = more of your matched compounds were found " +
+        "in that pathway's own graph (independent of Impact and of significance - a small pathway can score a " +
+        "high Impact from very few matches, a large one a low Impact from many). Colour = statistical " +
+        "significance, adjustable below."),
+        impactPane.el.firstChild);
+    let impactColorScale = ORA_DOT_COLOR_SCALES[0][1];
+    let impactFontSize = 12;
+    let impactVolcanoY = "p";
+    let impactTopN = Infinity;
+    const impactToggle = impactPane.toggle("impact", "pathway impact plot", (div) =>
+        buildPathwayImpactPlot(div, block.table, slug, null, impactColorScale, {
+            fontSize: impactFontSize, volcanoY: impactVolcanoY, alpha, topN: impactTopN,
+        }));
+    impactPane.option("Colour gradient", ORA_DOT_COLOR_SCALES.map(([label, value]) => [label, value]), impactColorScale, (value) => {
+        impactColorScale = value;
+        impactToggle.redraw();
+    });
+    impactPane.option("Rank & show by", [["p-value", "p"], ["FDR", "fdr"]], impactVolcanoY, (value) => {
+        impactVolcanoY = value;
+        impactToggle.redraw();
+    });
+    impactPane.option("Terms shown", [["10", "10"], ["20", "20"], ["30", "30"], ["50", "50"], ["100", "100"], ["All", "all"]],
+        "all", (value) => {
+        impactTopN = value === "all" ? Infinity : Number(value);
+        impactToggle.redraw();
+    });
+    impactPane.option("Font size", [["10", "10"], ["12", "12"], ["14", "14"], ["16", "16"], ["18", "18"]], String(impactFontSize), (value) => {
+        impactFontSize = Number(value);
+        impactToggle.redraw();
+    });
+
+    const graphPane = _metabolomicsChartPane(nav, slug, "Pathway graph");
+    const rows = _tableToObjects(block.table);
+    if (!rows.length) {
+        graphPane.el.appendChild(el("div", { class: "caption" }, "No pathway to draw."));
+        return;
+    }
+    const sizeExplain = block.measure === "outdegree"
+        ? "Point size = out-degree: a bigger circle directly feeds MORE reactions in this pathway (it is a " +
+          "substrate more often); a small circle feeds few or none."
+        : "Point size = relative betweenness centrality: a bigger circle sits on the shortest reaction path " +
+          "between more OTHER compound pairs in this pathway - a hub or bottleneck the network routes through; " +
+          "a small circle is structurally peripheral, off to the side of most paths.";
+    graphPane.el.insertBefore(el("div", { class: "ora-chart-threshold-note" },
+        "Drawn at KEGG's own map coordinates for the selected pathway. Red = one of your matched compounds; " +
+        "grey = every other compound in the pathway. " + sizeExplain + " Both nodes and their compound-name " +
+        "labels can be dragged with the mouse - move a node to untangle a crowded cluster (its edges and its " +
+        "own label follow), or drag just the label when only two labels overlap; 'Reset label positions' puts " +
+        "every label (not moved nodes) back. Some compounds have no line to any other node - this is genuine " +
+        "KEGG data, not a rendering gap: KEGG's own diagram for this pathway places that compound (often a " +
+        "cofactor, a pathway endpoint, or something only linked via an enzyme/gene box the diagram doesn't " +
+        "encode as a reaction arrow) without connecting it to a reaction in THIS specific map. It still counts " +
+        "toward the node total and, if matched, toward Impact - it simply has zero centrality, the same as any " +
+        "dead-end in the real network."), graphPane.el.firstChild);
+    let selectedTermId = String(rows[0]["Term ID"]);
+    let graphShowLabels = true;
+    // Dragged label offsets live on the run (same convention as the class
+    // composition pie's run._classPieLabelPos): renderPanel re-runs on every
+    // significance-threshold change, and a redraw/pathway switch/toggle must
+    // not lose a position the user just set. Keyed per pathway + node, since
+    // an offset is only meaningful for that node's own anchor.
+    run._topologyLabelPos = run._topologyLabelPos || {};
+    const labelPosKey = (nodeId) => selectedTermId + "|" + nodeId;
+    const graphToggle = graphPane.toggle("graph", "pathway graph", (div) => {
+        const graph = (block.graphs || {})[selectedTermId];
+        if (!graph) { div.textContent = "No graph available for this pathway."; return; }
+        if (graph.status !== "ok") {
+            div.textContent = graph.status === "nodata"
+                ? "KEGG has no KGML diagram for this map."
+                : "Could not fetch this pathway's graph from KEGG.";
+            return;
+        }
+        buildPathwayGraphPlot(div, graph, {
+            showLabels: graphShowLabels,
+            savedPos: (nodeId) => run._topologyLabelPos[labelPosKey(nodeId)] || null,
+            onMoved: (nodeId, ax, ay) => { run._topologyLabelPos[labelPosKey(nodeId)] = { ax, ay }; },
+        });
+    });
+    graphPane.option("Compound labels", [["Show", "show"], ["Hide", "hide"]], "show", (value) => {
+        graphShowLabels = value === "show";
+        graphToggle.redraw();
+    });
+    graphPane.action("Reset label positions", () => {
+        Object.keys(run._topologyLabelPos).forEach((k) => {
+            if (k.indexOf(selectedTermId + "|") === 0) delete run._topologyLabelPos[k];
+        });
+        graphToggle.redraw();
+    });
+    // Registered LAST: callers that grab "the last select on the pane" to
+    // reach the pathway picker (this app's usual convention for a pane's
+    // primary control) depend on this staying the final .option() call here.
+    graphPane.option(
+        "Pathway",
+        rows.map((r) => [String(r["Term ID"]) + " - " + String(r["Term Name"]), String(r["Term ID"])]),
+        selectedTermId,
+        (value) => { selectedTermId = value; graphToggle.redraw(); },
+        true,
+    );
+}
+
+function renderMetabolomicsResultsScreen() {
+    const mx = STATE.metabolomics;
+    const spec = _metabolomicsSpec();
+    const kind = spec.kind;
+    const isQuant = kind === "quant";
+    const isTopology = kind === "topology";
+    // Which statistical test ran - see the identical comment on renderPanel's
+    // own usesConcInput.
+    const usesConcInput = spec.input === "conc";
+    const run = mx.run;
+    const wrap = el("div", { class: "ora-config-screen ora-results-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" },
+        "Metabolomics — " + STATE.metabolomicsModuleName + ": results"));
+
+    if (!run.results) {
+        wrap.appendChild(alertBox("info", "Running analysis..."));
+        const progressWrap = el("div", { class: "progress-wrap" });
+        const progressInner = el("div", { id: "metabolomics-progress-inner", class: "progress-bar-inner", style: { width: "0%" } });
+        progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, progressInner));
+        progressWrap.appendChild(el("div", { id: "metabolomics-progress-label", class: "progress-label" }, ""));
+        wrap.appendChild(progressWrap);
+        return wrap;
+    }
+
+    const { tables, summary } = run.results;
+
+    if (isTopology) {
+        const measureLabel = (PATHWAY_TOPOLOGY_MEASURES.find((m) => m[1] === summary.measure) || [summary.measure])[0];
+        wrap.appendChild(metricCards([
+            [usesConcInput ? "Compounds scored" : "Compounds tested", summary.n_scored],
+            ["Matched", summary.n_matched],
+            ["Node importance", measureLabel],
+        ], 3));
+    } else if (isQuant) {
+        wrap.appendChild(metricCards([
+            ["Compounds scored", summary.n_scored],
+            ["Dropped (no finite score)", summary.n_dropped],
+            ["Matched", summary.n_matched],
+            ["Ranking metric", (METABOLOMICS_RANKING_METRICS.find((m) => m[1] === summary.metric) || [summary.metric])[0]],
+        ], 4));
+    } else {
+        wrap.appendChild(metricCards([
+            ["Compounds uploaded", summary.n_input_compounds],
+            ["Matched", summary.n_matched],
+            ["Class-level only", summary.n_class_level_only],
+        ], 3));
+    }
+    wrap.appendChild(el("div", { class: "caption" }, usesConcInput
+        ? "Universe: the compounds measured in your table (narrowed further if you supplied a background list)."
+        : "Test set: your compound list. Universe: each database's own annotated reference set - your list " +
+          "contributes only the hits (narrowed by your background list, if you supplied one)."));
+
+    // ----- Quantitative / Pathway Topology (concentration mode): the
+    // statistics Omiscera derived -----
+    if (isQuant && mx.statsMeta) {
+        const sm = mx.statsMeta;
+        wrap.appendChild(el("div", { class: "section-label" }, "Compound statistics"));
+        wrap.appendChild(el("div", { class: "caption" },
+            "Welch's t-test, " + sm.group_a + " vs " + sm.group_b + " (n=" + sm.n_a + " vs " + sm.n_b + "); " +
+            sm.n_compounds_tested + " compound(s) tested" +
+            (sm.n_dropped_low_n ? ", " + sm.n_dropped_low_n + " dropped for too few measured samples" : "") +
+            (sm.log_transform ? "; log2-transformed (offset " + Number(sm.log_offset).toPrecision(3) + "), so mean_a/mean_b are on the log2 scale and log2fc = mean_a - mean_b." : "; no log transform.") +
+            " Showing the 50 smallest p-values - the full table is downloadable."));
+        wrap.appendChild(buildTable(mx.statsPreview, {
+            maxHeight: 320,
+            cellFormatFn: (col, val) => {
+                if (col === "pvalue" || col === "padj") return _fmtSci(val, 3);
+                if (col === "log2fc" || col === "t_stat" || col === "mean_a" || col === "mean_b") return _fmtFixed(val, 3);
+                return val;
+            },
+        }));
+        const statsBtn = el("button", { class: "btn" }, "Download compound statistics (CSV)");
+        statsBtn.addEventListener("click", () => downloadFile(
+            "/api/metabolomics/quant/download/statistics.csv", "metabolomics_quant_statistics.csv"));
+        wrap.appendChild(statsBtn);
+    }
+    if (isTopology && usesConcInput && mx.topologyStatsMeta) {
+        const sm = mx.topologyStatsMeta;
+        wrap.appendChild(el("div", { class: "section-label" }, "Compound statistics"));
+        wrap.appendChild(el("div", { class: "caption" },
+            "Welch's t-test, " + sm.group_a + " vs " + sm.group_b + " (n=" + sm.n_a + " vs " + sm.n_b + "); " +
+            sm.n_compounds_tested + " compound(s) tested" +
+            (sm.n_dropped_low_n ? ", " + sm.n_dropped_low_n + " dropped for too few measured samples" : "") +
+            (sm.log_transform ? "; log2-transformed (offset " + Number(sm.log_offset).toPrecision(3) + "), so mean_a/mean_b are on the log2 scale and log2fc = mean_a - mean_b." : "; no log transform.") +
+            " Showing the 50 smallest p-values - the full table is downloadable."));
+        wrap.appendChild(buildTable(mx.topologyStatsPreview, {
+            maxHeight: 320,
+            cellFormatFn: (col, val) => {
+                if (col === "pvalue" || col === "padj") return _fmtSci(val, 3);
+                if (col === "log2fc" || col === "t_stat" || col === "mean_a" || col === "mean_b") return _fmtFixed(val, 3);
+                return val;
+            },
+        }));
+        const statsBtn = el("button", { class: "btn" }, "Download compound statistics (CSV)");
+        statsBtn.addEventListener("click", () => downloadFile(
+            "/api/metabolomics/topology/download/statistics.csv", "metabolomics_topology_statistics.csv"));
+        wrap.appendChild(statsBtn);
+    }
+
+    const alphaRow = el("div", { class: "ora-sig-threshold-row" });
+    alphaRow.appendChild(el("span", { class: "chart-option-label" }, "Significance threshold (FDR <)"));
+    const alphaInput = el("input", { type: "number", class: "ora-sig-threshold-input", min: "0", max: "1", step: "0.001" });
+    alphaInput.value = run.sigAlpha;
+    alphaInput.addEventListener("change", () => {
+        let v = parseFloat(alphaInput.value);
+        if (!isFinite(v) || v <= 0 || v > 1) v = 0.05;
+        run.sigAlpha = v;
+        alphaInput.value = v;
+        renderPanel(select.value);
+    });
+    alphaRow.appendChild(alphaInput);
+    wrap.appendChild(alphaRow);
+
+    wrap.appendChild(el("div", { class: "caption" }, usesConcInput
+        ? "Each term's compounds are compared against every OTHER measured compound (a competitive Wilcoxon " +
+          "rank-sum test, two-sided) - there is no significance cutoff and no up/down split, so a term shifted " +
+          "DOWN is exactly as detectable as one shifted UP. Effect (mean difference) carries the direction: " +
+          "positive means the term's compounds score higher than the rest of the panel."
+        : "Over-representation is tested with a one-sided Fisher exact test of your list against each database's " +
+          "reference set."));
+    wrap.appendChild(el("div", { class: "caption" },
+        "Each database is independently Benjamini-Hochberg corrected - there is no correction ACROSS databases. " +
+        "Scanning every table and reporting the best hit across all of them inflates the true error rate above " +
+        "what any single FDR column states."));
+
+    const sortedKeys = _sortedMetabolomicsKeys(tables);
+    const selectorRow = el("div", { class: "row" });
+    const select = el("select", { class: "text-input transcriptomics-ora-result-select" });
+    sortedKeys.forEach((key) => {
+        const block = tables[key];
+        const suffix = block.n_terms_tested > 0 ? ` (${block.n_terms_tested} terms)` : " (no terms)";
+        select.appendChild(el("option", { value: key }, key + suffix));
+    });
+    selectorRow.appendChild(el("div", { class: "col" }, select));
+    wrap.appendChild(selectorRow);
+
+    const panelHost = el("div", {});
+    wrap.appendChild(panelHost);
+
+    function renderPanel(key) {
+        panelHost.innerHTML = "";
+        const block = tables[key];
+        if (!block) return;
+        const alpha = run.sigAlpha;
+        const slug = _proteomicsOraSlug(key);
+        const card = el("div", { class: "rank-card ora-db-card ora-result-card ora-db-card-" + slug });
+        panelHost.appendChild(card);
+        const nav = makeResultNav(card, { stateKey: "metabolomics_" + kind });
+        // Per PANEL, not per tile: Quantitative Enrichment mixes pathway and
+        // class families in one results screen.
+        const isClassFamily = key === "Chemical Class" || key === "Lipid Class";
+        const isTopology = kind === "topology";
+        // Which STATISTICAL TEST ran - Wilcoxon (competitive, scored from a
+        // concentration table) or Fisher (a plain list against a database's
+        // reference set). isQuant alone cannot answer this for Pathway
+        // Topology, whose test depends on the user's own input-mode choice
+        // (spec.input, via _metabolomicsSpec()'s override), not its kind.
+        const usesConcInput = spec.input === "conc";
+
+        function addClassComposition() {
+            const isChem = key === "Chemical Class";
+            const levels = isChem ? METABOLOMICS_CHEM_LEVELS : METABOLOMICS_LIPID_LEVELS;
+            const cfg = run.config || {};
+            let level = (isChem ? cfg.chemical_class_level : cfg.lipid_class_level) || levels[0][1];
+            let classesShown = 15;
+            let pieFontSize = 12;
+            let showPercent = true;
+            let minPercent = 0;
+            let borderColor = "white";
+            let zoom = 1;
+            // On the run, not a renderPanel local: renderPanel re-runs on every
+            // significance-threshold and result-select change and would reset
+            // the user's colour choices.
+            run._classPieColors = run._classPieColors || {};
+
+            const pane = _metabolomicsChartPane(nav, slug, "Class composition");
+            pane.el.insertBefore(el("div", { class: "ora-chart-threshold-note" },
+                "Drag a percentage label to move it (the line follows). Zoom enlarges or shrinks the whole figure; the " +
+                "figure grows on its own so every label and every legend entry stays readable, and 'Label slices of at " +
+                "least' hides the smallest labels if a pie has dozens of thin slices. " +
+                "Composition, not enrichment. This shows what fraction of your matched compounds falls in each " +
+                "class - a description of your input, with no p-value. The statistical result is the bar plot and " +
+                "the table. A pie is meaningful here only because every compound belongs to exactly one class at a " +
+                "given level; in the pathway databases (KEGG, Reactome, SMPDB, PathBank) a compound sits in many " +
+                "pathways at once, so no equivalent pie is offered there."), pane.el.firstChild);
+
+            const colorKey = (slice) => key + "|" + level + "|" + slice.label;
+            const colorFor = (slice) => {
+                if (slice.kind === "other") return CLASS_PIE_OTHER_COLOR;
+                if (slice.kind === "unclassified") return CLASS_PIE_UNCLASSIFIED_COLOR;
+                return run._classPieColors[colorKey(slice)] || _classPieDefaultColor(slice.rank);
+            };
+            let redrawTimer = null;
+            const compose = () => _metabolomicsClassSlices(level, classesShown);
+            function refreshSwatches() {
+                pane.colorSwatches(
+                    compose().slices.filter((s) => s.kind === "class").map((s) => ({ label: s.label, color: colorFor(s) })),
+                    (label, color) => {
+                        run._classPieColors[key + "|" + level + "|" + label] = color;
+                        if (redrawTimer) clearTimeout(redrawTimer);
+                        redrawTimer = setTimeout(() => pieToggle.redraw(), 120);
+                    });
+            }
+            pane.option("Class level", levels, level, (value) => {
+                level = value;
+                refreshSwatches();
+                pieToggle.redraw();
+            }, true);
+            pane.option("Classes shown", [["10", "10"], ["15", "15"], ["20", "20"], ["All", "all"]], String(classesShown), (value) => {
+                classesShown = value === "all" ? Infinity : Number(value);
+                refreshSwatches();
+                pieToggle.redraw();
+            });
+            pane.option("Font size", [["10", "10"], ["12", "12"], ["14", "14"], ["16", "16"], ["18", "18"]], String(pieFontSize), (value) => {
+                pieFontSize = Number(value);
+                pieToggle.redraw();
+            });
+            pane.option("Percentages", [["Show", "show"], ["Hide", "hide"]], "show", (value) => {
+                showPercent = value === "show";
+                pieToggle.redraw();
+            });
+            pane.option("Label slices of at least", [["All", "0"], ["0.5%", "0.5"], ["1%", "1"], ["2%", "2"], ["5%", "5"]], "0", (value) => {
+                minPercent = Number(value);
+                pieToggle.redraw();
+            }, true);
+            pane.option("Slice borders", [["White", "white"], ["Black", "black"], ["None", "none"]], "white", (value) => {
+                borderColor = value;
+                pieToggle.redraw();
+            });
+            pane.option("Zoom", [["50%", "0.5"], ["75%", "0.75"], ["100%", "1"], ["150%", "1.5"], ["200%", "2"], ["300%", "3"]], "1", (value) => {
+                zoom = Number(value);
+                pieToggle.redraw();
+            });
+            // Dragged label offsets live on the run (like the colours): renderPanel
+            // re-runs on every threshold change. Keyed by zoom as well, because an
+            // offset is in pixels and means something different at another size.
+            run._classPieLabelPos = run._classPieLabelPos || {};
+            const posKey = (label) => key + "|" + level + "|z" + zoom + "|" + label;
+            pane.action("Reset label positions", () => {
+                Object.keys(run._classPieLabelPos).forEach((k) => {
+                    if (k.indexOf(key + "|" + level + "|z" + zoom + "|") === 0) delete run._classPieLabelPos[k];
+                });
+                pieToggle.redraw();
+            });
+            const pieToggle = pane.toggle("classpie", "class composition pie", (div) =>
+                buildClassCompositionPie(div, compose(), colorFor, slug, {
+                    fontSize: pieFontSize, zoom, showPercent, minPercent, borderColor,
+                    savedPos: (label) => run._classPieLabelPos[posKey(label)] || null,
+                    onMoved: (label, ax, ay) => { run._classPieLabelPos[posKey(label)] = { ax, ay }; },
+                }));
+            refreshSwatches();
+        }
+
+        const overviewPane = nav.pane("Overview");
+        if (block.caveat) overviewPane.appendChild(alertBox("warning", block.caveat));
+        if (block.note) overviewPane.appendChild(alertBox("info", block.note));
+        if (block.n_terms_tested > 0) {
+            overviewPane.appendChild(metricCards([
+                ["Terms tested", block.n_terms_tested],
+                ["Universe size", block.universe_size],
+                [usesConcInput ? "Compounds scored in universe" : "Your compounds in universe", block.n_input_in_universe],
+                ["Excluded by term-size filter", block.n_terms_excluded_min_size],
+            ], 4));
+        }
+        if (!usesConcInput && block.n_terms_no_overlap > 0) {
+            overviewPane.appendChild(el("div", { class: "caption" },
+                block.n_terms_no_overlap + " term(s) contained none of your compounds and were not tested " +
+                "(excluded from the FDR calculation, not shown)."));
+        }
+        if (!block.table.rows || block.table.rows.length === 0) {
+            const reason = block.note || block.caveat ? null : (
+                !usesConcInput && block.n_terms_no_overlap > 0
+                    ? "No term (of the size-eligible ones) contained any of your compounds."
+                    : "No terms passed the term-size filter for this selection."
+            );
+            if (reason) overviewPane.appendChild(alertBox("info", reason));
+            if (isClassFamily) addClassComposition();
+            nav.finish();
+            return;
+        }
+
+        const tablePane = nav.pane("Result table");
+        tablePane.appendChild(buildTable(block.table, {
+            maxHeight: 480,
+            rowClassFn: (row) => {
+                const fdr = row["FDR"];
+                return (fdr !== "" && fdr !== null && isFinite(Number(fdr)) && Number(fdr) < alpha) ? "row-significant" : null;
+            },
+            cellFormatFn: (col, val) => {
+                if (col === "p-value" || col === "FDR" || col === "Bonferroni") return _fmtSci(val, 3);
+                if (col === "Fold Enrichment") return _fmtFixed(val, 2);
+                if (col === "Effect (mean difference)" || col === "Mean score (set)" || col === "Mean score (rest)") return _fmtFixed(val, 3);
+                return val;
+            },
+        }));
+        const dlBtn = el("button", { class: "btn" }, "Download result table");
+        dlBtn.addEventListener("click", () => {
+            downloadFile("/api/metabolomics/" + kind + "/download?key=" + encodeURIComponent(key),
+                         "metabolomics_" + kind + "_" + slug + ".csv");
+        });
+        tablePane.appendChild(dlBtn);
+
+        // Pathway Topology has its own chart section entirely (an impact
+        // plot always drawn regardless of significance, plus the per-
+        // pathway graph view) - none of the dot/bar/volcano/enrichment-map/
+        // network logic below, and no class-composition pane, apply to it.
+        if (isTopology) {
+            renderTopologyCharts(nav, slug, block, alpha, run);
+            nav.finish();
+            return;
+        }
+
+        const hasSigRows = (block.table.rows || []).some(row =>
+            row["FDR"] !== null && row["FDR"] !== "" && isFinite(Number(row["FDR"])) && Number(row["FDR"]) < alpha
+        );
+        // The composition pane is descriptive of the input, so it does not wait
+        // for a significant term.
+        if (isClassFamily) addClassComposition();
+        if (!hasSigRows) {
+            if (isQuant) {
+                // Threshold-free test: "nothing significant" does not mean
+                // "nothing to look at" - the volcano draws every tested term.
+                overviewPane.appendChild(alertBox("info",
+                    `No term passed FDR < ${alpha} (${block.n_terms_tested} tested) - see the "Charts" section for a ` +
+                    `volcano plot of every term. The other figures only draw significant terms.`));
+                const overview = _metabolomicsChartPane(nav, slug, "Compound set overview");
+                let emptyFontSize = 12;
+                let emptyVolcanoY = "p";
+                overview.option("Font size", [["10", "10"], ["12", "12"], ["14", "14"], ["16", "16"], ["18", "18"]], String(emptyFontSize), (value) => {
+                    emptyFontSize = Number(value);
+                    volcanoToggle.redraw();
+                });
+                const volcanoToggle = overview.toggle("volcano", "volcano plot", (div) =>
+                    buildBurdenVolcanoPlot(div, block.table, slug, null, alpha, { fontSize: emptyFontSize, volcanoY: emptyVolcanoY }));
+                overview.option("Volcano y-axis", [["-log10(p-value)", "p"], ["-log10(FDR)", "fdr"]], emptyVolcanoY, (value) => {
+                    emptyVolcanoY = value;
+                    volcanoToggle.redraw();
+                });
+            } else {
+                overviewPane.appendChild(alertBox("info",
+                    `No term passed FDR < ${alpha}. The significance threshold is adjustable above; the charts ` +
+                    `only draw significant terms.`));
+            }
+            nav.finish();
+            return;
+        }
+
+        const overview = _metabolomicsChartPane(nav, slug, "Compound set overview");
+        overview.el.insertBefore(el("div", { class: "ora-chart-threshold-note" },
+            "Significance threshold: FDR < " + alpha + " (used for table highlighting and chart filtering; adjustable above)." +
+            (isQuant ? " Dot x-axis = Effect (mean difference); bar length follows the Bar metric choice (FDR or Effect)." : "")),
+            overview.el.firstChild);
+        let dotColorScale1 = ORA_DOT_COLOR_SCALES[0][1];
+        let barColor = ORA_BAR_COLORS[0][1];
+        let barMetric = "fdr";
+        let topN = 20;
+        let sortBy = "fdr";
+        let fontSize = 12;
+        let volcanoY = "p";
+
+        overview.option("Terms shown", [
+            ["5", "5"], ["10", "10"], ["15", "15"], ["20", "20"], ["30", "30"],
+            ["50", "50"], ["100", "100"], ["200", "200"], ["All significant", "all"],
+        ], String(topN === Infinity ? "all" : topN), (value) => {
+            topN = value === "all" ? Infinity : Number(value);
+            overview.redraw();
+            relationships.redraw();
+        });
+        if (!isQuant) {
+            overview.option("Rank & show by", [["FDR", "fdr"], ["Fold enrichment", "fold"], ["Compound count", "k"], ["Compound ratio", "ratio"]], sortBy, (value) => {
+                sortBy = value;
+                overview.redraw();
+                relationships.redraw();
+            });
+        }
+        overview.option("Font size", [["10", "10"], ["12", "12"], ["14", "14"], ["16", "16"], ["18", "18"]], String(fontSize), (value) => {
+            fontSize = Number(value);
+            overview.redraw();
+            relationships.redraw();
+        });
+
+        // The dot plot is a valid enrichment view for classes too (effect size /
+        // ratio against significance), so it stays on the class panels. Only the
+        // enrichment MAP is dropped there (see below).
+        const dotToggle = overview.toggle("dot", "dot plot", (div) => isQuant
+            ? buildBurdenDotPlot(div, block.table, slug, null, dotColorScale1, { topN, fontSize, alpha })
+            : buildDotPlot(div, block.table, slug, null, dotColorScale1, { topN, sortBy, fontSize, alpha }));
+        overview.option("Dot gradient", ORA_DOT_COLOR_SCALES.map(([label, value]) => [label, value]), dotColorScale1, (value) => {
+            dotColorScale1 = value;
+            dotToggle.redraw();
+        });
+        const barToggle = overview.toggle("bar", "bar plot", (div) => isQuant
+            ? buildBurdenBarPlot(div, block.table, slug, null, barColor, { topN, fontSize, alpha, barMetric })
+            : buildBarPlot(div, block.table, slug, null, barColor, { topN, sortBy, fontSize, alpha }));
+        if (isQuant) {
+            overview.option("Bar metric", [["FDR", "fdr"], ["Effect (mean difference)", "effect"]], barMetric, (value) => {
+                barMetric = value;
+                barToggle.redraw();
+            });
+        }
+        overview.option("Bar color", ORA_BAR_COLORS, barColor, (value) => {
+            barColor = value;
+            barToggle.redraw();
+        });
+        if (isQuant) {
+            const volcanoToggle = overview.toggle("volcano", "volcano plot", (div) =>
+                buildBurdenVolcanoPlot(div, block.table, slug, null, alpha, { fontSize, volcanoY }));
+            overview.option("Volcano y-axis", [["-log10(p-value)", "p"], ["-log10(FDR)", "fdr"]], volcanoY, (value) => {
+                volcanoY = value;
+                volcanoToggle.redraw();
+            });
+        }
+
+        const relationships = _metabolomicsChartPane(nav, slug, "Compound set relationships");
+        relationships.el.insertBefore(el("div", { class: "ora-chart-threshold-note ora-chart-encoding-note" },
+            "Circle color = -log10(FDR) (darker = more significant); circle size = number of compounds in the term. " +
+            (isQuant ? "In the compound-concept network the small compound nodes are colored by log2 fold change. " : "") +
+            "Terms shown" + (isQuant ? "" : " and Rank & show by") + " (Compound set overview) choose which terms are drawn."),
+            relationships.el.firstChild);
+        let dotColorScale2 = ORA_DOT_COLOR_SCALES[0][1];
+        let edgeThreshold = 1;
+        // Not on class panels: an enrichment map draws an edge between two terms
+        // that SHARE compounds, and class terms are disjoint (each compound has
+        // exactly one class per level), so it could never have a single edge.
+        let enrichMapToggle = null;
+        if (!isClassFamily) {
+            enrichMapToggle = relationships.toggle("enrichmap", "enrichment map", (div) => isQuant
+                ? buildBurdenEnrichmentMap(div, block.table, slug, null, dotColorScale2, { topN, fontSize, edgeThreshold, alpha })
+                : buildEnrichmentMap(div, block.table, slug, null, dotColorScale2, { topN, sortBy, fontSize, edgeThreshold, alpha }));
+            relationships.option("Edge threshold (shared compounds)", [[">= 1", "1"], [">= 2", "2"], [">= 3", "3"], [">= 5", "5"]], String(edgeThreshold), (value) => {
+                edgeThreshold = Number(value);
+                enrichMapToggle.redraw();
+            });
+        }
+        const networkToggle = relationships.toggle("network", "compound-concept network", (div) => isQuant
+            ? buildBurdenGeneConceptNetwork(div, block.table, slug, null, dotColorScale2, { topN, fontSize, alpha, geneScores: mx.compoundLog2fc || {} })
+            : buildGeneConceptNetwork(div, block.table, slug, null, dotColorScale2, { topN, sortBy, fontSize, alpha }));
+        relationships.option("Dot gradient", ORA_DOT_COLOR_SCALES.map(([label, value]) => [label, value]), dotColorScale2, (value) => {
+            dotColorScale2 = value;
+            if (enrichMapToggle) enrichMapToggle.redraw();
+            networkToggle.redraw();
+        });
+
+        nav.finish();
+    }
+
+    select.addEventListener("change", () => renderPanel(select.value));
+    if (sortedKeys.length > 0) {
+        select.value = sortedKeys[0];
+        renderPanel(sortedKeys[0]);
+    }
+
+    const newRunBtn = el("button", { class: "btn", style: { marginTop: "0.8rem" } }, "Start new run");
+    newRunBtn.addEventListener("click", () => {
+        mx.run = freshMetabolomicsRun();
+        STATE.aaPage = "metabolomics_config";
+        render();
+    });
+    wrap.appendChild(newRunBtn);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToMetabolomicsActions());
     return wrap;
 }
 
@@ -10112,8 +12977,43 @@ function _enableOraSelectToolToggle(div) {
     }, true);
 }
 
-function _newOraPlot(div, traces, layout, dbName, namespace, kind, kindLabel, onReady) {
+// Every ORA/Burden chart builder words its axis titles and hover text for
+// genes ("Gene count", "Genes in set", "Gene-concept network"), because they
+// were written for Genomics/Transcriptomics and reused verbatim for
+// Proteomics. A metabolomics user reading "Gene count" on a compound chart
+// has been told the tool does not understand their data, so charts drawn
+// inside _withChartNoun("Compound", ...) get those words swapped at the single
+// choke point every chart passes through (_newOraPlot). Only hover templates
+// and titles are touched - never trace data such as term or compound names.
+let _oraChartNoun = null;
+function _withChartNoun(noun, fn) {
+    const previous = _oraChartNoun;
+    _oraChartNoun = noun;
+    try { return fn(); } finally { _oraChartNoun = previous; }
+}
+function _swapChartNoun(node, noun, isText) {
+    if (typeof node === "string") {
+        return isText ? node.replace(/\bGenes\b/g, noun + "s").replace(/\bGene\b/g, noun) : node;
+    }
+    if (Array.isArray(node)) return node.map((item) => _swapChartNoun(item, noun, isText));
+    if (node && Object.getPrototypeOf(node) === Object.prototype) {
+        const out = {};
+        Object.keys(node).forEach((key) => {
+            out[key] = _swapChartNoun(node[key], noun, key === "hovertemplate" || key === "title" || (isText && key === "text"));
+        });
+        return out;
+    }
+    return node;
+}
+
+function _newOraPlot(div, traces, layout, dbName, namespace, kind, kindLabel, onReady, configExtra) {
+    if (_oraChartNoun) {
+        traces = _swapChartNoun(traces, _oraChartNoun, false);
+        layout = _swapChartNoun(layout, _oraChartNoun, false);
+        kindLabel = _swapChartNoun(kindLabel, _oraChartNoun, true);
+    }
     const config = _oraChartConfig(dbName, namespace, kind, kindLabel);
+    if (configExtra) Object.assign(config, configExtra);
     function draw() {
         const plot = Plotly.newPlot(div, traces, layout, config);
         if (plot && typeof plot.then === "function") {
@@ -10315,12 +13215,12 @@ function buildBurdenDotPlot(div, table, dbName, namespace, colorScaleName, opts)
         // regardless of what the x-axis encodes.
         customdata: rows.map(r => [
             String(r["Term Name"] || ""), Number(r.FDR), Number(r["Effect (mean difference)"]),
-            Number(r["Genes in set"]),
+            _burdenSetSize(r),
         ]),
         mode: "markers",
         type: "scatter",
         marker: {
-            size: _magnitudeMarkerSizes(rows.map(r => Number(r["Genes in set"])), 8, 30),
+            size: _magnitudeMarkerSizes(rows.map(r => _burdenSetSize(r)), 8, 30),
             color: fdrVals.map(f => -Math.log10(f + 1e-300)),
             colorscale: scale[2],
             reversescale: scale[3],
@@ -10365,7 +13265,7 @@ function buildBurdenBarPlot(div, table, dbName, namespace, barColor, opts) {
         y: wrappedNames,
         customdata: rows.map(r => [
             String(r["Term Name"] || ""), Number(r.FDR), Number(r["Effect (mean difference)"]),
-            Number(r["Genes in set"]),
+            _burdenSetSize(r),
         ]),
         type: "bar",
         orientation: "h",
@@ -10422,6 +13322,199 @@ function buildBurdenVolcanoPlot(div, table, dbName, namespace, alpha, opts) {
     _newOraPlot(div, [trace], layout, dbName, namespace, "volcano", "Volcano");
 }
 
+// Pathway Topology's impact plot: a categorical dot plot, same convention as
+// buildDotPlot - pathway NAME on the y-axis (wrapped, one row per pathway,
+// the figure growing to fit via _oraCategoricalChartHeight), Impact (MetPA's
+// 0..1 convention) on the x-axis, colour = significance (p-value or FDR,
+// toggleable), point size = compounds matched in that pathway's own graph.
+// Every TESTED pathway is plotted regardless of significance by default (a
+// "Terms shown" cap narrows this on request) - Impact is descriptive of
+// topology, not a threshold result, so this is never gated on hasSigRows.
+function buildPathwayImpactPlot(div, table, dbName, namespace, colorScaleName, opts) {
+    if (typeof Plotly === "undefined") return;
+    opts = opts || {};
+    const fontSize = opts.fontSize || 12;
+    const topN = opts.topN === undefined ? Infinity : opts.topN;
+    let rows = _tableToObjects(table).filter(r => r["Impact"] !== null && isFinite(Number(r["Impact"])));
+    if (!rows.length) { div.textContent = "No pathways to plot."; return; }
+    const scale = ORA_DOT_COLOR_SCALES.find((item) => item[1] === colorScaleName) || ORA_DOT_COLOR_SCALES[0];
+    const useFdr = opts.volcanoY === "fdr";
+    const sigField = useFdr ? "FDR" : "p-value";
+    const sigTitle = useFdr ? "-log10(FDR)" : "-log10(p-value)";
+    // Most significant first, same ranking convention as the dot/bar plots;
+    // a "Terms shown" cap then keeps only the top of this order.
+    rows = rows.slice().sort((a, b) => Number(a[sigField]) - Number(b[sigField]));
+    if (isFinite(topN)) rows = rows.slice(0, topN);
+    const impact = rows.map(r => Number(r["Impact"]));
+    const sigVals = rows.map(r => -Math.log10(Number(r[sigField]) + 1e-300));
+    const matchedCounts = rows.map(r => Number(r["Matched in graph"]) || 0);
+    const names = rows.map(r => String(r["Term Name"] || ""));
+    const wrappedNames = names.map(name => _wrapOraLabel(name, 44));
+    const chartHeight = _oraCategoricalChartHeight(wrappedNames, fontSize);
+    const trace = {
+        x: impact,
+        y: wrappedNames,
+        mode: "markers",
+        type: "scatter",
+        // customdata = [Term ID, significance value, matched-in-graph, graph
+        // nodes] so the hover is complete regardless of which significance
+        // field is plotted (colour comes from the same array, not re-read
+        // off marker.color).
+        customdata: rows.map((r, i) => [String(r["Term ID"] || ""), sigVals[i], Number(r["Matched in graph"]) || 0, Number(r["Graph nodes"]) || 0]),
+        marker: {
+            size: _magnitudeMarkerSizes(matchedCounts, 8, 30),
+            color: sigVals,
+            colorscale: scale[2],
+            reversescale: scale[3],
+            showscale: true,
+            colorbar: { title: sigTitle, thickness: 14, len: 0.7 },
+        },
+        hovertemplate: "%{y} (%{customdata[0]})<br>Impact=%{x:.3f}<br>" + sigTitle + "=%{customdata[1]:.2f}<br>" +
+            "Matched in graph=%{customdata[2]}/%{customdata[3]}<extra></extra>",
+    };
+    const layout = {
+        font: { size: fontSize },
+        // No fixed range: a hardcoded [-0.02, 1.02] clipped the largest
+        // markers at either end (a big point right at Impact=0 or Impact=1
+        // overflowed past the plot area, visible as a half-circle) until the
+        // user clicked the modebar's "Autoscale" button by hand. Leaving
+        // autorange on default does exactly what that button does - pads
+        // for the rendered marker size, not just the data value - so the
+        // FIRST draw already looks the way "Autoscale" fixes it to.
+        xaxis: { title: { text: "Impact", font: { size: fontSize + 4 } }, tickfont: { size: fontSize + 1 }, zeroline: false },
+        yaxis: { autorange: "reversed", tickfont: { size: fontSize }, automargin: true },
+        height: chartHeight,
+        margin: { l: 385, r: 105, t: 22, b: 56 },
+        plot_bgcolor: "#FAFCFE",
+        paper_bgcolor: "#FAFCFE",
+    };
+    _newOraPlot(div, [trace], layout, dbName, namespace, "impact", "Pathway impact");
+}
+
+// Pathway Topology's graph view: one pathway's compound-reaction graph,
+// drawn at KEGG's own KGML map coordinates (y flipped - KGML's origin is
+// top-left like an image, Plotly's is bottom-left). Edges are a single dim
+// line trace beneath the node markers (KEGG maps routinely have overlapping
+// edges), same convention as this app's other network figures.
+//
+// Compound-name labels are Plotly ANNOTATIONS anchored to each node's data
+// position, not the marker trace's own text - same reason as the class
+// composition pie's percentage labels (buildClassCompositionPie): an
+// annotation can be DRAGGED (config edits.annotationTail) independently of
+// its anchor, with a thin leader line that follows it, so two labels that
+// start on top of each other (dense clusters are routine on a real KEGG map)
+// can be pulled apart by hand. The node itself is ALSO draggable, reusing
+// the same _makeNetworkDraggable click-drag this app's other network charts
+// use; its onMove callback keeps each moved node's own label annotation
+// anchored to the node's NEW position, so a dragged node's label and leader
+// line follow it rather than being left pointing at the old spot. Neither
+// drag is persisted across a redraw (same as this app's other draggable
+// networks - _forceLayout-based charts reset the same way); only label
+// OFFSETS persist (run._topologyLabelPos), since KEGG's real coordinates are
+// the meaningful default to return to.
+//   opts: {fontSize, showLabels, savedPos(nodeId), onMoved(nodeId, ax, ay)}
+function buildPathwayGraphPlot(div, graph, opts) {
+    if (typeof Plotly === "undefined") return;
+    opts = opts || {};
+    const nodes = (graph && graph.nodes) || [];
+    if (!nodes.length) { div.textContent = "No graph available for this pathway."; return; }
+    const fontSize = opts.fontSize || 11;
+    const showLabels = opts.showLabels !== false;
+    const n = nodes.length;
+    // A node with no KGML coordinates (should not happen for a real fetch,
+    // but never assumed) falls back to a position on a circle, so the plot
+    // still draws something rather than silently dropping it.
+    const idx = {};
+    nodes.forEach((node, i) => { idx[node.id] = i; });
+    const xs = nodes.map((node, i) => (node.x === null || node.x === undefined)
+        ? 200 * Math.cos((2 * Math.PI * i) / n) : Number(node.x));
+    const ys = nodes.map((node, i) => (node.y === null || node.y === undefined)
+        ? 200 * Math.sin((2 * Math.PI * i) / n) : -Number(node.y));
+
+    const edgeX = [], edgeY = [];
+    (graph.edges || []).forEach(([s, t]) => {
+        const si = idx[s], ti = idx[t];
+        if (si === undefined || ti === undefined) return;
+        edgeX.push(xs[si], xs[ti], null);
+        edgeY.push(ys[si], ys[ti], null);
+    });
+    const edgeTrace = {
+        x: edgeX, y: edgeY, mode: "lines", type: "scatter",
+        line: { color: "#c7d0d8", width: 1 }, hoverinfo: "skip", showlegend: false,
+    };
+    const importance = nodes.map(node => Number(node.importance) || 0);
+    const nodeNames = nodes.map(node => String(node.label || node.id));
+    const nodeTrace = {
+        x: xs, y: ys, mode: "markers", type: "scatter",
+        hovertext: nodeNames,
+        customdata: nodes.map(node => [String(node.id), Number(node.importance) || 0]),
+        marker: {
+            size: _magnitudeMarkerSizes(importance, 8, 26),
+            color: nodes.map(node => node.matched ? "#c0392b" : "#95a5a6"),
+            line: { color: "#2c3e50", width: 1 },
+        },
+        hovertemplate: "%{hovertext} (%{customdata[0]})<br>Importance=%{customdata[1]:.4f}<extra></extra>",
+        showlegend: false,
+    };
+    const labelFontSize = Math.max(8, fontSize - 2);
+    const annotations = showLabels ? nodes.map((node, i) => {
+        const saved = opts.savedPos ? opts.savedPos(node.id) : null;
+        return {
+            x: xs[i], y: ys[i], xref: "x", yref: "y",
+            ax: saved ? saved.ax : 0, ay: saved ? saved.ay : -16,
+            axref: "pixel", ayref: "pixel",
+            text: _escapePlotlyText(nodeNames[i]),
+            showarrow: true, arrowhead: 0, arrowwidth: 1, arrowcolor: "#95a5a6",
+            font: { size: labelFontSize, color: "#2c3e50" },
+            bgcolor: "rgba(255,255,255,0.85)", borderpad: 1, yanchor: "middle",
+        };
+    }) : [];
+    const layout = {
+        font: { size: fontSize },
+        // Default click-drag is disabled (rather than Plotly's box-zoom) so a
+        // plain click-drag moves a node instead, same convention as this
+        // app's other draggable networks (_plotNetwork); zoom/pan remain
+        // available via the modebar.
+        dragmode: false,
+        xaxis: { visible: false, zeroline: false },
+        yaxis: { visible: false, zeroline: false, scaleanchor: "x" },
+        height: 560,
+        margin: { l: 20, r: 20, t: 20, b: 20 },
+        plot_bgcolor: "#FAFCFE",
+        paper_bgcolor: "#FAFCFE",
+        annotations,
+    };
+    const pos = {};
+    nodes.forEach((node, i) => { pos[node.id] = { x: xs[i], y: ys[i] }; });
+    const dragEdges = (graph.edges || []).map(([s, t]) => ({ source: s, target: t }));
+    _newOraPlot(div, [edgeTrace, nodeTrace], layout, "topology", null, "graph", "Pathway graph", () => {
+        // Remember where the user drags each label, same convention as the
+        // class composition pie - registered once per draw.
+        if (typeof div.removeAllListeners === "function") div.removeAllListeners("plotly_relayout");
+        div.on("plotly_relayout", (ev) => {
+            const moved = {};
+            Object.keys(ev || {}).forEach((k) => {
+                const m = /^annotations\[(\d+)\]\.(ax|ay)$/.exec(k);
+                if (m) (moved[m[1]] = moved[m[1]] || {})[m[2]] = ev[k];
+            });
+            Object.keys(moved).forEach((i) => {
+                const ann = (div.layout.annotations || [])[Number(i)];
+                const node = nodes[Number(i)];
+                if (ann && node && opts.onMoved) opts.onMoved(node.id, ann.ax, ann.ay);
+            });
+        });
+        _makeNetworkDraggable(div, [{ traceIndex: 1, nodeIds: nodes.map((node) => node.id) }], pos, 0, dragEdges,
+            (id, x, y) => {
+                // Keep the dragged node's own label anchored to its new spot,
+                // so the leader line follows the node instead of being left
+                // pointing at the old position.
+                const i = idx[id];
+                const ann = showLabels && div.layout.annotations ? div.layout.annotations[i] : null;
+                if (ann) { ann.x = x; ann.y = y; }
+            });
+    }, { responsive: false, edits: { annotationTail: true } });
+}
+
 // ---------------------------------------------------------------------------
 // Relational charts: enrichment map (terms linked by shared genes) and
 // gene-concept network (terms <-> their overlapping genes). Both are laid out
@@ -10430,7 +13523,16 @@ function buildBurdenVolcanoPlot(div, table, dbName, namespace, alpha, opts) {
 // export as every other ORA chart with zero new dependencies.
 // ---------------------------------------------------------------------------
 
+// Metabolomics member lists are semicolon-joined display NAMES ("Overlapping
+// Compounds"): compound names routinely contain commas ("2,3-bisphosphoglycerate")
+// and parentheses ("PC (34:1)"), so neither the comma split nor the " (SYMBOL)"
+// strip the gene/protein columns use may be applied to them.
+function _compoundSet(raw) {
+    return new Set(String(raw || "").split(";").map(s => s.trim()).filter(Boolean));
+}
+
 function _oraGeneSet(row) {
+    if (row["Overlapping Compounds"]) return _compoundSet(row["Overlapping Compounds"]);
     // Proteomics names this column "Overlapping Proteins" and formats each
     // member as "ACCESSION (SYMBOL)" (see Proteomics_module.OVERLAP_COLUMN).
     // Read either column name, and keep only the leading identifier - the
@@ -10456,7 +13558,14 @@ function _oraGeneSet(row) {
 // "ACCESSION (SYMBOL)" (Proteomics_module.OVERLAP_COLUMN / _finalize_member_
 // column) - read either column name and strip the trailing " (SYMBOL)",
 // same as _oraGeneSet does for ORA's identical proteomics formatting.
+// Burden tables name the per-term size column "Genes in set"; Metabolomics
+// renames it "Compounds in set" (Metabolomics_module._BURDEN_COLUMN_RENAMES).
+function _burdenSetSize(row) {
+    return Number(row["Genes in set"] !== undefined ? row["Genes in set"] : row["Compounds in set"]);
+}
+
 function _burdenGeneSet(row) {
+    if (row["Overlapping Compounds"]) return _compoundSet(row["Overlapping Compounds"]);
     const raw = String(row["Genes"] || row["Overlapping Proteins"] || "").trim();
     if (!raw) return new Set();
     return new Set(
@@ -10575,7 +13684,11 @@ function _plotNetwork(div, traces, layoutOverrides, dbName, namespace, kind, kin
 //   pos          - the live {nodeId: {x,y}} map from _forceLayout (mutated in place)
 //   edgeTraceIndex - index of the single edges line-trace sharing the same pos space
 //   edges        - the edge list used to build the edge trace ({source,target,...})
-function _makeNetworkDraggable(div, traceGroups, pos, edgeTraceIndex, edges) {
+//   onMove       - optional (id, x, y) callback fired on every drag step, for a
+//                  caller that has something else anchored to the node's position
+//                  (the pathway graph's draggable compound-name annotations, whose
+//                  own x/y anchor must track the node it labels as it moves)
+function _makeNetworkDraggable(div, traceGroups, pos, edgeTraceIndex, edges, onMove) {
     if (typeof Plotly === "undefined" || !div) return;
 
     const nodeLocation = {};
@@ -10641,6 +13754,7 @@ function _makeNetworkDraggable(div, traceGroups, pos, edgeTraceIndex, edges) {
                 edgeTrace.y[base] = pos[id].y;
             });
         }
+        if (onMove) onMove(id, pos[id].x, pos[id].y);
     }
 
     let draggingId = null;
@@ -10656,6 +13770,13 @@ function _makeNetworkDraggable(div, traceGroups, pos, edgeTraceIndex, edges) {
 
     function onMouseDown(evt) {
         if (evt.button !== 0) return;
+        // A click that landed on a Plotly ANNOTATION (e.g. the pathway
+        // graph's draggable compound-name labels, which sit close enough to
+        // their own node to be within the hit-test tolerance below) must be
+        // left alone so Plotly's own edits.annotationTail drag handles it -
+        // otherwise this capture-phase listener would win the race and drag
+        // the NODE every time the user meant to drag its nearby label.
+        if (evt.target && typeof evt.target.closest === "function" && evt.target.closest(".annotation")) return;
         const hit = hitTest(evt.clientX, evt.clientY);
         if (!hit) return;
         draggingId = hit;
@@ -11005,7 +14126,7 @@ function buildBurdenEnrichmentMap(div, table, dbName, namespace, colorScaleName,
     const geneSets = rows.map(_burdenGeneSet);
     const names = rows.map(r => String(r["Term Name"] || ""));
     const fdrVals = rows.map(r => Number(r.FDR));
-    const setSizes = rows.map(r => Number(r["Genes in set"]));
+    const setSizes = rows.map(r => _burdenSetSize(r));
     const effectVals = rows.map(r => Number(r["Effect (mean difference)"]));
 
     const edges = [];
@@ -11068,7 +14189,7 @@ function buildBurdenGeneConceptNetwork(div, table, dbName, namespace, colorScale
     const termIds = rows.map((r, i) => "T" + i);
     const names = rows.map(r => String(r["Term Name"] || ""));
     const fdrVals = rows.map(r => Number(r.FDR));
-    const setSizes = rows.map(r => Number(r["Genes in set"]));
+    const setSizes = rows.map(r => _burdenSetSize(r));
     const effectVals = rows.map(r => Number(r["Effect (mean difference)"]));
     const geneSets = rows.map(_burdenGeneSet);
 
@@ -12306,3 +15427,4375 @@ document.addEventListener("DOMContentLoaded", () => {
     STATE.transcriptomics = freshTranscriptomicsState();
     render();
 });
+
+// ===========================================================================
+// Multi-omics - Joint Pathway Enrichment
+//
+// Pick 2-4 omics, upload one file per omics HERE (nothing is read from another
+// tile), resolve each with that omics' own resolver, then test every KEGG /
+// Reactome pathway in each omics separately and combine the per-omics p-values
+// into one joint p-value per pathway (Fisher 1932, or Tippett's minimum-p).
+// Built entirely from new functions below; existing builders (buildTable,
+// makeResultNav, _metabolomicsChartPane, _newOraPlot, renderKeggOrganismWidget)
+// are CALLED, never edited.
+// ===========================================================================
+
+const MULTIOMICS_OMICS = [
+    ["genomics", "Genomics"], ["transcriptomics", "Transcriptomics"],
+    ["proteomics", "Proteomics"], ["metabolomics", "Metabolomics"],
+];
+const MULTIOMICS_LABELS = {
+    genomics: "Genomics", transcriptomics: "Transcriptomics", proteomics: "Proteomics", metabolomics: "Metabolomics",
+};
+const MULTIOMICS_DE_OMICS = ["transcriptomics", "proteomics"];
+const MULTIOMICS_DATABASES = ["KEGG", "Reactome"];
+const MULTIOMICS_METHODS = [
+    ["Brown's method (corrected for correlated omics)", "brown"],
+    ["Fisher's combined probability test", "fisher"],
+    ["Tippett's minimum-p test", "tippett"],
+];
+// Distinct, colour-blind-friendly marks for the per-omics evidence chart.
+const MULTIOMICS_COLORS = {
+    genomics: "#083B6B", transcriptomics: "#2A9D8F", proteomics: "#E9A23B", metabolomics: "#FF8289",
+};
+const MULTIOMICS_EXAMPLE_FILES = {
+    genomics: "example_multiomics_genes.csv", transcriptomics: "example_transcriptomics_de_full.csv",
+    proteomics: "example_proteomics_de_full.csv", metabolomics: "example_metabolomics_list.csv",
+};
+const MULTIOMICS_UPLOAD_HELP = {
+    genomics:
+        "One gene per row in a column named \"Gene Symbol\" or \"Ensembl Gene ID\". The genes you upload ARE the " +
+        "test set. Genes whose identifier is ambiguous or not found are left out - Omiscera never guesses one.",
+    transcriptomics:
+        "A differential-expression table: an identifier column, log2 fold change and p-value (padj optional - " +
+        "computed if absent). Omiscera selects the significant genes itself using the cutoffs you set on the next " +
+        "screen, up- and down-regulated together; every gene in the table counts as tested (the reference set).",
+    proteomics:
+        "A protein-level differential-abundance table: an accession column, log2 fold change and p-value (padj " +
+        "optional). Omiscera selects the significant proteins itself using the cutoffs you set on the next screen, " +
+        "up- and down-regulated together; every protein in the table counts as measured (the reference set).",
+    metabolomics:
+        "One compound per row in a column named \"Name\" (optional InChIKey, PubChem ID, KEGG ID, HMDB ID, ChEBI ID " +
+        "columns make matching more reliable). The compounds you upload ARE the test set; no statistics columns.",
+};
+const MULTIOMICS_MEMBER_COLUMNS = MULTIOMICS_OMICS.map(([, label]) => label + ": Overlapping members");
+// A member list can run to hundreds of names; without the long-list clamp one such cell inflates its whole row
+// (see TABLE_LONG_LIST_COLUMNS). These column names exist only in Multi-omics tables.
+MULTIOMICS_MEMBER_COLUMNS.forEach((c) => TABLE_LONG_LIST_COLUMNS.add(c));
+
+function freshMultiomicsRun() {
+    return { config: null, results: null, locked: false, draft: null, sigAlpha: 0.05 };
+}
+
+function freshMultiomicsState() {
+    return { selected: [], uploads: {}, taxonId: "", taxonName: "", resolved: null, run: freshMultiomicsRun(),
+             method: "joint", map: freshMultiomicsMap(), corr: freshCorrState(), net: freshNetState(), mofa: freshMofaState(), diablo: freshDiabloState() };
+}
+
+function _clearMultiomicsResolutionDependentState() {
+    const mo = STATE.multiomics;
+    if (!mo) return;
+    mo.resolved = null;
+    mo.run = freshMultiomicsRun();
+    mo.map = freshMultiomicsMap();
+    mo.net = freshNetState();
+    // KEGG's organism is derived from taxonId/taxonName and confirmed for that
+    // organism only - a check or confirmation must not outlive it.
+    delete mo._keggOrganismCheck;
+    mo._keggOrganismConfirmed = null;
+}
+
+function backToAnnotationAnalyticsActions() {
+    const actions = el("div", { class: "right-actions" });
+    const btn = el("button", { class: "btn" }, "Back to Annotation Analytics");
+    btn.addEventListener("click", () => { STATE.aaPage = "overview"; render(); });
+    actions.appendChild(el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, btn));
+    return actions;
+}
+
+function backToMultiomicsActions() {
+    const actions = el("div", { class: "right-actions" });
+    const btn = el("button", { class: "btn" }, "Back to Multi-omics");
+    btn.addEventListener("click", () => { STATE.aaPage = "multiomics_home"; render(); });
+    actions.appendChild(el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, btn));
+    return actions;
+}
+
+// The six planned Multi-omics methods, one box each (same layout as the other omics' tile screens). Only
+// Joint Pathway Enrichment and Cross-omics Pathway Mapping are built; the rest are shown greyed out so the plan is
+// visible. A box shows only the method's name - databases are chosen inside the method, not advertised on the box.
+const MULTIOMICS_TILES = [
+    { name: "Joint Pathway Enrichment", ready: true, method: "joint" },
+    { name: "Cross-omics Pathway Mapping", ready: true, method: "mapping" },
+    { name: "Correlation-based Integration", ready: true, method: "correlation" },
+    { name: "Network-based Integration", ready: true, method: "network" },
+    { name: "MOFA / Factor-based Integration", ready: true, method: "mofa" },
+    { name: "DIABLO / Multiblock Integration", ready: true, method: "diablo" },
+];
+
+function renderMultiomicsHomeScreen() {
+    const wrap = el("div", {});
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle" }, "Multi-omics"));
+    const grid = el("div", { class: "aa-genomics-grid" });
+    MULTIOMICS_TILES.forEach((tile) => {
+        const btn = el("button", {
+            class: "module-btn multiomics" + (tile.ready ? "" : " module-btn-disabled"),
+            title: tile.ready ? "" : "Coming soon",
+        }, tile.ready ? [el("div", {}, tile.name)] : [
+            el("div", {}, tile.name),
+            el("div", { style: { fontSize: "0.95rem", fontWeight: "500", marginTop: "0.25rem" } }, "coming soon"),
+        ]);
+        if (tile.ready) {
+            btn.addEventListener("click", () => {
+                // Mapping reuses uploads that are already resolved in this session (same Multi-omics state, no
+                // re-upload); Joint always starts from a clean setup, as before.
+                const keep = (tile.method === "mapping" || tile.method === "network") && STATE.multiomics && STATE.multiomics.resolved;
+                // MOFA reads the tables matched on the Correlation screen: if they are already matched in this session they are kept
+                const keepCorr = (tile.method === "mofa" || tile.method === "diablo") && STATE.multiomics && STATE.multiomics.corr && STATE.multiomics.corr.alignment;
+                if (!keep && !keepCorr) STATE.multiomics = freshMultiomicsState();
+                STATE.multiomics.method = tile.method;
+                STATE.aaPage = (tile.method === "correlation" || tile.method === "mofa" || tile.method === "diablo") ? "multiomics_corr"
+                    : keep ? (tile.method === "network" ? "multiomics_net" : "multiomics_map") : "multiomics";
+                render();
+            });
+        } else {
+            btn.disabled = true;
+        }
+        grid.appendChild(btn);
+    });
+    wrap.appendChild(grid);
+    wrap.appendChild(el("div", { class: "caption", style: { marginTop: "1.2rem" } },
+        "Multi-omics combines two or more omics layers. Joint Pathway Enrichment, Cross-omics Pathway Mapping, " +
+        "Correlation-based Integration, Network-based Integration, MOFA / Factor-based Integration and DIABLO / Multiblock Integration are available now - every planned method is built."));
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToAnnotationAnalyticsActions());
+    return wrap;
+}
+
+function renderMultiomicsOmicsPicker() {
+    const mo = STATE.multiomics;
+    const wrap = el("div", {});
+    wrap.appendChild(el("div", { class: "section-label" }, "Omics to combine"));
+    const row = el("div", { class: "db-checkbox-row" });
+    MULTIOMICS_OMICS.forEach(([key, label]) => {
+        const pill = el("label", { class: "ora-db-pill" });
+        const cb = el("input", { type: "checkbox", class: "ora-db-checkbox" });
+        cb.checked = mo.selected.indexOf(key) !== -1;
+        cb.addEventListener("change", async () => {
+            const next = MULTIOMICS_OMICS.map(([k]) => k).filter((k) =>
+                k === key ? cb.checked : mo.selected.indexOf(k) !== -1);
+            if (next.length >= 2) {
+                try {
+                    await apiPostJson("/api/multiomics/select", { omics_types: next });
+                } catch (err) {
+                    alert(err.message);
+                    cb.checked = !cb.checked;
+                    return;
+                }
+            }
+            mo.selected.filter((k) => next.indexOf(k) === -1).forEach((k) => { delete mo.uploads[k]; });
+            mo.selected = next;
+            // The combination changed, so anything resolved or run for the old one no longer applies.
+            _clearMultiomicsResolutionDependentState();
+            render();
+        });
+        pill.appendChild(cb);
+        pill.appendChild(document.createTextNode(" " + label));
+        row.appendChild(pill);
+    });
+    wrap.appendChild(row);
+    wrap.appendChild(el("div", { class: "caption" },
+        "Each omics is tested against every KEGG / Reactome pathway on its own, then the per-omics p-values are " +
+        "combined into ONE joint p-value per pathway - so a pathway that several omics point at ranks above one only a " +
+        "single omics supports, and the per-omics evidence stays visible beside it. Choose at least two."));
+    return wrap;
+}
+
+function renderMultiomicsOrganismSelector() {
+    const mo = STATE.multiomics;
+    const wrap = el("div", {});
+    const input = el("input", { class: "text-input", type: "text",
+        placeholder: "Species / organism (name or UniProt taxon ID)" });
+    const resultsSelect = el("select", { class: "hidden" });
+    const selectedCaption = el("div", { class: "caption" });
+    selectedCaption.textContent = mo.taxonId ? "Selected: " + mo.taxonName + " (taxon " + mo.taxonId + ")" : "";
+
+    let lastQuery = "";
+    let timer = null;
+    input.addEventListener("input", () => {
+        const query = input.value.trim();
+        if (timer) clearTimeout(timer);
+        if (query.length < 3) {
+            resultsSelect.innerHTML = "";
+            resultsSelect.classList.add("hidden");
+            return;
+        }
+        timer = setTimeout(async () => {
+            if (query === lastQuery) return;
+            lastQuery = query;
+            try {
+                const data = await apiJson("/api/contexts/search?database=" + encodeURIComponent("Rhea + UniProt")
+                    + "&query=" + encodeURIComponent(query) + "&limit=10");
+                resultsSelect.innerHTML = "";
+                resultsSelect.appendChild(el("option", { value: "" }, "Select organism"));
+                const records = data.results || [];
+                records.forEach((rec, idx) => {
+                    const label = rec.context_id && rec.context_name
+                        ? rec.context_id + " | " + rec.context_name
+                        : (rec.context_name || rec.context_id || "");
+                    resultsSelect.appendChild(el("option", { value: String(idx) }, label));
+                });
+                resultsSelect._records = records;
+                resultsSelect.classList.toggle("hidden", records.length === 0);
+            } catch (err) { /* keep prior dropdown contents on transient search errors */ }
+        }, 350);
+    });
+    resultsSelect.addEventListener("change", () => {
+        if (resultsSelect.value === "") return;
+        const rec = resultsSelect._records[parseInt(resultsSelect.value, 10)];
+        const newTaxonId = String(rec.context_id || "");
+        const changed = !!mo.resolved && newTaxonId !== mo.taxonId;
+        mo.taxonId = newTaxonId;
+        mo.taxonName = String(rec.context_name || "");
+        if (changed) _clearMultiomicsResolutionDependentState();
+        delete mo._keggOrganismCheck;
+        render();
+    });
+    wrap.appendChild(input);
+    wrap.appendChild(resultsSelect);
+    wrap.appendChild(selectedCaption);
+    return wrap;
+}
+
+function renderMultiomicsUploadSection(omics) {
+    const mo = STATE.multiomics;
+    const label = MULTIOMICS_LABELS[omics];
+    const isDe = MULTIOMICS_DE_OMICS.indexOf(omics) !== -1;
+    const up = mo.uploads[omics];
+    const wrap = el("div", {});
+    wrap.appendChild(el("div", { class: "section-label" },
+        label + " — " + (isDe ? "differential-expression table" : (omics === "genomics" ? "gene list" : "compound list"))));
+
+    async function upload(file) {
+        const formData = new FormData();
+        formData.append("file", file);
+        try {
+            const data = await apiUpload("/api/multiomics/" + omics + "/upload", formData);
+            mo.uploads[omics] = { filename: file.name, info: data };
+            // The server reset everything built on the previous upload of this omics; mirror that here.
+            _clearMultiomicsResolutionDependentState();
+            render();
+        } catch (err) {
+            alert(err.message);
+        }
+    }
+    wrap.appendChild(fileInputWidget({
+        accept: ".csv,.tsv,.txt", buttonLabel: "Choose CSV file",
+        initialFilename: up ? up.filename : "",
+        onChange: (file) => { if (file) upload(file); },
+    }));
+    wrap.appendChild(el("div", { class: "caption" }, MULTIOMICS_UPLOAD_HELP[omics]));
+    const exLink = el("button", { class: "ora-inline-example-link", type: "button" }, "Example file");
+    exLink.addEventListener("click", () => downloadFile(
+        "/api/multiomics/example?omics_type=" + omics, MULTIOMICS_EXAMPLE_FILES[omics]));
+    wrap.appendChild(exLink);
+
+    if (up) {
+        const info = up.info;
+        let summary = "Read " + info.n_rows + " row" + (info.n_rows === 1 ? "" : "s") + ".";
+        if (info.identifier_type) summary += " Identifier type detected: " + info.identifier_type.replace(/_/g, " ") + ".";
+        if (info.n_duplicates_removed) summary += " " + info.n_duplicates_removed + " duplicate(s) removed.";
+        if (info.column_mapping && info.column_mapping.identifier) {
+            const cm = info.column_mapping;
+            summary += " Columns: identifier \"" + cm.identifier + "\"" +
+                (cm.log2FC ? ", log2FC \"" + cm.log2FC + "\"" : "") +
+                (cm.pvalue ? ", p-value \"" + cm.pvalue + "\"" : "") +
+                (cm.padj ? ", padj \"" + cm.padj + "\"" : "") + ".";
+        } else if (info.column_mapping && (info.column_mapping.identifier_columns || []).length) {
+            summary += " Identifier columns: " + info.column_mapping.identifier_columns.join(", ") + ".";
+        }
+        wrap.appendChild(el("div", { class: "caption" }, summary));
+        const maxHeight = Math.min(300, Math.max(160, (info.preview.rows.length + 1) * 35));
+        wrap.appendChild(buildTable(info.preview, { maxHeight }));
+    }
+    return wrap;
+}
+
+function renderMultiomicsResolveControls() {
+    const mo = STATE.multiomics;
+    const wrap = el("div", {});
+    const missing = mo.selected.filter((o) => !mo.uploads[o]).map((o) => MULTIOMICS_LABELS[o]);
+    const ready = mo.selected.length >= 2 && missing.length === 0 && !!mo.taxonId;
+    const btn = el("button", { class: "btn", style: { marginTop: "0.8rem" } }, "Resolve identifiers");
+    btn.disabled = !ready;
+    if (mo.selected.length >= 2 && missing.length) {
+        wrap.appendChild(el("div", { class: "caption" }, "Upload a file for: " + missing.join(", ") + "."));
+    }
+    if (mo.selected.length >= 2 && !mo.taxonId) {
+        wrap.appendChild(el("div", { class: "caption" }, "Select an organism first."));
+    }
+    wrap.appendChild(el("div", { class: "caption" },
+        "Every omics is resolved with its OWN resolver, exactly as in its own tile (UniProt for genes, mygene.info " +
+        "for transcripts, UniProt ID mapping for proteins, PubChem/KEGG plus the local cross-reference for " +
+        "compounds), so an identifier means the same thing here as there. The first run downloads reference " +
+        "files and can take a few minutes; later runs reuse the cache."));
+    const progressWrap = el("div", { class: "progress-wrap hidden" });
+    const progressInner = el("div", { class: "progress-bar-inner", style: { width: "0%" } });
+    const progressLabel = el("div", { class: "progress-label" }, "");
+    progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, progressInner));
+    progressWrap.appendChild(progressLabel);
+
+    btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        progressWrap.classList.remove("hidden");
+        try {
+            const { job_id } = await apiPostJson("/api/multiomics/resolve",
+                { taxon_id: mo.taxonId, taxon_name: mo.taxonName });
+            pollJob(job_id, {
+                onProgress: (job) => {
+                    progressInner.style.width = Math.round((job.progress || 0) * 100) + "%";
+                    progressLabel.textContent = job.message || "";
+                },
+                onDone: (result) => { mo.resolved = result; mo.run = freshMultiomicsRun(); render(); },
+                onError: (err) => { alert(err); render(); },
+            });
+        } catch (err) {
+            alert(err.message);
+            render();
+        }
+    });
+    wrap.appendChild(btn);
+    wrap.appendChild(progressWrap);
+    return wrap;
+}
+
+function renderMultiomicsResolveResults() {
+    const mo = STATE.multiomics;
+    const info = mo.resolved.omics || {};
+    const wrap = el("div", {});
+    wrap.appendChild(el("div", { class: "section-label" }, "Resolved identifiers"));
+    wrap.appendChild(metricCards(mo.selected.map((o) => {
+        const s = info[o] || {};
+        return [MULTIOMICS_LABELS[o] + " usable", (s.n_usable !== undefined ? s.n_usable : "-") + " of " + (s.n_input_rows !== undefined ? s.n_input_rows : "-")];
+    }), mo.selected.length));
+    mo.selected.forEach((o) => {
+        const s = info[o] || {};
+        const meta = s.meta || {};
+        if (o === "genomics" && (meta.n_ambiguous || meta.n_not_found)) {
+            wrap.appendChild(el("div", { class: "caption" },
+                "Genomics: " + (meta.n_ambiguous || 0) + " gene(s) were ambiguous and " + (meta.n_not_found || 0) +
+                " were not found, so they are left out - there is no candidate-picking step here, and Omiscera never " +
+                "guesses an identifier."));
+        }
+        if (o === "metabolomics" && meta.n_unmatched) {
+            wrap.appendChild(el("div", { class: "caption" },
+                "Metabolomics: " + meta.n_unmatched + " compound(s) could not be matched to the cross-reference and " +
+                "are left out."));
+        }
+        if (MULTIOMICS_DE_OMICS.indexOf(o) !== -1 && meta.n_unmapped) {
+            wrap.appendChild(el("div", { class: "caption" },
+                MULTIOMICS_LABELS[o] + ": " + meta.n_unmapped + " identifier(s) could not be mapped and are left out."));
+        }
+    });
+    const continueBtn = el("button", { class: "btn btn-primary", style: { marginTop: "0.8rem" } },
+        mo.method === "mapping" ? "Continue to pathway mapping" : mo.method === "network" ? "Continue to network setup" : "Continue to setup");
+    continueBtn.addEventListener("click", () => {
+        mo.run = freshMultiomicsRun();
+        mo.map = freshMultiomicsMap();
+        mo.net = freshNetState();
+        STATE.aaPage = mo.method === "mapping" ? "multiomics_map" : mo.method === "network" ? "multiomics_net" : "multiomics_config";
+        render();
+    });
+    wrap.appendChild(continueBtn);
+    return wrap;
+}
+
+function renderMultiomicsScreen() {
+    const mo = STATE.multiomics;
+    const wrap = el("div", { class: "ora-config-screen ora-module-screen" });
+    wrap.appendChild(aaHeader());
+    const isMapping = mo.method === "mapping";
+    const isNetwork = mo.method === "network";
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" },
+        isMapping ? "Multi-omics — Cross-omics Pathway Mapping" : isNetwork ? "Multi-omics — Network-based Integration" : "Multi-omics — Joint Pathway Enrichment"));
+    wrap.appendChild(el("div", { class: "caption" },
+        (isMapping ? "Where, inside one pathway, do your omics layers land? "
+                   : isNetwork ? "Which proteins sit at the centre of ALL your omics together on the protein-interaction network? "
+                   : "Do your omics layers point at the SAME pathways? ") +
+        "Upload a list or table for each omics you want to combine; " +
+        "nothing is read from the other modules, so a re-run elsewhere can never change what is combined here."));
+    wrap.appendChild(renderMultiomicsOmicsPicker());
+    if (mo.selected.length >= 2) {
+        wrap.appendChild(el("div", { class: "section-label" }, "Organism"));
+        wrap.appendChild(renderMultiomicsOrganismSelector());
+        wrap.appendChild(el("div", { class: "caption" },
+            "One organism for the whole run: it selects which species' Reactome pathways are used and which KEGG " +
+            "pathway maps exist, and it is the same for every omics so they are tested against identical pathways."));
+        mo.selected.forEach((o) => wrap.appendChild(renderMultiomicsUploadSection(o)));
+        wrap.appendChild(renderMultiomicsResolveControls());
+        if (mo.resolved) wrap.appendChild(renderMultiomicsResolveResults());
+    }
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToMultiomicsActions());
+    return wrap;
+}
+
+function renderMultiomicsConfigScreen() {
+    const mo = STATE.multiomics;
+    const wrap = el("div", { class: "ora-config-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Multi-omics — Joint Pathway Enrichment: setup"));
+    if (!mo || !mo.resolved) {
+        wrap.appendChild(alertBox("warning", "Resolve the identifiers first."));
+        wrap.appendChild(backToMultiomicsActions());
+        return wrap;
+    }
+    const run = mo.run;
+    const locked = run.locked;
+    if (locked) {
+        wrap.appendChild(alertBox("info", "Configuration is locked for the in-progress/completed run. Use \"Start new run\" on the results screen to change settings."));
+    }
+    if (!run.draft) {
+        run.draft = {
+            databases: MULTIOMICS_DATABASES.slice(), method: "brown", minTermSize: 3, maxTermSize: 500,
+            cutoffs: { transcriptomics: { padj: 0.05, lfc: 1.0 }, proteomics: { padj: 0.05, lfc: 1.0 } },
+        };
+    }
+    const draft = run.draft;
+
+    function numberField(labelText, value, step, min, onChange) {
+        const col = el("div", { class: "col" });
+        col.appendChild(el("div", { class: "chart-option-label" }, labelText));
+        const input = el("input", { type: "number", class: "text-input", step: String(step), min: String(min) });
+        input.value = value;
+        input.disabled = locked;
+        input.addEventListener("change", () => {
+            const v = parseFloat(input.value);
+            if (isFinite(v) && v >= min) onChange(v); else input.value = value;
+        });
+        col.appendChild(input);
+        return col;
+    }
+
+    const runBtnWrap = el("div", { class: "col" });
+    function renderRunBtn() {
+        runBtnWrap.innerHTML = "";
+        const runBtn = el("button", { class: "btn btn-primary ora-run-btn" }, "Run");
+        runBtn.disabled = locked || draft.databases.length === 0;
+        runBtn.addEventListener("click", () => startMultiomicsRun(draft));
+        runBtnWrap.appendChild(runBtn);
+    }
+
+    // ----- Databases -----
+    wrap.appendChild(el("div", { class: "section-label" }, "Databases"));
+    const dbRow = el("div", { class: "db-checkbox-row" });
+    const keggBox = el("div", {});
+    MULTIOMICS_DATABASES.forEach((db) => {
+        const pill = el("label", { class: "ora-db-pill" });
+        const cb = el("input", { type: "checkbox", class: "ora-db-checkbox" });
+        cb.checked = draft.databases.indexOf(db) !== -1;
+        cb.disabled = locked;
+        cb.addEventListener("change", () => {
+            draft.databases = MULTIOMICS_DATABASES.filter((d) => d === db ? cb.checked : draft.databases.indexOf(d) !== -1);
+            renderRunBtn();
+            renderKegg();
+        });
+        pill.appendChild(cb);
+        pill.appendChild(document.createTextNode(" " + db));
+        dbRow.appendChild(pill);
+    });
+    wrap.appendChild(dbRow);
+    wrap.appendChild(el("div", { class: "caption" },
+        "KEGG and Reactome are the two databases here that annotate BOTH genes/proteins and compounds under the same " +
+        "pathway identifiers, which is what a joint test needs. Each database is combined and corrected independently."));
+    wrap.appendChild(keggBox);
+    function renderKegg() {
+        keggBox.innerHTML = "";
+        if (draft.databases.indexOf("KEGG") === -1) return;
+        keggBox.appendChild(el("div", { class: "section-label" }, "KEGG organism"));
+        const holder = el("div", {});
+        keggBox.appendChild(holder);
+        renderKeggOrganismWidget(holder, "multiomics");
+    }
+    renderKegg();
+
+    // ----- Combination method -----
+    wrap.appendChild(el("div", { class: "section-label" }, "How the omics are combined"));
+    const methodRow = el("div", { class: "row" });
+    const methodCol = el("div", { class: "col" });
+    methodCol.appendChild(el("div", { class: "chart-option-label" }, "Method"));
+    const methodSel = el("select", { class: "text-input" });
+    MULTIOMICS_METHODS.forEach(([lab, val]) => methodSel.appendChild(el("option", { value: val }, lab)));
+    methodSel.value = draft.method;
+    methodSel.disabled = locked;
+    methodSel.addEventListener("change", () => { draft.method = methodSel.value; });
+    methodCol.appendChild(methodSel);
+    methodRow.appendChild(methodCol);
+    wrap.appendChild(methodRow);
+    wrap.appendChild(el("div", { class: "caption" },
+        "Brown (1975, recommended): evidence ACCUMULATES across omics, as in Fisher, but first measures how strongly " +
+        "each pair of omics agree across all pathways (estimated from this run's own p-values, Poole et al. 2016) and " +
+        "counts correlated omics as less than one independent piece of evidence each - so RNA and protein from the " +
+        "same samples are not double-counted. Because that agreement includes real shared biology it is somewhat " +
+        "conservative. Fisher (1932): the same accumulation but it assumes the omics are independent, so correlated " +
+        "omics give a joint p-value that is too small; keep it for comparison. Tippett (1931): asks whether AT LEAST " +
+        "ONE omics is strongly enriched, ignoring agreement between them. An omics with no hit in a pathway enters as " +
+        "p = 1.0, which none of these punish. Stouffer's Z method is deliberately not offered: it reads a p-value " +
+        "near 1 as strong evidence AGAINST a pathway, which is wrong for a one-sided enrichment test."));
+
+    // ----- Differential-expression cutoffs -----
+    const deSelected = mo.selected.filter((o) => MULTIOMICS_DE_OMICS.indexOf(o) !== -1);
+    if (deSelected.length) {
+        wrap.appendChild(el("div", { class: "section-label" }, "Significance cutoffs for differential-expression tables"));
+        deSelected.forEach((o) => {
+            const row = el("div", { class: "row" });
+            row.appendChild(numberField(MULTIOMICS_LABELS[o] + ": adjusted p-value (padj) at most", draft.cutoffs[o].padj, 0.001, 0.000001,
+                (v) => { draft.cutoffs[o].padj = Math.min(v, 1); }));
+            row.appendChild(numberField(MULTIOMICS_LABELS[o] + ": |log2 fold change| at least", draft.cutoffs[o].lfc, 0.1, 0,
+                (v) => { draft.cutoffs[o].lfc = v; }));
+            wrap.appendChild(row);
+        });
+        wrap.appendChild(el("div", { class: "caption" },
+            "Up- and down-regulated features are pooled into one list: the joint question is whether a pathway is " +
+            "perturbed, and a compound list has no direction. The reference set is every gene/protein in your table " +
+            "(the field's standard for expression data), not the whole database."));
+    }
+
+    // ----- Term size -----
+    wrap.appendChild(el("div", { class: "section-label" }, "Pathway size"));
+    const sizeRow = el("div", { class: "row" });
+    sizeRow.appendChild(numberField("Minimum pathway size", draft.minTermSize, 1, 1, (v) => { draft.minTermSize = Math.round(v); }));
+    sizeRow.appendChild(numberField("Maximum pathway size", draft.maxTermSize, 1, 1, (v) => { draft.maxTermSize = Math.round(v); }));
+    wrap.appendChild(sizeRow);
+    wrap.appendChild(el("div", { class: "caption" },
+        "Size counts a pathway's members that are annotated in that omics. A pathway must pass the size gate in EVERY " +
+        "omics to be combined; one that passes in only some is listed separately, never padded with a made-up p-value."));
+
+    const actionRow = el("div", { class: "row", style: { marginTop: "1rem" } });
+    renderRunBtn();
+    actionRow.appendChild(runBtnWrap);
+    wrap.appendChild(actionRow);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    const back = el("div", { class: "right-actions" });
+    const backBtn = el("button", { class: "btn" }, "Back to upload");
+    backBtn.addEventListener("click", () => { STATE.aaPage = "multiomics"; render(); });
+    back.appendChild(el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, backBtn));
+    wrap.appendChild(back);
+    return wrap;
+}
+
+async function startMultiomicsRun(draft) {
+    const mo = STATE.multiomics;
+    const run = mo.run;
+    if (!draft.databases.length) return;
+    const cutoffs = {};
+    mo.selected.filter((o) => MULTIOMICS_DE_OMICS.indexOf(o) !== -1).forEach((o) => { cutoffs[o] = draft.cutoffs[o]; });
+    const payload = {
+        databases: draft.databases, method: draft.method, min_term_size: draft.minTermSize,
+        max_term_size: draft.maxTermSize, de_cutoffs: cutoffs,
+    };
+    try {
+        const cfg = await apiPostJson("/api/multiomics/joint/configure", payload);
+        run.config = cfg.config;
+        run.locked = true;
+        run.results = null;
+        STATE.aaPage = "multiomics_results";
+        render();
+        const { job_id } = await apiPostJson("/api/multiomics/joint/run", {});
+        pollJob(job_id, {
+            onProgress: (job) => {
+                const bar = document.getElementById("multiomics-progress-inner");
+                const label = document.getElementById("multiomics-progress-label");
+                if (bar) bar.style.width = Math.round((job.progress || 0) * 100) + "%";
+                if (label) label.textContent = job.message || "";
+            },
+            onDone: (result) => { run.results = result; render(); },
+            onError: (err) => {
+                alert("Run failed: " + err);
+                run.locked = false;
+                STATE.aaPage = "multiomics_config";
+                render();
+            },
+        });
+    } catch (err) {
+        alert(err.message);
+        run.locked = false;
+        if (STATE.aaPage === "multiomics_results") STATE.aaPage = "multiomics_config";
+        render();
+    }
+}
+
+// ---- results -------------------------------------------------------------
+
+// buildTable only clamps a member-list cell above 100 characters, which suits a wide column. This table has ~18
+// columns, so the auto layout squeezes a member column to ~100px and an 80-character list - under that threshold -
+// still wraps to ten lines and inflates its whole row (measured: a 195px row). Clamp EVERY non-empty member cell to
+// the same three-line form with a sensible minimum width; the full text stays in the tooltip and in the CSV.
+function _multiomicsClampMemberCells(tableWrap, payload) {
+    const idx = [];
+    (payload.columns || []).forEach((c, i) => { if (MULTIOMICS_MEMBER_COLUMNS.indexOf(c) !== -1) idx.push(i); });
+    tableWrap.querySelectorAll("tbody tr").forEach((tr) => {
+        idx.forEach((i) => {
+            const td = tr.children[i];
+            if (!td) return;
+            td.style.minWidth = "200px";
+            if (td.classList.contains("td-long-list") || !td.textContent) return;
+            const text = td.textContent;
+            td.className = "td-long-list";
+            td.title = text;
+            td.textContent = "";
+            td.appendChild(el("div", { class: "td-long-list-content" }, text));
+        });
+    });
+    return tableWrap;
+}
+
+function _multiomicsUniqueLabels(rows) {
+    const seen = {};
+    rows.forEach((r) => { seen[r["Term Name"]] = (seen[r["Term Name"]] || 0) + 1; });
+    // Plotly merges identical category labels onto one row, so a repeated pathway name gets its id appended.
+    return rows.map((r) => seen[r["Term Name"]] > 1 ? r["Term Name"] + " (" + r["Term ID"] + ")" : r["Term Name"]);
+}
+
+function _multiomicsTopRows(table, topN) {
+    const rows = _tableToObjects(table).filter((r) => r["Combined p-value"] !== null && isFinite(Number(r["Combined p-value"])));
+    rows.sort((a, b) => Number(a["Combined FDR"]) - Number(b["Combined FDR"]) || Number(a["Combined p-value"]) - Number(b["Combined p-value"]));
+    return isFinite(topN) ? rows.slice(0, topN) : rows;
+}
+
+function _multiomicsTotalHits(row, omics) {
+    return omics.reduce((s, o) => s + (Number(row[MULTIOMICS_LABELS[o] + ": k"]) || 0), 0);
+}
+
+// One row per pathway (most significant first): x = -log10(combined p-value), size = hits summed over the omics,
+// colour = -log10(combined FDR). Same categorical dot-plot convention as buildDotPlot.
+function buildJointDotPlot(div, table, omics, slug, colorScaleName, opts) {
+    if (typeof Plotly === "undefined") return;
+    opts = opts || {};
+    const fontSize = opts.fontSize || 12;
+    const rows = _multiomicsTopRows(table, opts.topN === undefined ? 20 : opts.topN);
+    if (!rows.length) { div.textContent = "No jointly tested pathways to plot."; return; }
+    const scale = ORA_DOT_COLOR_SCALES.find((item) => item[1] === colorScaleName) || ORA_DOT_COLOR_SCALES[0];
+    const labels = _multiomicsUniqueLabels(rows);
+    const wrapped = labels.map((name) => _wrapOraLabel(name, 44));
+    const negLogP = rows.map((r) => -Math.log10(Number(r["Combined p-value"]) + 1e-300));
+    const negLogFdr = rows.map((r) => -Math.log10(Number(r["Combined FDR"]) + 1e-300));
+    const trace = {
+        x: negLogP, y: wrapped, mode: "markers", type: "scatter",
+        customdata: rows.map((r, i) => [String(r["Term ID"]), Number(r["Combined FDR"]), _multiomicsTotalHits(r, omics), labels[i]]),
+        marker: {
+            size: _magnitudeMarkerSizes(rows.map((r) => _multiomicsTotalHits(r, omics)), 8, 30),
+            color: negLogFdr, colorscale: scale[2], reversescale: scale[3], showscale: true,
+            colorbar: { title: "-log10(FDR)", thickness: 14, len: 0.7 },
+        },
+        hovertemplate: "%{customdata[3]} (%{customdata[0]})<br>-log10(combined p)=%{x:.2f}<br>" +
+            "Combined FDR=%{customdata[1]:.3g}<br>Hits across omics=%{customdata[2]}<extra></extra>",
+    };
+    const layout = {
+        font: { size: fontSize },
+        xaxis: { title: { text: "-log10(combined p-value)", font: { size: fontSize + 2 } }, tickfont: { size: fontSize }, zeroline: false },
+        yaxis: { autorange: "reversed", tickfont: { size: fontSize }, automargin: true },
+        height: _oraCategoricalChartHeight(wrapped, fontSize),
+        margin: { l: 385, r: 105, t: 22, b: 56 },
+        plot_bgcolor: "#FAFCFE", paper_bgcolor: "#FAFCFE",
+    };
+    _newOraPlot(div, [trace], layout, slug, null, "jointdot", "Joint dot plot");
+}
+
+// Which omics drove each pathway: one coloured circle per omics at -log10(its own p-value), and a black diamond at
+// the combined one. A pathway where the diamond sits far right of every circle is one no single omics shows alone.
+function buildJointEvidencePlot(div, table, omics, slug, opts) {
+    if (typeof Plotly === "undefined") return;
+    opts = opts || {};
+    const fontSize = opts.fontSize || 12;
+    const rows = _multiomicsTopRows(table, opts.topN === undefined ? 20 : opts.topN);
+    if (!rows.length) { div.textContent = "No jointly tested pathways to plot."; return; }
+    const labels = _multiomicsUniqueLabels(rows);
+    const wrapped = labels.map((name) => _wrapOraLabel(name, 44));
+    const nlog = (p) => (p === null || p === undefined || !isFinite(Number(p))) ? null : -Math.log10(Number(p) + 1e-300);
+
+    // LANES, not one shared line: two omics with the same p-value (every omics with no hit sits at exactly 0) would
+    // stack on one point and the lower marker would vanish. Each pathway's row is split into one lane per omics plus
+    // one for the combined diamond, so no two markers can ever cover each other. The y-axis is numeric (row index +
+    // lane offset) with the pathway names as tick labels; LANE_PX of vertical space per lane keeps markers clear.
+    const lanes = omics.length + 1;
+    const LANE_PX = 13;
+    const maxLines = wrapped.reduce((m, w) => Math.max(m, String(w).split("<br>").length), 1);
+    const rowPx = Math.max(lanes * LANE_PX + 14, maxLines * Math.round(fontSize * 1.7) + 8, 34);
+    const laneOffset = (k) => (k - (lanes - 1) / 2) * (LANE_PX / rowPx);
+    const rowIndex = rows.map((_, i) => i);
+
+    const traces = omics.map((o, k) => {
+        const label = MULTIOMICS_LABELS[o];
+        return {
+            x: rows.map((r) => nlog(r[label + ": p-value"])), y: rowIndex.map((i) => i + laneOffset(k)),
+            mode: "markers", type: "scatter", name: label,
+            customdata: rows.map((r, i) => [labels[i], r[label + ": k"], r[label + ": K"], r[label + ": p-value"]]),
+            marker: { size: 9, color: MULTIOMICS_COLORS[o], opacity: 0.9, line: { color: "#FFFFFF", width: 1 } },
+            hovertemplate: "%{customdata[0]}<br>" + label + ": %{customdata[1]} of %{customdata[2]} members hit<br>" +
+                "-log10(p)=%{x:.2f}<extra></extra>",
+        };
+    });
+    traces.push({
+        x: rows.map((r) => nlog(r["Combined p-value"])), y: rowIndex.map((i) => i + laneOffset(lanes - 1)),
+        mode: "markers", type: "scatter", name: "Combined",
+        customdata: rows.map((r, i) => [labels[i], Number(r["Combined FDR"])]),
+        marker: { size: 11, symbol: "diamond", color: "#1B2A41", line: { color: "#FFFFFF", width: 1 } },
+        hovertemplate: "%{customdata[0]}<br>Combined: -log10(p)=%{x:.2f}<br>Combined FDR=%{customdata[1]:.3g}<extra></extra>",
+    });
+    const layout = {
+        font: { size: fontSize },
+        xaxis: { title: { text: "-log10(p-value)", font: { size: fontSize + 2 } }, tickfont: { size: fontSize }, zeroline: false },
+        yaxis: {
+            tickmode: "array", tickvals: rowIndex, ticktext: wrapped, tickfont: { size: fontSize }, automargin: true,
+            range: [rows.length - 0.5, -0.5], zeroline: false, showgrid: true, gridcolor: "#E4EAF0",
+        },
+        height: rows.length * rowPx + 22 + 56 + 40,
+        margin: { l: 385, r: 40, t: 22, b: 56 },
+        legend: { orientation: "h", y: 1.04, x: 0 },
+        plot_bgcolor: "#FAFCFE", paper_bgcolor: "#FAFCFE",
+    };
+    _newOraPlot(div, traces, layout, slug, null, "jointevidence", "Evidence by omics");
+}
+
+function renderMultiomicsResultsScreen() {
+    const mo = STATE.multiomics;
+    const run = mo.run;
+    const wrap = el("div", { class: "ora-config-screen ora-results-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Multi-omics — Joint Pathway Enrichment: results"));
+
+    if (!run.results) {
+        wrap.appendChild(alertBox("info", "Running analysis..."));
+        const progressWrap = el("div", { class: "progress-wrap" });
+        const progressInner = el("div", { id: "multiomics-progress-inner", class: "progress-bar-inner", style: { width: "0%" } });
+        progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, progressInner));
+        progressWrap.appendChild(el("div", { id: "multiomics-progress-label", class: "progress-label" }, ""));
+        wrap.appendChild(progressWrap);
+        return wrap;
+    }
+
+    const { blocks, summary } = run.results;
+    const omics = summary.omics;
+    wrap.appendChild(metricCards([
+        ["Omics combined", omics.map((o) => MULTIOMICS_LABELS[o]).join(" + ")],
+        ["Organism", summary.taxon_name || summary.taxon_id],
+        ["KEGG organism", summary.kegg_organism_code || "-"],
+        ["Method", summary.method_label],
+    ], 4));
+    omics.forEach((o) => {
+        const s = (summary.omics_summary || {})[o] || {};
+        let line;
+        if (MULTIOMICS_DE_OMICS.indexOf(o) !== -1) {
+            line = MULTIOMICS_LABELS[o] + ": " + s.n_in_list + " significant of " + s.n_tested + " tested (padj <= " +
+                s.padj_cutoff + ", |log2FC| >= " + s.lfc_cutoff + "; up and down pooled). The " + s.n_tested + " tested are the reference set.";
+        } else if (o === "genomics") {
+            line = "Genomics: " + s.n_in_list + " gene(s) in the list" + (s.n_left_out ? " (" + s.n_left_out + " left out as ambiguous / not found)" : "") + ".";
+        } else {
+            line = "Metabolomics: " + s.n_in_list + " compound(s) matched, tested against each database's own annotated compounds.";
+        }
+        wrap.appendChild(el("div", { class: "caption" }, line));
+    });
+
+    const alphaRow = el("div", { class: "ora-sig-threshold-row" });
+    alphaRow.appendChild(el("span", { class: "chart-option-label" }, "Significance threshold (Combined FDR <)"));
+    const alphaInput = el("input", { type: "number", class: "ora-sig-threshold-input", min: "0", max: "1", step: "0.001" });
+    alphaInput.value = run.sigAlpha;
+    alphaInput.addEventListener("change", () => {
+        let v = parseFloat(alphaInput.value);
+        if (!isFinite(v) || v <= 0 || v > 1) v = 0.05;
+        run.sigAlpha = v;
+        alphaInput.value = v;
+        renderPanel(select.value);
+    });
+    alphaRow.appendChild(alphaInput);
+    wrap.appendChild(alphaRow);
+    wrap.appendChild(el("div", { class: "caption" },
+        "Each database is combined and Benjamini-Hochberg corrected on its own, and the correction is applied ONCE, to " +
+        "the combined p-values. The per-omics p-values beside them are informational and not corrected again. " +
+        "There is no correction ACROSS databases."));
+
+    const dbKeys = MULTIOMICS_DATABASES.filter((d) => blocks[d]);
+    const selectorRow = el("div", { class: "row" });
+    const select = el("select", { class: "text-input transcriptomics-ora-result-select" });
+    dbKeys.forEach((key) => {
+        select.appendChild(el("option", { value: key }, key + " (" + blocks[key].n_terms_combined + " pathways)"));
+    });
+    selectorRow.appendChild(el("div", { class: "col" }, select));
+    wrap.appendChild(selectorRow);
+    const panelHost = el("div", {});
+    wrap.appendChild(panelHost);
+    select.addEventListener("change", () => renderPanel(select.value));
+
+    function renderPanel(db) {
+        panelHost.innerHTML = "";
+        const block = blocks[db];
+        if (!block) return;
+        const alpha = run.sigAlpha;
+        const slug = "multiomics-" + db.toLowerCase();
+        const card = el("div", { class: "rank-card ora-db-card ora-result-card ora-db-card-" + slug });
+        panelHost.appendChild(card);
+        const nav = makeResultNav(card, { stateKey: "multiomics_joint" });
+
+        const overviewPane = nav.pane("Overview");
+        if (block.caveat) overviewPane.appendChild(alertBox("warning", block.caveat));
+        if (block.note) overviewPane.appendChild(alertBox("info", block.note));
+        overviewPane.appendChild(metricCards([
+            ["Pathways combined", block.n_terms_combined],
+            ["Partial coverage", block.n_terms_partial],
+            ["Hit by no omics (not tested)", block.n_terms_no_overlap],
+        ], 3));
+        const perOmicsRows = block.omics_combined.concat(Object.keys(block.omics_excluded)).map((o) => {
+            const p = (block.per_omics || {})[o] || {};
+            return {
+                "Omics": MULTIOMICS_LABELS[o],
+                "In your list": p.n_list, "Of those annotated here": p.n_in_universe,
+                "Reference set (annotated)": p.universe_size, "Pathways tested": p.n_terms_tested,
+                "Used in the combination": p.testable ? "yes" : "no",
+            };
+        });
+        overviewPane.appendChild(buildTable({
+            columns: ["Omics", "In your list", "Of those annotated here", "Reference set (annotated)", "Pathways tested", "Used in the combination"],
+            rows: perOmicsRows,
+        }, {}));
+        Object.keys(block.omics_excluded || {}).forEach((o) => {
+            overviewPane.appendChild(alertBox("warning", MULTIOMICS_LABELS[o] + " was left out of the " + db + " combination: " + block.omics_excluded[o]));
+        });
+        // How much the omics agree across pathways - always shown (even under Fisher, which ignores it), so the
+        // dependence between the layers is visible rather than assumed away.
+        const corr = block.correlation;
+        if (corr && corr.pairs && corr.pairs.length) {
+            const reading = (r) => r >= 0.7 ? "strong" : r >= 0.4 ? "moderate" : r >= 0.15 ? "weak" : "none";
+            overviewPane.appendChild(el("div", { class: "section-label" }, "Correlation between omics"));
+            overviewPane.appendChild(buildTable({
+                columns: ["Pair of omics", "Correlation used", "Raw estimate", "Pathways used", "Agreement"],
+                rows: corr.pairs.map((p) => ({
+                    "Pair of omics": MULTIOMICS_LABELS[p.a] + " – " + MULTIOMICS_LABELS[p.b],
+                    "Correlation used": _fmtFixed(p.rho, 2),
+                    "Raw estimate": p.rho_raw === null || p.rho_raw === undefined ? "n/a" : _fmtFixed(p.rho_raw, 2),
+                    "Pathways used": p.n_pathways,
+                    "Agreement": corr.fallback ? "not estimated" : reading(p.rho),
+                })),
+            }, {}));
+            overviewPane.appendChild(el("div", { class: "caption" }, corr.applied
+                ? "Estimated across the " + corr.n_pathways + " pathways tested in every omics (the correlation of -2 ln p, set " +
+                  "to 0 if negative). Brown's method uses it: your " + block.omics_combined.length + " omics count as about " +
+                  _fmtFixed(corr.effective_omics, 1) + " independent ones" +
+                  (corr.effective_omics < block.omics_combined.length - 0.05 ? ", so every p-value that could be significant is larger (more conservative) than plain Fisher would give." : ".")
+                : "Shown for information only - " + (block.method === "fisher" ? "Fisher" : "Tippett") +
+                  " does not use it. Correlated omics make plain Fisher's joint p-values too small; Brown's method corrects for this."));
+        }
+        overviewPane.appendChild(el("div", { class: "caption" },
+            "A pathway enters the combination only when every used omics could test it AND at least one omics has a hit in it " +
+            "(a pathway nobody hit says nothing, and counting it would only inflate the correction). An omics with no hit in a pathway " +
+            "that another omics did hit enters as p = 1.0, so the silence is part of the evidence."));
+
+        if (!block.table.rows || block.table.rows.length === 0) {
+            if (!block.note) overviewPane.appendChild(alertBox("info", "No pathway could be combined for this database."));
+            nav.finish();
+            return;
+        }
+
+        const tablePane = nav.pane("Combined table");
+        tablePane.appendChild(_multiomicsClampMemberCells(buildTable(block.table, {
+            maxHeight: 480,
+            rowClassFn: (row) => {
+                const fdr = row["Combined FDR"];
+                return (fdr !== "" && fdr !== null && isFinite(Number(fdr)) && Number(fdr) < alpha) ? "row-significant" : null;
+            },
+            cellFormatFn: (col, val) => {
+                if (/p-value$/.test(col) || col === "Combined FDR" || col === "Combined Bonferroni") return _fmtSci(val, 3);
+                if (col === "Statistic") return _fmtFixed(val, 2);
+                return val;
+            },
+        }), block.table));
+        const dlBtn = el("button", { class: "btn" }, "Download combined table (CSV)");
+        dlBtn.addEventListener("click", () => downloadFile(
+            "/api/multiomics/joint/download?database=" + encodeURIComponent(db) + "&table=combined",
+            "multiomics_joint_" + db + "_combined.csv"));
+        tablePane.appendChild(dlBtn);
+        // Open one of these pathways in Cross-omics Pathway Mapping (same uploads, same cutoffs).
+        const mapRows = block.table.rows.slice(0, 200);
+        const mapSel = el("select", { class: "text-input multiomics-map-from-joint" });
+        mapRows.forEach((r) => mapSel.appendChild(el("option", { value: String(r["Term ID"]) }, r["Term Name"] + " (" + r["Term ID"] + ")")));
+        const mapBtn = el("button", { class: "btn multiomics-map-from-joint-btn" }, "Map this pathway");
+        mapBtn.addEventListener("click", () => {
+            const r = mapRows[mapSel.selectedIndex];
+            if (r) openMultiomicsMapFromJoint(db, String(r["Term ID"]), String(r["Term Name"]));
+        });
+        tablePane.appendChild(el("div", { class: "section-label", style: { marginTop: "1rem" } }, "See a pathway's members"));
+        tablePane.appendChild(el("div", { class: "caption" },
+            "Open one of the top pathways in Cross-omics Pathway Mapping to see which members each omics hit and how they connect."));
+        tablePane.appendChild(el("div", { class: "row" }, [el("div", { class: "col" }, mapSel), el("div", { class: "col" }, mapBtn)]));
+
+        if (block.partial_table && block.partial_table.rows && block.partial_table.rows.length) {
+            const partialPane = nav.pane("Partial coverage");
+            partialPane.appendChild(el("div", { class: "caption" },
+                "These pathways were tested in only some of the omics (the others have too few annotated members, or " +
+                "none), so no joint p-value is computed - a missing omics is never padded with a made-up p-value. Each " +
+                "omics' own result is shown where it exists; sorted by the best single p-value."));
+            partialPane.appendChild(_multiomicsClampMemberCells(buildTable(block.partial_table, {
+                maxHeight: 420,
+                cellFormatFn: (col, val) => (/p-value$/.test(col) ? _fmtSci(val, 3) : val),
+            }), block.partial_table));
+            const pBtn = el("button", { class: "btn" }, "Download partial-coverage table (CSV)");
+            pBtn.addEventListener("click", () => downloadFile(
+                "/api/multiomics/joint/download?database=" + encodeURIComponent(db) + "&table=partial",
+                "multiomics_joint_" + db + "_partial.csv"));
+            partialPane.appendChild(pBtn);
+        }
+
+        // ----- Charts -----
+        const dotPane = _metabolomicsChartPane(nav, slug, "Joint dot plot");
+        dotPane.el.insertBefore(el("div", { class: "ora-chart-threshold-note" },
+            "One row per pathway, most significant first. Position = -log10 of the COMBINED p-value; colour = -log10 of the " +
+            "combined FDR; a bigger circle = more of your hits fall in that pathway, summed over the omics."), dotPane.el.firstChild);
+        let dotTopN = 20, dotFont = 12, dotScale = ORA_DOT_COLOR_SCALES[0][1];
+        const dotToggle = dotPane.toggle("jointdot", "joint dot plot", (div) =>
+            buildJointDotPlot(div, block.table, block.omics_combined, slug, dotScale, { topN: dotTopN, fontSize: dotFont }));
+        dotPane.option("Colour gradient", ORA_DOT_COLOR_SCALES.map(([l, v]) => [l, v]), dotScale, (v) => { dotScale = v; dotToggle.redraw(); });
+        dotPane.option("Terms shown", [["10", "10"], ["20", "20"], ["30", "30"], ["50", "50"], ["All", "all"]], "20",
+            (v) => { dotTopN = v === "all" ? Infinity : Number(v); dotToggle.redraw(); });
+        dotPane.option("Font size", [["10", "10"], ["12", "12"], ["14", "14"], ["16", "16"], ["18", "18"]], String(dotFont),
+            (v) => { dotFont = Number(v); dotToggle.redraw(); });
+
+        const evPane = _metabolomicsChartPane(nav, slug, "Evidence by omics");
+        evPane.el.insertBefore(el("div", { class: "ora-chart-threshold-note" },
+            "Which omics drove each pathway. Each coloured circle is one omics' OWN -log10(p-value); the black diamond is the " +
+            "combined one. A diamond far to the right of every circle marks a pathway no single omics shows on its own - " +
+            "that is what combining adds. A circle at 0 means that omics saw nothing there (p = 1.0). Each pathway's row is " +
+            "split into one thin lane per omics (and one for the diamond), so markers never cover each other even when " +
+            "their p-values are identical - read the omics from the colour, and hover for its counts."), evPane.el.firstChild);
+        let evTopN = 20, evFont = 12;
+        const evToggle = evPane.toggle("jointevidence", "evidence-by-omics plot", (div) =>
+            buildJointEvidencePlot(div, block.table, block.omics_combined, slug, { topN: evTopN, fontSize: evFont }));
+        evPane.option("Terms shown", [["10", "10"], ["20", "20"], ["30", "30"], ["50", "50"], ["All", "all"]], "20",
+            (v) => { evTopN = v === "all" ? Infinity : Number(v); evToggle.redraw(); });
+        evPane.option("Font size", [["10", "10"], ["12", "12"], ["14", "14"], ["16", "16"], ["18", "18"]], String(evFont),
+            (v) => { evFont = Number(v); evToggle.redraw(); });
+        nav.finish();
+    }
+    renderPanel(dbKeys[0]);
+
+    const actions = el("div", { class: "right-actions", style: { marginTop: "1rem" } });
+    const newRun = el("button", { class: "btn" }, "Start new run");
+    newRun.addEventListener("click", () => {
+        run.locked = false;
+        run.results = null;
+        STATE.aaPage = "multiomics_config";
+        render();
+    });
+    actions.appendChild(el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, newRun));
+    wrap.appendChild(actions);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToMultiomicsActions());
+    return wrap;
+}
+
+
+// ===========================================================================
+// Multi-omics - Cross-omics Pathway Mapping
+//
+// Inside ONE pathway: which members did each omics hit, and how do they connect
+// (enzyme -> reaction -> metabolite). Descriptive - no p-value (the engine is
+// Multiomics_mapping.py). It shares the uploads / resolution of the Multi-omics
+// session with Joint Pathway Enrichment; its own state is STATE.multiomics.map.
+// ===========================================================================
+
+const MULTIOMICS_MAP_SLOT = { genomics: 0, transcriptomics: 1, proteomics: 2, metabolomics: 3 };
+const MULTIOMICS_MAP_CHIP_PX = 11;
+
+function freshMultiomicsMap() {
+    return {
+        classColors: {},
+        database: "KEGG",
+        cutoffs: { transcriptomics: { padj: 0.05, lfc: 1.0 }, proteomics: { padj: 0.05, lfc: 1.0 } },
+        pickers: {}, filter: "", busy: null, error: null, result: null, selected: null,
+    };
+}
+
+function _multiomicsNumberField(labelText, value, step, min, onChange) {
+    const col = el("div", { class: "col" });
+    col.appendChild(el("div", { class: "chart-option-label" }, labelText));
+    const input = el("input", { type: "number", class: "text-input", step: String(step), min: String(min) });
+    input.value = value;
+    input.addEventListener("change", () => {
+        const v = parseFloat(input.value);
+        if (isFinite(v) && v >= min) onChange(v); else input.value = value;
+    });
+    col.appendChild(input);
+    return col;
+}
+
+function _multiomicsMapProgress(prefix) {
+    const progressWrap = el("div", { class: "progress-wrap" });
+    progressWrap.appendChild(el("div", { class: "progress-bar-outer" },
+        el("div", { id: prefix + "-inner", class: "progress-bar-inner", style: { width: "0%" } })));
+    progressWrap.appendChild(el("div", { id: prefix + "-label", class: "progress-label" }, ""));
+    return progressWrap;
+}
+
+function _multiomicsMapOnProgress(prefix) {
+    return (job) => {
+        const bar = document.getElementById(prefix + "-inner");
+        const label = document.getElementById(prefix + "-label");
+        if (bar) bar.style.width = Math.round((job.progress || 0) * 100) + "%";
+        if (label) label.textContent = job.message || "";
+    };
+}
+
+async function listMultiomicsMapPathways() {
+    const mo = STATE.multiomics, m = mo.map;
+    m.error = null; m.result = null; m.selected = null; m.pickers = {}; m.filter = "";
+    m.busy = "picker";
+    render();
+    try {
+        const cutoffs = {};
+        mo.selected.filter((o) => MULTIOMICS_DE_OMICS.indexOf(o) !== -1).forEach((o) => { cutoffs[o] = m.cutoffs[o]; });
+        await apiPostJson("/api/multiomics/mapping/configure", { de_cutoffs: cutoffs });
+        const { job_id } = await apiPostJson("/api/multiomics/mapping/pathways", { database: m.database });
+        pollJob(job_id, {
+            onProgress: _multiomicsMapOnProgress("multiomics-map-picker-progress"),
+            onDone: (result) => { m.pickers[result.database] = result; m.busy = null; render(); },
+            onError: (err) => { m.busy = null; m.error = String(err); render(); },
+        });
+    } catch (err) {
+        m.busy = null; m.error = err.message; render();
+    }
+}
+
+async function runMultiomicsMap(database, pathwayId, pathwayName) {
+    const mo = STATE.multiomics, m = mo.map;
+    m.error = null; m.result = null; m.selected = { database, id: pathwayId, name: pathwayName };
+    m.busy = "map";
+    render();
+    try {
+        const { job_id } = await apiPostJson("/api/multiomics/mapping/run",
+            { database, pathway_id: pathwayId, pathway_name: pathwayName });
+        pollJob(job_id, {
+            onProgress: _multiomicsMapOnProgress("multiomics-map-run-progress"),
+            onDone: (result) => { m.result = result; m.busy = null; render(); },
+            onError: (err) => { m.busy = null; m.error = String(err); render(); },
+        });
+    } catch (err) {
+        m.busy = null; m.error = err.message; render();
+    }
+}
+
+// Open a pathway straight from a Joint Pathway Enrichment result (same uploads, same cutoffs).
+async function openMultiomicsMapFromJoint(database, pathwayId, pathwayName) {
+    const mo = STATE.multiomics;
+    mo.method = "mapping";
+    mo.map = freshMultiomicsMap();
+    mo.map.database = database;
+    const cfg = (mo.run && mo.run.config && mo.run.config.de_cutoffs) || {};
+    Object.keys(cfg).forEach((o) => { mo.map.cutoffs[o] = { padj: cfg[o].padj, lfc: cfg[o].lfc }; });
+    try {
+        const cutoffs = {};
+        mo.selected.filter((o) => MULTIOMICS_DE_OMICS.indexOf(o) !== -1).forEach((o) => { cutoffs[o] = mo.map.cutoffs[o]; });
+        await apiPostJson("/api/multiomics/mapping/configure", { de_cutoffs: cutoffs });
+    } catch (err) {
+        alert(err.message);
+        return;
+    }
+    STATE.aaPage = "multiomics_map";
+    await runMultiomicsMap(database, pathwayId, pathwayName);
+}
+
+function renderMultiomicsMapScreen() {
+    const mo = STATE.multiomics;
+    const wrap = el("div", { class: "ora-config-screen ora-results-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Multi-omics — Cross-omics Pathway Mapping"));
+    if (!mo || !mo.resolved) {
+        wrap.appendChild(alertBox("warning", "Resolve the identifiers first."));
+        wrap.appendChild(backToMultiomicsActions());
+        return wrap;
+    }
+    const m = mo.map;
+    const busy = !!m.busy;
+    wrap.appendChild(el("div", { class: "caption" },
+        "Inside ONE pathway: which members did each omics hit, and how do they connect - enzyme, reaction, metabolite? " +
+        "Pick a database, list the pathways your omics hit, then open one to see it drawn with your hits on it. This is " +
+        "descriptive: it computes no p-value (use Joint Pathway Enrichment for significance). A hit is decided exactly as " +
+        "there: a list is the hit set; for a differential-expression table Omiscera applies the cutoffs below, up and " +
+        "down together."));
+
+    wrap.appendChild(el("div", { class: "section-label" }, "Database"));
+    const dbSel = el("select", { class: "text-input" });
+    MULTIOMICS_DATABASES.forEach((db) => dbSel.appendChild(el("option", { value: db }, db)));
+    dbSel.value = m.database;
+    dbSel.disabled = busy;
+    dbSel.addEventListener("change", () => { m.database = dbSel.value; render(); });
+    wrap.appendChild(el("div", { class: "row" }, el("div", { class: "col" }, dbSel)));
+    if (m.database === "KEGG") {
+        wrap.appendChild(el("div", { class: "section-label" }, "KEGG organism"));
+        const holder = el("div", {});
+        wrap.appendChild(holder);
+        renderKeggOrganismWidget(holder, "multiomics");
+    } else {
+        wrap.appendChild(el("div", { class: "caption" },
+            "Reactome draws the pathway from its own diagram. Transcriptomics genes are matched to Reactome proteins through " +
+            "UniProt (via the KEGG gene map when a KEGG organism can be resolved for your organism, automatically), or by gene " +
+            "symbol when that is not possible - each match records which."));
+    }
+
+    const deSelected = mo.selected.filter((o) => MULTIOMICS_DE_OMICS.indexOf(o) !== -1);
+    if (deSelected.length) {
+        wrap.appendChild(el("div", { class: "section-label" }, "Significance cutoffs for differential-expression tables"));
+        deSelected.forEach((o) => {
+            const row = el("div", { class: "row" });
+            row.appendChild(_multiomicsNumberField(MULTIOMICS_LABELS[o] + ": adjusted p-value (padj) at most", m.cutoffs[o].padj, 0.001, 0.000001,
+                (v) => { m.cutoffs[o].padj = Math.min(v, 1); }));
+            row.appendChild(_multiomicsNumberField(MULTIOMICS_LABELS[o] + ": |log2 fold change| at least", m.cutoffs[o].lfc, 0.1, 0,
+                (v) => { m.cutoffs[o].lfc = v; }));
+            wrap.appendChild(row);
+        });
+    }
+    const listBtn = el("button", { class: "btn btn-primary ora-run-btn", style: { marginTop: "0.8rem" } }, "List pathways hit by my omics");
+    listBtn.disabled = busy;
+    listBtn.addEventListener("click", listMultiomicsMapPathways);
+    wrap.appendChild(listBtn);
+    if (m.busy === "picker") wrap.appendChild(_multiomicsMapProgress("multiomics-map-picker-progress"));
+    if (m.error) wrap.appendChild(alertBox("warning", m.error));
+
+    const picker = m.pickers[m.database];
+    if (picker) wrap.appendChild(renderMultiomicsMapPicker(m, picker));
+    if (m.busy === "map") {
+        wrap.appendChild(el("div", { class: "section-label" }, "Mapping " + ((m.selected && (m.selected.name || m.selected.id)) || "")));
+        wrap.appendChild(_multiomicsMapProgress("multiomics-map-run-progress"));
+    }
+    if (m.result) wrap.appendChild(renderMultiomicsMapResult(m.result));
+
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    const back = el("div", { class: "right-actions" });
+    const backBtn = el("button", { class: "btn" }, "Back to upload");
+    backBtn.addEventListener("click", () => { STATE.aaPage = "multiomics"; render(); });
+    back.appendChild(el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, backBtn));
+    wrap.appendChild(back);
+    wrap.appendChild(backToMultiomicsActions());
+    return wrap;
+}
+
+function renderMultiomicsMapPicker(m, picker) {
+    const wrap = el("div", { class: "multiomics-map-picker" });
+    wrap.appendChild(el("div", { class: "section-label" }, picker.database + " pathways hit by your omics (" + picker.n_pathways + ")"));
+    if (picker.caveat) wrap.appendChild(alertBox("warning", picker.caveat));
+    if (picker.note) wrap.appendChild(alertBox("info", picker.note));
+    wrap.appendChild(el("div", { class: "caption" },
+        "Ranked by how many of your omics hit the pathway, then by the total number of hits. \"hit / annotated\" is how many " +
+        "of the pathway's members that omics hit out of those it can place on the pathway. This is a coverage list, not a " +
+        "test" + (picker.has_joint_fdr ? "; the last column is the Joint Pathway Enrichment FDR from your earlier run." : ".")));
+    if (!picker.table.rows.length) {
+        wrap.appendChild(alertBox("info", "None of your omics hit any " + picker.database + " pathway."));
+        return wrap;
+    }
+    const search = el("input", { type: "text", class: "text-input multiomics-map-search", placeholder: "Search pathway name or ID" });
+    search.value = m.filter;
+    wrap.appendChild(el("div", { class: "row" }, el("div", { class: "col" }, search)));
+    const host = el("div", {});
+    wrap.appendChild(host);
+    const LIMIT = 150;
+    function draw() {
+        host.innerHTML = "";
+        const q = m.filter.trim().toLowerCase();
+        const rows = picker.table.rows.filter((r) => !q || String(r["Term Name"]).toLowerCase().indexOf(q) !== -1 ||
+            String(r["Term ID"]).toLowerCase().indexOf(q) !== -1);
+        const shown = rows.slice(0, LIMIT);
+        const tableWrap = buildTable({ columns: picker.table.columns, rows: shown }, {
+            maxHeight: 360, cellFormatFn: (col, val) => (col === "Joint combined FDR" ? _fmtSci(val, 3) : val),
+        });
+        const headRow = tableWrap.querySelector("thead tr");
+        headRow.appendChild(el("th", {}, "Map"));
+        tableWrap.querySelectorAll("tbody tr").forEach((tr, i) => {
+            const btn = el("button", { class: "btn multiomics-map-open", type: "button" }, "Map");
+            btn.disabled = !!m.busy;
+            btn.addEventListener("click", () => runMultiomicsMap(picker.database, String(shown[i]["Term ID"]), String(shown[i]["Term Name"])));
+            tr.appendChild(el("td", {}, btn));
+        });
+        host.appendChild(tableWrap);
+        host.appendChild(el("div", { class: "caption" }, rows.length > LIMIT
+            ? "Showing the first " + LIMIT + " of " + rows.length + " matching pathways - narrow the search to see others."
+            : rows.length + " pathway(s)."));
+    }
+    search.addEventListener("input", () => { m.filter = search.value; draw(); });
+    draw();
+    return wrap;
+}
+
+// ---- the map -------------------------------------------------------------
+
+function _multiomicsMapHover(node, omics) {
+    const lines = ["<b>" + _escapePlotlyText(node.label || node.id) + "</b>"];
+    omics.forEach((o) => {
+        const st = node.status[o];
+        if (!st || st.state === "absent") return;
+        const head = MULTIOMICS_LABELS[o] + ": " + (st.state === "hit" ? "hit" : "measured, not significant") +
+            (st.direction ? " (" + st.direction + ")" : "");
+        lines.push(head);
+        st.members.slice(0, 5).forEach((mem) => {
+            let t = "&nbsp;&nbsp;" + _escapePlotlyText(mem.label) + (mem.hit ? "" : " (not significant)");
+            if (mem.log2fc !== null && mem.log2fc !== undefined) t += ", log2FC " + _fmtFixed(mem.log2fc, 2);
+            if (mem.padj !== null && mem.padj !== undefined) t += ", padj " + _fmtSci(mem.padj, 2);
+            lines.push(t + " <i>[" + _escapePlotlyText(mem.via) + "]</i>");
+        });
+        if (st.members.length > 5) lines.push("&nbsp;&nbsp;... and " + (st.members.length - 5) + " more");
+    });
+    return lines.join("<br>");
+}
+
+// How a KEGG relation is drawn, by its subtype (KEGG's own conventions): an arrow for activation / expression and the
+// modifications that act on a target, a bar for inhibition / repression, a dashed arrow for an indirect effect, a plain
+// line for binding (and for the compound-mediated relations of metabolic maps), dash-dot for dissociation, dotted for a
+// missing interaction. An inhibition wins over everything else a relation says (a phosphorylation that inhibits is an
+// inhibition), then the arrows, then the plain ones.
+const MULTIOMICS_MAP_EDGE_STYLES = {
+    activate: { dash: "solid", head: "arrow", label: "activation / expression (arrow)" },
+    inhibit: { dash: "solid", head: "line-ew", label: "inhibition / repression (bar)" },
+    indirect: { dash: "dash", head: "arrow", label: "indirect effect (dashed arrow)" },
+    bind: { dash: "solid", head: null, label: "binding / other (plain)" },
+    dissoc: { dash: "dashdot", head: null, label: "dissociation (dash-dot)" },
+    missing: { dash: "dot", head: null, label: "missing interaction (dotted)" },
+};
+const MULTIOMICS_MAP_PTM = { phosphorylation: "+p", dephosphorylation: "-p", ubiquitination: "+u", glycosylation: "+g", methylation: "+m" };
+
+function _multiomicsMapStyle(types) {
+    const has = (...names) => (types || []).some((t) => names.indexOf(t) !== -1);
+    if (has("inhibition", "repression")) return "inhibit";
+    if (has("activation", "expression", "phosphorylation", "dephosphorylation", "ubiquitination", "glycosylation", "methylation", "state change")) return "activate";
+    if (has("indirect effect")) return "indirect";
+    if (has("dissociation")) return "dissoc";
+    if (has("missing interaction")) return "missing";
+    return "bind";
+}
+
+// One evidence chip per omics under each BOX, in FIXED slots (Genomics, Transcriptomics, Proteomics, Metabolomics), so a
+// box hit by several omics never has one chip on top of another. Colour = omics (the same colours as the joint evidence
+// plot); filled = hit, hollow = measured but not significant, no chip = absent. A differential-expression hit is a
+// triangle pointing up or down (diamond if its members disagree); a list hit is a circle.
+//
+// KEGG's overview maps draw a gene as a LINE along its reaction arrow instead of a box: a line gene has no chips, its
+// stroke carries the evidence - grey when untouched, darker when measured only, in the omics' colour when hit. A line
+// hit by several omics is drawn as nested strokes (widest first, one colour per omics), so none hides another at any
+// zoom. KEGG's signalling maps have no reactions but RELATIONS: drawn as arrows / bars between the boxes, dark when
+// both ends were hit, light otherwise. A group (a drawn complex) is an outline around its components.
+//
+// The map is drawn at the database's own scale (1 px per KGML / Reactome unit at 100%) inside a scroll frame, so a
+// 4,900 x 3,200 global map is a big picture to scroll around, not a heap squeezed into the page width. Chips, arrows and
+// group outlines are re-derived from the positions and the zoom by dynamic().
+function buildPathwayMapPlot(div, result, opts) {
+    if (typeof Plotly === "undefined") return;
+    opts = opts || {};
+    const nodes = result.nodes || [];
+    const omics = result.omics || [];
+    if (!nodes.length) { div.textContent = "No map available for this pathway."; return; }
+    const fontSize = opts.fontSize || 10;
+    const labelMode = opts.labels || (nodes.length > 300 ? "hits" : "evidence");
+    const byId = {};
+    nodes.forEach((n) => { byId[n.id] = n; });
+    const pos = {};
+    nodes.forEach((n) => { pos[n.id] = { x: Number(n.x), y: -Number(n.y) }; });
+    // The colour of a line gene / pathway label is that of its pathway CLASS: KEGG's own, or the one the user picked.
+    const classColor = {};
+    (result.classes || []).forEach((c) => { classColor[c.name] = (opts.classColors && opts.classColors[c.name]) || c.color; });
+    const colorOf = (n) => classColor[n.cls] || "#9AA8B6";
+
+    let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
+    const grow = (x, y) => { if (x < xmin) xmin = x; if (x > xmax) xmax = x; if (y < ymin) ymin = y; if (y > ymax) ymax = y; };
+    nodes.forEach((n) => {
+        grow(pos[n.id].x, pos[n.id].y);
+        if (n.path) for (let i = 0; i + 1 < n.path.length; i += 2) grow(n.path[i], -n.path[i + 1]);
+    });
+    const decor = result.decor_lines || [];
+    decor.forEach((p) => { for (let i = 0; i + 1 < p.length; i += 2) grow(p[i], -p[i + 1]); });
+    const widthData = xmax - xmin + 140, heightData = ymax - ymin + 140;
+    // opts.scale: "fit" (the page's width) or a number of screen pixels per map unit (1 = 100%)
+    const scaleNum = opts.scale && opts.scale !== "fit" ? Number(opts.scale) : 0;
+    const pxWidth = Math.max(div.clientWidth || 0, 900);
+    const unit = scaleNum ? 1 / scaleNum : (Math.max(xmax - xmin, 100) + 120) / pxWidth;   // data units per screen pixel (before the chart can say)
+
+    const st = (n, o) => n.status && n.status[o];
+    const hasEvidence = (n) => omics.some((o) => st(n, o) && st(n, o).state !== "absent");
+    const hasHit = (n) => omics.some((o) => st(n, o) && st(n, o).state === "hit");
+    const hitOmics = (n) => omics.filter((o) => st(n, o) && st(n, o).state === "hit");
+    const labelOn = (n) => labelMode === "all" ? true : labelMode === "none" ? false : labelMode === "hits" ? hasHit(n) : hasEvidence(n);
+    const shortLabel = (n) => { const t = String(n.label || ""); return t.length > 20 ? t.slice(0, 19) + "…" : t; };
+
+    const boxes = nodes.filter((n) => n.kind !== "link" && n.kind !== "group");
+    const lineNodes = boxes.filter((n) => n.path);
+    const markerBoxes = boxes.filter((n) => !n.path);   // boxes drawn as a marker; a line gene is drawn as its line
+    const chipBoxes = boxes;                             // every box AND every line gene carries its omics chips when hit
+    const groupNodes = nodes.filter((n) => n.kind === "group");
+    const lineMap = !!result.line_graphics;
+
+    const traces = [];
+    // 0 and 1 are always the reaction and the catalyst lines (empty on a map whose lines are the genes themselves)
+    traces.push({ x: [], y: [], mode: "lines", type: "scatter", line: { color: "#B8C4CF", width: 1.2 }, hoverinfo: "skip", showlegend: false });
+    traces.push({ x: [], y: [], mode: "lines", type: "scatter", line: { color: "#B8C4CF", width: 1, dash: "dot" }, hoverinfo: "skip", showlegend: false });
+
+    // ----- decoration + line genes -----
+    if (decor.length) {
+        const dx = [], dy = [];
+        decor.forEach((p) => { for (let i = 0; i + 1 < p.length; i += 2) { dx.push(p[i]); dy.push(-p[i + 1]); } dx.push(null); dy.push(null); });
+        traces.push({ x: dx, y: dy, mode: "lines", type: "scatter", line: { color: "#E3E8ED", width: 1 }, hoverinfo: "skip", showlegend: false });
+    }
+    const lineSpecs = [];
+    if (lineNodes.length) {
+        // colour = the pathway CLASS (KEGG's own colour for it, or the user's); strength = what your omics did there:
+        // faint = nobody had it, firmer = measured only, full strength and thick = HIT (its chips sit at its middle)
+        const rgba = (hex, a) => {
+            const h = String(hex).replace("#", "");
+            const v = parseInt(h.length === 3 ? h.split("").map((c) => c + c).join("") : h, 16);
+            return "rgba(" + ((v >> 16) & 255) + "," + ((v >> 8) & 255) + "," + (v & 255) + "," + a + ")";
+        };
+        const STATES = [["untouched", 0.32, 2], ["measured", 0.65, 2.5], ["hit", 1, 5.5]];
+        const specs = {};
+        lineNodes.forEach((n) => {
+            const state = hasHit(n) ? "hit" : hasEvidence(n) ? "measured" : "untouched";
+            const key = (n.cls || "") + "|" + state;
+            if (!specs[key]) {
+                const rank = STATES.findIndex((d) => d[0] === state);
+                specs[key] = { state: state, cls: n.cls || "", color: rgba(colorOf(n), STATES[rank][1]), width: STATES[rank][2], rank: rank, ids: [] };
+                lineSpecs.push(specs[key]);
+            }
+            specs[key].ids.push(n.id);
+        });
+        lineSpecs.sort((x, y) => x.rank - y.rank || (x.cls < y.cls ? -1 : x.cls > y.cls ? 1 : 0));
+        lineSpecs.forEach((spec) => {
+            spec.index = traces.length;
+            traces.push({ x: [], y: [], mode: "lines", type: "scatter", line: { color: spec.color, width: spec.width }, hoverinfo: "skip", showlegend: false });
+        });
+    }
+
+    // ----- groups (outlines) -----
+    let groupIndex = -1;
+    if (groupNodes.length) {
+        groupIndex = traces.length;
+        traces.push({ x: [], y: [], mode: "lines", type: "scatter", line: { color: "#A9BDD1", width: 1.5 }, hoverinfo: "skip", showlegend: false });
+    }
+    function groupBox(g) {
+        const comps = (g.components || []).map((id) => byId[id]).filter(Boolean);
+        if (!comps.length) { const p = pos[g.id]; return { x0: p.x - g.w / 2, x1: p.x + g.w / 2, y0: p.y - g.h / 2, y1: p.y + g.h / 2 }; }
+        let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+        comps.forEach((c) => {
+            const p = pos[c.id], hw = (Number(c.w) || 0) / 2 + 6, hh = (Number(c.h) || 0) / 2 + 6;
+            x0 = Math.min(x0, p.x - hw); x1 = Math.max(x1, p.x + hw); y0 = Math.min(y0, p.y - hh); y1 = Math.max(y1, p.y + hh);
+        });
+        return { x0: x0, x1: x1, y0: y0, y1: y1 };
+    }
+    const center = (n) => {
+        if (n.kind === "group") { const b = groupBox(n); return { x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2 }; }
+        return pos[n.id];
+    };
+
+    // ----- relations (signalling maps) -----
+    const relGroups = {};
+    let ptmIndex = -1;
+    const ptmRels = [];
+    const useHeads = (result.relations || []).length <= 1500;
+    (result.relations || []).forEach((r) => {
+        const a = byId[r.a], b = byId[r.b];
+        if (!a || !b) return;
+        const style = _multiomicsMapStyle(r.types);
+        const hl = hasHit(a) && hasHit(b);
+        const key = style + "|" + (hl ? "hit" : "plain");
+        if (!relGroups[key]) relGroups[key] = { style: style, hl: hl, rels: [], head: useHeads ? MULTIOMICS_MAP_EDGE_STYLES[style].head : null };
+        const rel = { a: a, b: b, text: (r.types || []).map((t) => MULTIOMICS_MAP_PTM[t] || "").join("") };
+        relGroups[key].rels.push(rel);
+        if (rel.text) ptmRels.push(rel);
+    });
+    const relList = Object.keys(relGroups).sort().map((k) => relGroups[k]);
+    relList.forEach((g) => {
+        const def = MULTIOMICS_MAP_EDGE_STYLES[g.style];
+        g.index = traces.length;
+        traces.push({
+            x: [], y: [], mode: g.head ? "lines+markers" : "lines", type: "scatter", hoverinfo: "skip", showlegend: false,
+            line: { color: g.hl ? "#1B2A41" : "#B5C0CB", width: g.hl ? 1.8 : 1.1, dash: def.dash },
+            marker: g.head ? { symbol: g.head, size: [], angleref: "previous", color: g.hl ? "#1B2A41" : "#B5C0CB", line: { width: g.head === "line-ew" ? 2 : 0, color: g.hl ? "#1B2A41" : "#B5C0CB" } } : { size: 0 },
+        });
+    });
+    if (ptmRels.length) {
+        ptmIndex = traces.length;
+        traces.push({ x: [], y: [], text: [], mode: "text", type: "scatter", textfont: { size: fontSize - 1, color: "#6B7B8C" }, hoverinfo: "skip", showlegend: false });
+    }
+
+    // ----- boxes -----
+    const addNodeTrace = (group, symbol, size, lineMode) => {
+        if (!group.length) return;
+        traces.push({
+            x: group.map((n) => pos[n.id].x), y: group.map((n) => pos[n.id].y), mode: "markers+text", type: "scatter", showlegend: false,
+            text: group.map((n) => labelOn(n) ? _escapePlotlyText(shortLabel(n)) : ""),
+            textposition: "top center", textfont: { size: fontSize, color: "#1B2A41" },
+            hovertext: group.map((n) => _multiomicsMapHover(n, omics)), hoverinfo: "text",
+            marker: lineMode ? { symbol: "circle", size: size, color: "rgba(255,255,255,0)", line: { width: 0, color: "rgba(255,255,255,0)" } } : {
+                symbol: symbol, size: size, color: group.map((n) => hasHit(n) ? "#FFFFFF" : "#EEF2F6"),
+                line: { color: group.map((n) => hasHit(n) ? "#1B2A41" : "#9AA8B6"), width: group.map((n) => hasHit(n) ? 2 : 1) },
+            },
+        });
+    };
+    addNodeTrace(lineNodes, "circle", 10, true);              // a line gene: an invisible handle at its middle, for hover and label
+    addNodeTrace(markerBoxes.filter((n) => n.kind === "gene"), "square", 12, false);
+    addNodeTrace(markerBoxes.filter((n) => n.kind === "compound"), "circle", lineMap ? 6 : 9, false);
+    addNodeTrace(markerBoxes.filter((n) => n.kind !== "gene" && n.kind !== "compound"), "diamond", 7, false);
+    const links = nodes.filter((n) => n.kind === "link");
+    if (links.length) {
+        traces.push({
+            x: links.map((n) => pos[n.id].x), y: links.map((n) => pos[n.id].y), mode: "text", type: "scatter", showlegend: false,
+            text: links.map((n) => _escapePlotlyText(shortLabel(n))), textfont: { size: fontSize - 1, color: links.map((n) => n.cls ? colorOf(n) : "#9AA8B6") },
+            hoverinfo: "skip",
+        });
+    }
+
+    // ----- evidence chips (boxes only) -----
+    const dirSymbol = (stt, o) => {
+        if (MULTIOMICS_DE_OMICS.indexOf(o) === -1) return "circle";
+        return stt.direction === "up" ? "triangle-up" : stt.direction === "down" ? "triangle-down" : stt.direction === "mixed" ? "diamond" : "circle";
+    };
+    // Positioned in DATA units, but the spacing must be a fixed number of SCREEN pixels: dynamic() re-derives them
+    // from the axis' real pixel scale once the chart is drawn, on every zoom, and on every drag.
+    const chipTraces = [];
+    omics.forEach((o) => {
+        const slot = MULTIOMICS_MAP_SLOT[o];
+        const pts = { hit: [], measured: [] };
+        chipBoxes.forEach((n) => {
+            const s = st(n, o);
+            if (!s || s.state === "absent") return;
+            pts[s.state].push({ symbol: dirSymbol(s, o), text: _multiomicsMapHover(n, [o]), id: n.id, halfData: (Number(n.h) || 0) / 2 });
+        });
+        if (pts.hit.length) {
+            chipTraces.push({ index: traces.length, slot: slot, pts: pts.hit });
+            traces.push({
+                x: [], y: [], mode: "markers", type: "scatter", name: MULTIOMICS_LABELS[o],
+                customdata: pts.hit.map((p) => p.id),
+                hovertext: pts.hit.map((p) => p.text), hoverinfo: "text", legendgroup: o,
+                marker: { size: MULTIOMICS_MAP_CHIP_PX - 2, symbol: pts.hit.map((p) => p.symbol), color: MULTIOMICS_COLORS[o], line: { color: "#FFFFFF", width: 1 } },
+            });
+        } else {
+            traces.push({ x: [null], y: [null], mode: "markers", type: "scatter", name: MULTIOMICS_LABELS[o], legendgroup: o,
+                marker: { size: MULTIOMICS_MAP_CHIP_PX - 2, color: MULTIOMICS_COLORS[o] }, hoverinfo: "skip" });
+        }
+        if (pts.measured.length) {
+            chipTraces.push({ index: traces.length, slot: slot, pts: pts.measured });
+            traces.push({
+                x: [], y: [], mode: "markers", type: "scatter",
+                customdata: pts.measured.map((p) => p.id),
+                showlegend: false, legendgroup: o, hovertext: pts.measured.map((p) => p.text), hoverinfo: "text",
+                marker: { size: MULTIOMICS_MAP_CHIP_PX - 3, symbol: "circle-open", color: MULTIOMICS_COLORS[o], line: { color: MULTIOMICS_COLORS[o], width: 2 } },
+            });
+        }
+    });
+    // legend keys for the shapes (grey: the colour already identifies the omics)
+    const legendShapes = [["measured, not significant", "circle-open"]];
+    if (chipBoxes.length) legendShapes.unshift(["up (expression omics)", "triangle-up"], ["down (expression omics)", "triangle-down"]);
+    legendShapes.forEach(([name, symbol]) => {
+        traces.push({ x: [null], y: [null], mode: "markers", type: "scatter", name: name,
+            marker: { size: 9, symbol: symbol, color: "#6B7B8C", line: { color: "#6B7B8C", width: 2 } }, hoverinfo: "skip" });
+    });
+    const stylesUsed = {};
+    relList.forEach((g) => { stylesUsed[g.style] = true; });
+    Object.keys(MULTIOMICS_MAP_EDGE_STYLES).filter((k) => stylesUsed[k]).forEach((k) => {
+        const def = MULTIOMICS_MAP_EDGE_STYLES[k];
+        traces.push({ x: [null], y: [null], mode: def.head ? "lines+markers" : "lines", type: "scatter", name: def.label, hoverinfo: "skip",
+            line: { color: "#6B7B8C", width: 1.6, dash: def.dash }, marker: { symbol: def.head || "circle", size: def.head ? 8 : 0, color: "#6B7B8C", line: { width: def.head === "line-ew" ? 2 : 0, color: "#6B7B8C" } } });
+    });
+    if (relList.some((g) => g.hl)) {
+        traces.push({ x: [null], y: [null], mode: "lines", type: "scatter", name: "relation with BOTH ends hit (dark)", hoverinfo: "skip", line: { color: "#1B2A41", width: 2.2 } });
+    }
+
+    // ----- everything that depends on where the boxes are (and, for the chips and arrows, on the zoom) -----
+    function ppuNow() {
+        const xa = div._fullLayout && div._fullLayout.xaxis;
+        const v = xa && typeof xa.l2p === "function" ? Math.abs(xa.l2p(1) - xa.l2p(0)) : NaN;
+        return isFinite(v) && v > 0 ? v : 1 / unit;
+    }
+    function radiusPx(n, ppu) {
+        if (n.kind === "group") { const b = groupBox(n); return Math.min(60, Math.max(b.x1 - b.x0, b.y1 - b.y0) / 2 * ppu); }
+        if (n.kind === "compound") return 5;
+        if (n.path) return 4;
+        return Math.min(40, Math.max(6, Math.max(Number(n.w) || 0, Number(n.h) || 0) / 2 * ppu));
+    }
+    function dynamic(scope) {
+        const ppu = ppuNow();
+        const out = [];
+        if (scope === "all") {
+            const rx = [], ry = [], cxs = [], cys = [];
+            if (!lineMap) {
+                (result.reactions || []).forEach((r) => {
+                    const subs = r.substrates.map((i) => byId[i]).filter(Boolean);
+                    const prods = r.products.map((i) => byId[i]).filter(Boolean);
+                    const enz = r.enzymes.map((i) => byId[i]).filter(Boolean);
+                    if (r.pos) {
+                        const px = Number(r.pos[0]), py = -Number(r.pos[1]);
+                        (r.segments || []).forEach((s) => { rx.push(s[0], s[2], null); ry.push(-s[1], -s[3], null); });
+                        subs.concat(prods).forEach((n) => { rx.push(pos[n.id].x, px, null); ry.push(pos[n.id].y, py, null); });
+                        enz.forEach((n) => { cxs.push(pos[n.id].x, px, null); cys.push(pos[n.id].y, py, null); });
+                    } else {
+                        subs.forEach((s) => prods.forEach((p) => { rx.push(pos[s.id].x, pos[p.id].x, null); ry.push(pos[s.id].y, pos[p.id].y, null); }));
+                    }
+                });
+            }
+            out.push({ index: 0, x: rx, y: ry }, { index: 1, x: cxs, y: cys });
+            lineSpecs.forEach((spec) => {
+                const X = [], Y = [];
+                spec.ids.forEach((id) => {
+                    const n = byId[id];
+                    for (let i = 0; i + 1 < n.path.length; i += 2) { X.push(n.path[i]); Y.push(-n.path[i + 1]); }
+                    X.push(null); Y.push(null);
+                });
+                out.push({ index: spec.index, x: X, y: Y });
+            });
+            if (groupIndex >= 0) {
+                const X = [], Y = [];
+                groupNodes.forEach((g) => { const b = groupBox(g); X.push(b.x0, b.x1, b.x1, b.x0, b.x0, null); Y.push(b.y0, b.y0, b.y1, b.y1, b.y0, null); });
+                out.push({ index: groupIndex, x: X, y: Y });
+            }
+        }
+        relList.forEach((g) => {
+            const X = [], Y = [], S = [];
+            g.rels.forEach((r) => {
+                const A = center(r.a), B = center(r.b), dx = B.x - A.x, dy = B.y - A.y, dist = Math.hypot(dx, dy);
+                const back = (radiusPx(r.b, ppu) + 2) / ppu;       // stop short of the target's box so the head is not hidden under it
+                if (!(dist > back * 1.05)) return;
+                X.push(A.x, B.x - dx / dist * back, null); Y.push(A.y, B.y - dy / dist * back, null);
+                S.push(0, g.head ? 9 : 0, 0);
+            });
+            out.push({ index: g.index, x: X, y: Y, size: g.head ? S : null });
+        });
+        if (ptmIndex >= 0) {
+            out.push({ index: ptmIndex, x: ptmRels.map((r) => (center(r.a).x + center(r.b).x) / 2), y: ptmRels.map((r) => (center(r.a).y + center(r.b).y) / 2 + 6 / ppu),
+                       text: ptmRels.map((r) => r.text) });
+        }
+        chipTraces.forEach((ct) => {
+            out.push({
+                index: ct.index,
+                x: ct.pts.map((q) => pos[q.id].x + (ct.slot - 1.5) * MULTIOMICS_MAP_CHIP_PX / ppu),
+                y: ct.pts.map((q) => pos[q.id].y - Math.max(q.halfData, 7 / ppu) - 7 / ppu),
+            });
+        });
+        return out;
+    }
+    function applyDirect(out, target) {
+        out.forEach((o) => {
+            const t = target[o.index];
+            t.x = o.x; t.y = o.y;
+            if (o.size) t.marker.size = o.size;
+            if (o.text) t.text = o.text;
+        });
+    }
+    function applyRestyle(out) {
+        if (!out.length) return;
+        const idx = out.map((o) => o.index);
+        Plotly.restyle(div, { x: out.map((o) => o.x), y: out.map((o) => o.y) }, idx);
+        const sized = out.filter((o) => o.size);
+        if (sized.length) Plotly.restyle(div, { "marker.size": sized.map((o) => o.size) }, sized.map((o) => o.index));
+        const texted = out.filter((o) => o.text);
+        if (texted.length) Plotly.restyle(div, { text: texted.map((o) => o.text) }, texted.map((o) => o.index));
+    }
+    applyDirect(dynamic("all"), traces);
+
+    let width, height;
+    if (scaleNum) {
+        width = Math.round(widthData * scaleNum) + 20;
+        height = Math.round(heightData * scaleNum) + 70;
+        div.style.width = width + "px";
+    } else {
+        width = undefined;
+        height = Math.min(1400, Math.max(480, Math.round(heightData / widthData * pxWidth) + 80));
+    }
+    const layout = {
+        font: { size: fontSize },
+        hovermode: "closest", dragmode: "pan",
+        xaxis: { visible: false, zeroline: false, showgrid: false, range: [xmin - 70, xmax + 70] },
+        yaxis: { visible: false, zeroline: false, showgrid: false, scaleanchor: "x", scaleratio: 1, range: [ymin - 70, ymax + 70] },
+        plot_bgcolor: "#FAFCFE", paper_bgcolor: "#FAFCFE",
+        margin: { l: 10, r: 10, t: 60, b: 10 }, height: height,
+        legend: { orientation: "h", y: 1.0, yanchor: "bottom", x: 0 },
+    };
+    if (scaleNum) { layout.width = width; layout.autosize = false; }
+    div._mapPos = pos;
+    div._mapHome = { x: [xmin - 70, xmax + 70], y: [ymin - 70, ymax + 70] };   // what "Reset axes" returns to
+    _newOraPlot(div, traces, layout, "multiomics-map", null, "pathwaymap", "Pathway map", () => {
+        div._mapReady = true;   // Plotly has finished drawing (div._fullLayout exists long before that)
+        applyRestyle(dynamic("zoom"));
+        if (div.removeAllListeners) div.removeAllListeners("plotly_relayout");
+        if (div.on) div.on("plotly_relayout", () => applyRestyle(dynamic("zoom")));
+    }, scaleNum ? { responsive: false, scrollZoom: false } : { scrollZoom: true });
+}
+
+// Default size: 100% when the map is wider than the page (a global map), the page's width otherwise.
+function _multiomicsMapDefaultScale(result) {
+    let xmin = Infinity, xmax = -Infinity;
+    (result.nodes || []).forEach((n) => {
+        if (Number(n.x) < xmin) xmin = Number(n.x);
+        if (Number(n.x) > xmax) xmax = Number(n.x);
+        if (n.path) for (let i = 0; i < n.path.length; i += 2) { if (n.path[i] < xmin) xmin = n.path[i]; if (n.path[i] > xmax) xmax = n.path[i]; }
+    });
+    return xmax - xmin > 1300 ? "1" : "fit";
+}
+
+function renderMultiomicsMapResult(result) {
+    const card = el("div", { class: "rank-card ora-db-card ora-result-card ora-db-card-multiomics-map multiomics-map-result" });
+    const heading = el("div", { class: "section-label" },
+        result.pathway_name + " (" + result.pathway_id + ", " + result.database + ")");
+    const outer = el("div", {});
+    outer.appendChild(heading);
+    outer.appendChild(card);
+
+    if (result.status === "overview") {
+        // Reactome draws this pathway only as links to its sub-pathways: nothing to put a hit on. List them.
+        card.appendChild(alertBox("info", result.note || "This is an overview pathway: it has no genes or compounds of its own."));
+        const sub = result.subpathways || { columns: [], rows: [] };
+        card.appendChild(el("div", { class: "caption" },
+            "Ranked by how many of your omics hit each sub-pathway, then by the total number of hits (\"hit / annotated\" as in the " +
+            "pathway list; a sub-pathway with no hit shows 0 / -). Map one to see its diagram with your hits on it."));
+        const tableWrap = buildTable({ columns: sub.columns, rows: sub.rows }, {
+            maxHeight: 420, cellFormatFn: (col, val) => (col === "Joint combined FDR" ? _fmtSci(val, 3) : val),
+        });
+        tableWrap.querySelector("thead tr").appendChild(el("th", {}, "Map"));
+        tableWrap.querySelectorAll("tbody tr").forEach((tr, i) => {
+            const btn = el("button", { class: "btn multiomics-map-open multiomics-map-open-sub", type: "button" }, "Map");
+            btn.addEventListener("click", () => runMultiomicsMap(result.database, String(sub.rows[i]["Term ID"]), String(sub.rows[i]["Term Name"])));
+            tr.appendChild(el("td", {}, btn));
+        });
+        card.appendChild(tableWrap);
+        return outer;
+    }
+    if (result.status !== "ok") {
+        card.appendChild(alertBox("warning", result.note || "This pathway could not be mapped."));
+        return outer;
+    }
+    const omics = result.omics;
+    const hasRelations = (result.relations || []).length > 0;
+    const hasReactions = (result.reactions || []).length > 0;
+    const nav = makeResultNav(card, { stateKey: "multiomics_map" });
+
+    const mapPane = nav.pane("Pathway map");
+    mapPane.appendChild(el("div", { class: "ora-chart-threshold-note" },
+        "Each box is a gene / protein (square) or a metabolite (circle) at " + result.database + "'s own position. Under every box " +
+        "sit up to four coloured chips, always in the same order - Genomics, Transcriptomics, Proteomics, Metabolomics - so a " +
+        "member hit by several omics never hides one: filled = hit, hollow = measured but not significant, no chip = not in " +
+        "that omics. A triangle shows the direction in a differential-expression table (a diamond = its members disagree); " +
+        "a plain circle is a list hit. On KEGG's overview maps a gene is a LINE, coloured by its pathway CLASS (the legend " +
+        "below the menus; pick another colour for a class if you like): faint = no omics had it, firmer = measured only, full " +
+        "colour and thick = hit - and a hit line carries the same four chips at its middle. On signalling maps the lines between boxes are KEGG's own " +
+        "relations - an arrow activates, a bar inhibits, dashed is indirect - dark when both ends were hit. Hover a box for " +
+        "its members, log2FC, padj and how each was matched. A big map is drawn at its own size inside a frame you scroll; the " +
+        "Size menu changes that."));
+    const bar = el("div", { class: "row multiomics-map-toolbar" });
+    const labelSel = el("select", { class: "text-input multiomics-map-labels" });
+    [["Labels: hits and measured", "evidence"], ["Labels: hits only", "hits"], ["Labels: every box", "all"], ["Labels: none", "none"]]
+        .forEach(([lab, val]) => labelSel.appendChild(el("option", { value: val }, lab)));
+    labelSel.value = (result.nodes || []).length > 300 ? "hits" : "evidence";
+    const sizeSel = el("select", { class: "text-input multiomics-map-size" });
+    [["Size: fit to page", "fit"], ["Size: 50%", "0.5"], ["Size: 75%", "0.75"], ["Size: 100% (database scale)", "1"], ["Size: 150%", "1.5"], ["Size: 200%", "2"]]
+        .forEach(([lab, val]) => sizeSel.appendChild(el("option", { value: val }, lab)));
+    sizeSel.value = _multiomicsMapDefaultScale(result);
+    const dlMapBtn = el("button", { class: "btn multiomics-map-download", type: "button" }, "Download map");
+    bar.appendChild(el("div", { class: "col" }, labelSel));
+    bar.appendChild(el("div", { class: "col" }, sizeSel));
+    bar.appendChild(el("div", { class: "col" }, dlMapBtn));
+    mapPane.appendChild(bar);
+
+    // The chart's own toolbar (zoom, pan, autoscale, reset axes) sits at the chart's right edge, which is far off-screen on
+    // a big map drawn at its own size. The same tools, working on the same chart, are repeated here for that case.
+    const toolsRow = el("div", { class: "chart-toggle-row multiomics-map-tools" });
+    const chartNow = () => { const d = document.getElementById("multiomics-pathway-map"); return d && d._fullLayout ? d : null; };
+    const zoomBy = (f) => {
+        const d = chartNow();
+        if (!d) return;
+        const x = d._fullLayout.xaxis.range, y = d._fullLayout.yaxis.range;
+        const cx = (x[0] + x[1]) / 2, cy = (y[0] + y[1]) / 2, hx = (x[1] - x[0]) / 2 * f, hy = (y[1] - y[0]) / 2 * f;
+        Plotly.relayout(d, { "xaxis.range": [cx - hx, cx + hx], "yaxis.range": [cy - hy, cy + hy] });
+    };
+    [["Zoom tool", "multiomics-map-tool-zoom", () => { const d = chartNow(); if (d) Plotly.relayout(d, { dragmode: "zoom" }); }],
+     ["Pan tool", "multiomics-map-tool-pan", () => { const d = chartNow(); if (d) Plotly.relayout(d, { dragmode: "pan" }); }],
+     ["Zoom in", "multiomics-map-tool-in", () => zoomBy(0.5)],
+     ["Zoom out", "multiomics-map-tool-out", () => zoomBy(2)],
+     ["Autoscale", "multiomics-map-tool-auto", () => { const d = chartNow(); if (d) Plotly.relayout(d, { "xaxis.autorange": true, "yaxis.autorange": true }); }],
+     ["Reset axes", "multiomics-map-tool-reset", () => {
+         const d = chartNow();
+         if (d && d._mapHome) Plotly.relayout(d, { "xaxis.range": d._mapHome.x, "yaxis.range": d._mapHome.y });
+     }],
+    ].forEach(([label, cls, fn]) => {
+        const b = el("button", { class: "btn chart-toggle-btn " + cls, type: "button" }, label);
+        b.style.width = "auto"; b.style.flex = "0 0 auto"; b.style.padding = "0.35rem 1rem";
+        b.addEventListener("click", fn);
+        toolsRow.appendChild(b);
+    });
+    mapPane.appendChild(toolsRow);
+
+    const mo = STATE.multiomics;
+    mo.map.classColors = mo.map.classColors || {};
+    const classes = result.classes || [];
+    const legend = el("div", { class: "chart-toggle-row chart-color-row multiomics-map-classes" });
+    if (classes.length) {
+        mapPane.appendChild(el("div", { class: "chart-option-label" }, "Pathway classes (KEGG's colour for each; choose another to recolour that class)"));
+        classes.forEach((c) => {
+            const control = el("label", { class: "chart-option-control chart-color-control" });
+            control.style.flex = "0 0 auto";   // the class names are long: never squeeze them into the 240px a colour control gets elsewhere
+            control.appendChild(el("span", { class: "chart-option-label" }, c.name + " (" + c.n_hit + " hit of " + c.n_lines + ")"));
+            const input = el("input", { type: "color", class: "chart-option-color", "data-class": c.name });
+            input.value = mo.map.classColors[c.name] || c.color;
+            let timer = null;
+            input.addEventListener("input", () => {
+                mo.map.classColors[c.name] = input.value;
+                clearTimeout(timer);
+                timer = setTimeout(rebuild, 250);
+            });
+            control.appendChild(input);
+            legend.appendChild(control);
+        });
+        const resetColors = el("button", { class: "btn multiomics-map-class-reset", type: "button" }, "KEGG colours");
+        resetColors.style.width = "auto"; resetColors.style.flex = "0 0 auto"; resetColors.style.padding = "0.35rem 1rem";
+        resetColors.addEventListener("click", () => {
+            mo.map.classColors = {};
+            legend.querySelectorAll("input[type=color]").forEach((inp) => { inp.value = (classes.find((c) => c.name === inp.getAttribute("data-class")) || {}).color || inp.value; });
+            rebuild();
+        });
+        legend.appendChild(resetColors);
+        mapPane.appendChild(legend);
+    }
+
+    const holder = el("div", { class: "multiomics-map-frame" });
+    function applyFrame() {
+        // A numeric size is a big picture to scroll around in a frame; "fit" is the page's width as before.
+        toolsRow.style.display = sizeSel.value === "fit" ? "none" : "";   // at "fit" the chart's own toolbar is in view
+        holder.style.overflow = sizeSel.value === "fit" ? "visible" : "auto";
+        holder.style.maxHeight = sizeSel.value === "fit" ? "" : "80vh";
+        holder.style.border = sizeSel.value === "fit" ? "" : "1px solid #D5DEE7";
+    }
+    applyFrame();
+    const mapDiv = el("div", { class: "chart-container", id: "multiomics-pathway-map" });
+    holder.appendChild(mapDiv);
+    mapPane.appendChild(holder);
+    const chartOpts = () => ({ labels: labelSel.value, scale: sizeSel.value, classColors: mo.map.classColors });
+    // Drawn after the screen is in the DOM (a detached div has no width, and the chips' spacing is in screen pixels).
+    scheduleChart("multiomics-pathway-map", (div) => buildPathwayMapPlot(div, result, chartOpts()));
+    function rebuild() {
+        // A fresh element, not a redraw of the old one: the old chart is purged and the new one sized from scratch.
+        const old = holder.firstChild;
+        if (old && typeof Plotly !== "undefined") { try { Plotly.purge(old); } catch (e) { /* not a plot */ } }
+        holder.innerHTML = "";
+        applyFrame();
+        const fresh = el("div", { class: "chart-container", id: "multiomics-pathway-map" });
+        holder.appendChild(fresh);
+        buildPathwayMapPlot(fresh, result, chartOpts());
+    }
+    labelSel.addEventListener("change", rebuild);
+    sizeSel.addEventListener("change", rebuild);
+    dlMapBtn.addEventListener("click", () => {
+        // The chart's own toolbar can be off-screen on a 4,900 px chart, so the download lives here.
+        const d = document.getElementById("multiomics-pathway-map");
+        if (d && typeof _showOraChartExportMenu === "function") {
+            _showOraChartExportMenu(d, "multiomics-map", null, "pathwaymap", "Pathway map");
+            // the menu is placed at the chart's right edge, which is far off-screen on a big map: put it under the button
+            const menu = document.querySelector(".ora-chart-export-menu");
+            if (menu) {
+                const r = dlMapBtn.getBoundingClientRect();
+                menu.style.top = (r.bottom + window.scrollY + 4) + "px";
+                menu.style.left = Math.max(8, r.left + window.scrollX) + "px";
+            }
+        }
+    });
+
+    const membersPane = nav.pane("Members");
+    membersPane.appendChild(el("div", { class: "caption" },
+        "Every member of this pathway that one of your omics measured or hit, one row per omics. \"measured, not significant\" " +
+        "means the omics saw it but it did not pass the cutoffs. KEGG sometimes draws the same gene in several boxes; \"Box ID\" " +
+        "tells them apart."));
+    if (result.members.rows.length) {
+        membersPane.appendChild(buildTable(result.members, {
+            maxHeight: 480,
+            cellFormatFn: (col, val) => (col === "padj" ? _fmtSci(val, 3) : col === "log2FC" ? _fmtFixed(val, 2) : val),
+        }));
+        const dl = el("button", { class: "btn" }, "Download members (CSV)");
+        dl.addEventListener("click", () => downloadFile("/api/multiomics/mapping/download?table=members",
+            "multiomics_mapping_" + result.pathway_id + "_members.csv"));
+        membersPane.appendChild(dl);
+    } else {
+        membersPane.appendChild(alertBox("info", "None of your omics' members could be placed on this pathway."));
+    }
+
+    if (hasReactions || !hasRelations) {
+        const linksPane = nav.pane("Reaction links");
+        linksPane.appendChild(el("div", { class: "caption" },
+            "Reactions with evidence from more than one angle: the enzyme was hit by a gene / protein omics AND a substrate or " +
+            "product was hit by Metabolomics, or the enzyme was hit in two or more omics. Direction is reported for the " +
+            "differential-expression omics only (a compound list has none). Descriptive - not a test."));
+        if (result.links.rows.length) {
+            linksPane.appendChild(buildTable(result.links, { maxHeight: 420 }));
+            const dl2 = el("button", { class: "btn" }, "Download reaction links (CSV)");
+            dl2.addEventListener("click", () => downloadFile("/api/multiomics/mapping/download?table=links",
+                "multiomics_mapping_" + result.pathway_id + "_links.csv"));
+            linksPane.appendChild(dl2);
+        } else {
+            linksPane.appendChild(alertBox("info", "No reaction in this pathway has cross-omics evidence for your data."));
+        }
+    }
+
+    if (hasRelations) {
+        const intPane = nav.pane("Interaction links");
+        intPane.appendChild(el("div", { class: "caption" },
+            "KEGG's own relations between this map's members (activation, inhibition, binding, phosphorylation, ...) whose BOTH ends " +
+            "were hit by some omics. The relation is KEGG's statement; that both ends were hit is what your data adds. Descriptive - " +
+            "not a test."));
+        const ints = result.interactions || { columns: [], rows: [] };
+        if (ints.rows.length) {
+            intPane.appendChild(buildTable(ints, { maxHeight: 420 }));
+            const dl3 = el("button", { class: "btn" }, "Download interaction links (CSV)");
+            dl3.addEventListener("click", () => downloadFile("/api/multiomics/mapping/download?table=interactions",
+                "multiomics_mapping_" + result.pathway_id + "_interactions.csv"));
+            intPane.appendChild(dl3);
+        } else {
+            intPane.appendChild(alertBox("info", "No relation in this pathway has both of its ends hit by your omics."));
+        }
+    }
+
+    const overview = nav.pane("Overview");
+    if (result.caveat) overview.appendChild(alertBox("warning", result.caveat));
+    if (result.note) overview.appendChild(alertBox("info", result.note));
+    if (result.restricted_to) {
+        overview.appendChild(alertBox("info", "This pathway has no diagram of its own in Reactome; it is drawn inside \"" +
+            result.restricted_to + "\", showing only this pathway's own reactions."));
+    }
+    const s = result.summary;
+    overview.appendChild(metricCards(hasRelations ? [
+        ["Boxes on the map", s.n_nodes], ["Boxes hit by any omics", s.n_nodes_with_hit], ["Cross-omics reaction links", s.n_links],
+        ["Interaction links", s.n_interactions],
+    ] : [
+        ["Boxes on the map", s.n_nodes], ["Boxes hit by any omics", s.n_nodes_with_hit], ["Cross-omics reaction links", s.n_links],
+    ], hasRelations ? 4 : 3));
+    overview.appendChild(buildTable({
+        columns: ["Omics", "Boxes hit", "Boxes measured only", "Members hit"],
+        rows: omics.map((o) => ({
+            "Omics": MULTIOMICS_LABELS[o], "Boxes hit": s.per_omics[o].nodes_hit,
+            "Boxes measured only": s.per_omics[o].nodes_measured_only, "Members hit": s.per_omics[o].members_hit,
+        })),
+    }, {}));
+    overview.appendChild(el("div", { class: "caption" },
+        "\"Boxes measured only\" counts boxes where the omics saw a member but none passed the cutoffs; a plain list (Genomics, " +
+        "Metabolomics) has no such state. A box is hit if ANY of its members is - a KEGG box can hold several genes and a " +
+        "Reactome box a whole complex. \"Members hit\" counts each gene once even where KEGG draws it in several boxes. A cofactor " +
+        "inside a Reactome complex never makes the complex a metabolite hit."));
+    nav.finish();
+    return outer;
+}
+
+
+// ===========================================================================
+// Multi-omics - Correlation-based Integration
+//
+// Two questions over SAMPLE x FEATURE tables (the same samples in every file): how well does each gene's transcript
+// track its protein (same-gene concordance), and which features of different omics move together (cross-omics pairs,
+// as a table, a heatmap and a network). The statistics are in Multiomics_correlation.py; this is only the screens.
+// State: STATE.multiomics.corr. Genomics (a gene list) cannot take part.
+// ===========================================================================
+
+const CORR_OMICS = [["transcriptomics", "Transcriptomics"], ["proteomics", "Proteomics"], ["metabolomics", "Metabolomics"]];
+const CORR_EXAMPLE_FILES = {
+    transcriptomics: "example_corr_transcriptomics.csv", proteomics: "example_corr_proteomics.csv",
+    metabolomics: "example_corr_metabolomics.csv",
+};
+const CORR_UPLOAD_HELP = {
+    transcriptomics:
+        "A table of expression values: one row per gene (first column = the gene identifier: symbol, Ensembl or Entrez ID) and one " +
+        "column per SAMPLE. Use values already normalised (log2 CPM / TPM / VST); raw counts need the log2 option on the setup step.",
+    proteomics:
+        "A table of protein abundances: one row per protein (first column = UniProt accession) and one column per SAMPLE. Use " +
+        "normalised, log-scaled intensities. Missing values are fine (a protein missing in more than 20% of the samples is dropped).",
+    metabolomics:
+        "A table of concentrations or intensities: one row per SAMPLE and one column per compound (first column = the sample id; a " +
+        "Group column, if present, is set aside), or the other way round. Compounds are correlated by the name you wrote.",
+};
+const CORR_METHODS = [["Spearman (rank) - the default, robust to outliers and to the scale of the data", "spearman"],
+                      ["Pearson (linear) - for data that are already roughly normal on a log scale", "pearson"]];
+const CORR_ORIENTATIONS = [["Orientation: detect automatically", "auto"], ["Samples are in the COLUMNS", "columns"], ["Samples are in the ROWS", "rows"]];
+
+function freshCorrState() {
+    return {
+        selected: [], taxonId: "", taxonName: "", uploads: {}, alignment: null, caseInsensitive: false,
+        draft: null, run: { results: null, busy: false }, selectedPair: null, heatScale: "redblue", heatFlip: false,
+    };
+}
+
+// A pill is an inline <label>: its padding does not push the neighbours down (it overlapped the select above it and the field
+// labels below it). Inside a block of its own it takes its real height.
+function corrPillBlock(pill) {
+    pill.style.display = "inline-flex";
+    pill.style.alignItems = "center";
+    pill.style.gap = "0.55rem";
+    return el("div", { style: { margin: "0.8rem 0" } }, pill);
+}
+
+function _corrClearDownstream() {
+    const c = STATE.multiomics.corr;
+    c.alignment = null;
+    c.run = { results: null, busy: false };
+    _mofaReset();   // a MOFA setup / result belongs to the tables that were matched
+    _diabloReset(); // ...and so does a DIABLO one
+}
+
+function _corrNumberField(labelText, value, step, min, max, onChange) {
+    const col = el("div", { class: "col" });
+    col.appendChild(el("div", { class: "chart-option-label" }, labelText));
+    const input = el("input", { type: "number", class: "text-input", step: String(step), min: String(min), max: String(max) });
+    input.value = value;
+    input.addEventListener("change", () => {
+        const v = parseFloat(input.value);
+        if (isFinite(v) && v >= min && v <= max) onChange(v); else input.value = value;
+    });
+    col.appendChild(input);
+    return col;
+}
+
+function renderCorrOrganismSelector() {
+    const corr = STATE.multiomics.corr;
+    const wrap = el("div", {});
+    const input = el("input", { class: "text-input", type: "text", placeholder: "Species / organism (name or UniProt taxon ID)" });
+    const resultsSelect = el("select", { class: "hidden" });
+    const selectedCaption = el("div", { class: "caption" });
+    selectedCaption.textContent = corr.taxonId ? "Selected: " + corr.taxonName + " (taxon " + corr.taxonId + ")" : "";
+    let lastQuery = "", timer = null;
+    input.addEventListener("input", () => {
+        const query = input.value.trim();
+        if (timer) clearTimeout(timer);
+        if (query.length < 3) { resultsSelect.innerHTML = ""; resultsSelect.classList.add("hidden"); return; }
+        timer = setTimeout(async () => {
+            if (query === lastQuery) return;
+            lastQuery = query;
+            try {
+                const data = await apiJson("/api/contexts/search?database=" + encodeURIComponent("Rhea + UniProt") +
+                    "&query=" + encodeURIComponent(query) + "&limit=10");
+                resultsSelect.innerHTML = "";
+                resultsSelect.appendChild(el("option", { value: "" }, "Select organism"));
+                const records = data.results || [];
+                records.forEach((rec, idx) => resultsSelect.appendChild(el("option", { value: String(idx) },
+                    rec.context_id && rec.context_name ? rec.context_id + " | " + rec.context_name : (rec.context_name || rec.context_id || ""))));
+                resultsSelect._records = records;
+                resultsSelect.classList.toggle("hidden", records.length === 0);
+            } catch (err) { /* keep the previous list on a transient error */ }
+        }, 350);
+    });
+    resultsSelect.addEventListener("change", () => {
+        if (resultsSelect.value === "") return;
+        const rec = resultsSelect._records[parseInt(resultsSelect.value, 10)];
+        const id = String(rec.context_id || "");
+        if (corr.alignment && id !== corr.taxonId) _corrClearDownstream();
+        corr.taxonId = id;
+        corr.taxonName = String(rec.context_name || "");
+        render();
+    });
+    wrap.appendChild(input);
+    wrap.appendChild(resultsSelect);
+    wrap.appendChild(selectedCaption);
+    return wrap;
+}
+
+function renderCorrOmicsPicker() {
+    const corr = STATE.multiomics.corr;
+    const wrap = el("div", {});
+    wrap.appendChild(el("div", { class: "section-label" }, "Omics to correlate"));
+    const row = el("div", { class: "db-checkbox-row" });
+    CORR_OMICS.forEach(([key, label]) => {
+        const pill = el("label", { class: "ora-db-pill" });
+        const cb = el("input", { type: "checkbox", class: "ora-db-checkbox" });
+        cb.checked = corr.selected.indexOf(key) !== -1;
+        cb.addEventListener("change", async () => {
+            const next = CORR_OMICS.map(([k]) => k).filter((k) => k === key ? cb.checked : corr.selected.indexOf(k) !== -1);
+            if (next.length >= 2) {
+                try {
+                    await apiPostJson("/api/multiomics/correlation/select", { omics_types: next });
+                } catch (err) { alert(err.message); cb.checked = !cb.checked; return; }
+            }
+            corr.selected.filter((k) => next.indexOf(k) === -1).forEach((k) => { delete corr.uploads[k]; });
+            corr.selected = next;
+            _corrClearDownstream();
+            render();
+        });
+        pill.appendChild(cb);
+        pill.appendChild(document.createTextNode(" " + label));
+        row.appendChild(pill);
+    });
+    const gen = el("label", { class: "ora-db-pill", title: "A gene list has no values per sample, so it cannot be correlated." });
+    const gcb = el("input", { type: "checkbox", class: "ora-db-checkbox" });
+    gcb.disabled = true;
+    gen.appendChild(gcb);
+    gen.appendChild(document.createTextNode(" Genomics (a gene list - cannot be correlated)"));
+    gen.style.opacity = "0.5";
+    row.appendChild(gen);
+    wrap.appendChild(row);
+    wrap.appendChild(el("div", { class: "caption" }, STATE.multiomics.method === "diablo"
+        ? "DIABLO needs a table of VALUES per sample, with the same samples in every file. Choose at least two omics."
+        : STATE.multiomics.method === "mofa"
+        ? "MOFA needs a table of VALUES per sample, with the same samples in every file. Choose at least two omics."
+        : "Correlation needs a table of VALUES per sample, with the same samples in every file. Choose at least two omics."));
+    return wrap;
+}
+
+function renderCorrUploadSection(omics) {
+    const corr = STATE.multiomics.corr;
+    const label = MULTIOMICS_LABELS[omics];
+    const up = corr.uploads[omics];
+    const wrap = el("div", { class: "multiomics-corr-upload", "data-omics": omics });
+    wrap.appendChild(el("div", { class: "section-label" }, label + " - samples x features table"));
+    async function send(file, orientation) {
+        const formData = new FormData();
+        formData.append("file", file);
+        formData.append("orientation", orientation);
+        try {
+            const data = await apiUpload("/api/multiomics/correlation/" + omics + "/upload", formData);
+            corr.uploads[omics] = { filename: file.name, file: file, orientation: orientation, info: data };
+            _corrClearDownstream();
+            render();
+        } catch (err) { alert(err.message); }
+    }
+    wrap.appendChild(fileInputWidget({
+        accept: ".csv,.tsv,.txt", buttonLabel: "Choose table", initialFilename: up ? up.filename : "",
+        onChange: (file) => { if (file) send(file, up ? up.orientation : "auto"); },
+    }));
+    const orientSel = el("select", { class: "text-input multiomics-corr-orientation" });
+    CORR_ORIENTATIONS.forEach(([lab, val]) => orientSel.appendChild(el("option", { value: val }, lab)));
+    orientSel.value = up ? up.orientation : "auto";
+    orientSel.addEventListener("change", () => {
+        if (up && up.file) send(up.file, orientSel.value);
+        else if (up) up.orientation = orientSel.value;
+    });
+    wrap.appendChild(el("div", { class: "row" }, el("div", { class: "col" }, orientSel)));
+    wrap.appendChild(el("div", { class: "caption" }, CORR_UPLOAD_HELP[omics]));
+    const exLink = el("button", { class: "ora-inline-example-link", type: "button" }, "Example file");
+    // MOFA mode: the 36-sample examples (the correlation examples have 12 samples, too few for MOFA)
+    const mofaLikeMode = STATE.multiomics.method === "mofa" || STATE.multiomics.method === "diablo";
+    exLink.addEventListener("click", () => mofaLikeMode
+        ? downloadFile("/api/multiomics/mofa/example?omics_type=" + omics, MOFA_EXAMPLE_FILES[omics])
+        : downloadFile("/api/multiomics/correlation/example?omics_type=" + omics, CORR_EXAMPLE_FILES[omics]));
+    wrap.appendChild(exLink);
+    if (up) {
+        const i = up.info;
+        let text = "Read " + i.n_samples + " samples x " + i.n_features + " features; " +
+            (i.orientation === "columns" ? "samples are in the columns" : "samples are in the rows") + " (" + i.orientation_reason + ").";
+        if (i.set_aside_columns && i.set_aside_columns.length) text += " Set aside (not numbers): " + i.set_aside_columns.join(", ") + ".";
+        if (i.n_repeated_feature_ids) text += " " + i.n_repeated_feature_ids + " repeated feature id(s) kept as separate features.";
+        text += " First samples: " + i.first_samples.join(", ") + ".";
+        wrap.appendChild(el("div", { class: "caption multiomics-corr-upload-summary" }, text));
+    }
+    return wrap;
+}
+
+function renderCorrAlignmentCard(al) {
+    const wrap = el("div", { class: "multiomics-corr-alignment" });
+    wrap.appendChild(el("div", { class: "section-label" }, "Matched samples"));
+    wrap.appendChild(metricCards([["Samples in every file", al.n_shared], ["Omics", Object.keys(al.omics).length]], 2));
+    (al.warnings || []).forEach((w) => wrap.appendChild(alertBox("warning", w)));
+    const rows = Object.keys(al.omics).map((o) => {
+        const a = al.omics[o];
+        return {
+            "Omics": a.label, "Samples in the file": a.n_samples, "Samples used": a.n_used,
+            "Left out": a.dropped.length ? a.dropped.length + ": " + a.dropped.slice(0, 6).join(", ") + (a.dropped.length > 6 ? ", ..." : "") : "none",
+            "Features": a.n_features, "Layout": a.orientation === "columns" ? "samples in columns" : "samples in rows",
+            "Mapped to a gene": a.n_mapped === null || a.n_mapped === undefined ? "n/a (compounds keep their names)" : a.n_mapped + " of " + a.n_features,
+        };
+    });
+    wrap.appendChild(buildTable({ columns: ["Omics", "Samples in the file", "Samples used", "Left out", "Features", "Layout", "Mapped to a gene"], rows: rows }, {}));
+    wrap.appendChild(el("div", { class: "caption" },
+        "Only the samples that EVERY file has are used; the ones left out are listed, never silently dropped. Transcript and protein " +
+        "identifiers are mapped to gene symbols (each omics' own mapping) so a transcript and its protein can be paired."));
+    return wrap;
+}
+
+function renderMultiomicsCorrScreen() {
+    const mo = STATE.multiomics;
+    const corr = mo.corr;
+    const wrap = el("div", { class: "ora-config-screen ora-module-screen" });
+    wrap.appendChild(aaHeader());
+    const mofaMode = mo.method === "mofa";
+    const diabloMode = mo.method === "diablo";
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" },
+        diabloMode ? "Multi-omics - DIABLO / Multiblock Integration" : mofaMode ? "Multi-omics - MOFA / Factor-based Integration" : "Multi-omics - Correlation-based Integration"));
+    wrap.appendChild(el("div", { class: "caption" }, diabloMode
+        ? "DIABLO is SUPERVISED: given a group for each sample, it finds a few components per omics that agree across the omics AND separate the groups, " +
+          "using a small set of features per omics. Upload a values table for each omics (rows or columns = samples; the same sample ids in every file; at " +
+          "least two groups of 3 or more samples each), choose the organism, and match the samples. The next step asks for the sample groups and sets up the model."
+        : mofaMode
+        ? "MOFA finds the hidden factors that explain the differences between your samples across several omics at once. Upload a values table for each omics " +
+          "(rows or columns = samples; the same sample ids in every file; at least 6 samples, 15 or more recommended), choose the organism, and match the samples. " +
+          "The next step sets up the model. A Group column in a table, or a sample sheet you upload next, can colour the results by group."
+        : "Do your omics layers move together across the SAME samples? Upload a values table for each omics (rows or columns = samples; the " +
+          "same sample ids in every file) and Omiscera asks two questions: for every gene, how well its transcript tracks its protein " +
+          "(same-gene concordance), and which features of different omics are correlated (cross-omics pairs). It is descriptive: a " +
+          "correlation across samples is an association, not a mechanism."));
+    wrap.appendChild(renderCorrOmicsPicker());
+    if (corr.selected.length >= 2) {
+        wrap.appendChild(el("div", { class: "section-label" }, "Organism"));
+        wrap.appendChild(renderCorrOrganismSelector());
+        wrap.appendChild(el("div", { class: "caption" },
+            "Needed to map transcript and protein identifiers to gene symbols (so a transcript and its protein can be paired)."));
+        corr.selected.forEach((o) => wrap.appendChild(renderCorrUploadSection(o)));
+        wrap.appendChild(renderCorrResolveControls());
+        if (corr.alignment) {
+            wrap.appendChild(renderCorrAlignmentCard(corr.alignment));
+            wrap.appendChild(diabloMode ? renderDiabloContinue() : mofaMode ? renderMofaContinue() : renderCorrConfig());
+        }
+    }
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToMultiomicsActions());
+    return wrap;
+}
+
+function renderCorrResolveControls() {
+    const corr = STATE.multiomics.corr;
+    const wrap = el("div", {});
+    const missing = corr.selected.filter((o) => !corr.uploads[o]).map((o) => MULTIOMICS_LABELS[o]);
+    const ready = corr.selected.length >= 2 && missing.length === 0 && !!corr.taxonId;
+    if (missing.length) wrap.appendChild(el("div", { class: "caption" }, "Upload a table for: " + missing.join(", ") + "."));
+    if (!corr.taxonId) wrap.appendChild(el("div", { class: "caption" }, "Select an organism first."));
+    const ciRow = el("label", { class: "ora-db-pill" });
+    const ci = el("input", { type: "checkbox", class: "ora-db-checkbox multiomics-corr-case" });
+    ci.checked = corr.caseInsensitive;
+    // the matched samples depend on this option: an earlier match no longer applies
+    ci.addEventListener("change", () => { corr.caseInsensitive = ci.checked; if (corr.alignment) { _corrClearDownstream(); render(); } });
+    ciRow.appendChild(ci);
+    ciRow.appendChild(document.createTextNode(" Ignore upper / lower case when matching sample ids"));
+    wrap.appendChild(corrPillBlock(ciRow));
+    const btn = el("button", { class: "btn multiomics-corr-resolve", style: { marginTop: "0.8rem" } }, "Resolve identifiers and match samples");
+    btn.disabled = !ready;
+    const progressWrap = el("div", { class: "progress-wrap hidden" });
+    const inner = el("div", { class: "progress-bar-inner", style: { width: "0%" } });
+    const lab = el("div", { class: "progress-label" }, "");
+    progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, inner));
+    progressWrap.appendChild(lab);
+    btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        progressWrap.classList.remove("hidden");
+        try {
+            const { job_id } = await apiPostJson("/api/multiomics/correlation/resolve",
+                { taxon_id: corr.taxonId, taxon_name: corr.taxonName, case_insensitive: corr.caseInsensitive });
+            pollJob(job_id, {
+                onProgress: (job) => { inner.style.width = Math.round((job.progress || 0) * 100) + "%"; lab.textContent = job.message || ""; },
+                onDone: (result) => { corr.alignment = result; corr.run = { results: null, busy: false }; corr.draft = null; _mofaReset(); _diabloReset(); render(); },
+                onError: (err) => { alert(err); render(); },
+            });
+        } catch (err) { alert(err.message); render(); }
+    });
+    wrap.appendChild(btn);
+    wrap.appendChild(progressWrap);
+    return wrap;
+}
+
+function renderCorrConfig() {
+    const corr = STATE.multiomics.corr;
+    const wrap = el("div", { class: "multiomics-corr-config" });
+    if (!corr.draft) corr.draft = { method: "spearman", log2: false, top_variance: 2000, fdr: 0.05, rho_cut: 0.6, min_samples: 5, heat_k: 40, net_k: 60 };
+    const d = corr.draft;
+    wrap.appendChild(el("div", { class: "section-label" }, "Setup"));
+    const methodSel = el("select", { class: "text-input multiomics-corr-method" });
+    CORR_METHODS.forEach(([lab, val]) => methodSel.appendChild(el("option", { value: val }, lab)));
+    methodSel.value = d.method;
+    methodSel.addEventListener("change", () => { d.method = methodSel.value; });
+    wrap.appendChild(el("div", { class: "row" }, el("div", { class: "col" }, [el("div", { class: "chart-option-label" }, "Correlation"), methodSel])));
+    const logRow = el("label", { class: "ora-db-pill" });
+    const logCb = el("input", { type: "checkbox", class: "ora-db-checkbox multiomics-corr-log2" });
+    logCb.checked = d.log2;
+    logCb.addEventListener("change", () => { d.log2 = logCb.checked; });
+    logRow.appendChild(logCb);
+    logRow.appendChild(document.createTextNode(" Apply log2(x + 1) first (for raw counts / intensities; values must be non-negative)"));
+    wrap.appendChild(corrPillBlock(logRow));
+    const r1 = el("div", { class: "row" });
+    r1.appendChild(_corrNumberField("FDR cutoff for a reported pair", d.fdr, 0.01, 0.000001, 1, (v) => { d.fdr = v; }));
+    r1.appendChild(_corrNumberField("|rho| at least", d.rho_cut, 0.05, 0, 0.99, (v) => { d.rho_cut = v; }));
+    wrap.appendChild(r1);
+    const r2 = el("div", { class: "row" });
+    r2.appendChild(_corrNumberField("Features per omics in the cross-omics pairs (top by variance)", d.top_variance, 100, 50, 5000, (v) => { d.top_variance = Math.round(v); }));
+    r2.appendChild(_corrNumberField("Minimum samples per pair", d.min_samples, 1, 5, 1000, (v) => { d.min_samples = Math.round(v); }));
+    wrap.appendChild(r2);
+    const r3 = el("div", { class: "row" });
+    r3.appendChild(_corrNumberField("Heatmap: features per side", d.heat_k, 5, 5, 80, (v) => { d.heat_k = Math.round(v); }));
+    r3.appendChild(_corrNumberField("Network: strongest pairs per omics pair", d.net_k, 5, 5, 150, (v) => { d.net_k = Math.round(v); }));
+    wrap.appendChild(r3);
+    wrap.appendChild(el("div", { class: "caption" },
+        "Every pair of features is tested (p-value from the t distribution on n - 2 degrees of freedom) and Benjamini-Hochberg corrected within " +
+        "each omics pair separately; a pair is REPORTED when its FDR and its |rho| both pass. The same-gene test uses every gene; the cross-omics " +
+        "pairs use the most variable features so the number of pairs stays manageable."));
+    const run = el("button", { class: "btn btn-primary ora-run-btn multiomics-corr-run", style: { marginTop: "0.8rem" } }, "Run correlation");
+    run.addEventListener("click", () => startCorrRun());
+    wrap.appendChild(run);
+    return wrap;
+}
+
+async function startCorrRun() {
+    const corr = STATE.multiomics.corr;
+    corr.run = { results: null, busy: true };
+    STATE.aaPage = "multiomics_corr_results";
+    render();
+    try {
+        await apiPostJson("/api/multiomics/correlation/configure", corr.draft);
+        const { job_id } = await apiPostJson("/api/multiomics/correlation/run", {});
+        pollJob(job_id, {
+            onProgress: (job) => {
+                const bar = document.getElementById("multiomics-corr-progress-inner");
+                const label = document.getElementById("multiomics-corr-progress-label");
+                if (bar) bar.style.width = Math.round((job.progress || 0) * 100) + "%";
+                if (label) label.textContent = job.message || "";
+            },
+            onDone: (result) => { corr.run = { results: result, busy: false }; render(); },
+            onError: (err) => { alert("Run failed: " + err); corr.run = { results: null, busy: false }; STATE.aaPage = "multiomics_corr"; render(); },
+        });
+    } catch (err) {
+        alert(err.message);
+        corr.run = { results: null, busy: false };
+        STATE.aaPage = "multiomics_corr";
+        render();
+    }
+}
+
+// ---- charts ---------------------------------------------------------------
+
+
+// ---- the figure tools, as visible buttons ---------------------------------------------------------------------------------
+// Every chart has Plotly's own toolbar (zoom, pan, zoom in/out, autoscale, reset axes, download) at its top-right corner. On a figure
+// drawn at a fixed readable size inside a scroll frame that corner is far off-screen, so the same tools are repeated here as buttons
+// above the figure, working on the same chart (the pathway map does the same).
+function figureToolsRow(chartId, cls) {
+    const row = el("div", { class: "chart-toggle-row " + cls });
+    const chartNow = () => { const d = document.getElementById(chartId); return d && d._fullLayout ? d : null; };
+    const zoomBy = (f) => {
+        const d = chartNow();
+        if (!d) return;
+        const x = d._fullLayout.xaxis.range, y = d._fullLayout.yaxis.range;
+        const cx = (x[0] + x[1]) / 2, cy = (y[0] + y[1]) / 2, hx = (x[1] - x[0]) / 2 * f, hy = (y[1] - y[0]) / 2 * f;
+        Plotly.relayout(d, { "xaxis.range": [cx - hx, cx + hx], "yaxis.range": [cy - hy, cy + hy] });
+    };
+    [["Zoom tool", "fig-tool-zoom", () => { const d = chartNow(); if (d) Plotly.relayout(d, { dragmode: "zoom" }); }],
+     ["Pan tool", "fig-tool-pan", () => { const d = chartNow(); if (d) Plotly.relayout(d, { dragmode: "pan" }); }],
+     ["Zoom in", "fig-tool-in", () => zoomBy(0.5)],
+     ["Zoom out", "fig-tool-out", () => zoomBy(2)],
+     ["Autoscale", "fig-tool-auto", () => { const d = chartNow(); if (d) Plotly.relayout(d, { "xaxis.autorange": true, "yaxis.autorange": true }); }],
+     ["Reset axes", "fig-tool-reset", () => {
+         const d = chartNow();
+         if (!d) return;
+         if (d._figHome) Plotly.relayout(d, { "xaxis.range": d._figHome.x, "yaxis.range": d._figHome.y });
+         else Plotly.relayout(d, { "xaxis.autorange": true, "yaxis.autorange": true });
+     }],
+    ].forEach(([label, c, fn]) => {
+        const b = el("button", { class: "btn chart-toggle-btn " + c, type: "button" }, label);
+        b.style.width = "auto"; b.style.flex = "0 0 auto"; b.style.padding = "0.35rem 1rem";
+        b.addEventListener("click", fn);
+        row.appendChild(b);
+    });
+    return row;
+}
+
+// "Download figure": the app's own export menu (PNG / SVG / ... as every other chart offers), opened under the button because the chart's
+// own corner is off-screen on a big figure.
+function figureDownloadButton(chartId, slug, kind, kindLabel, cls) {
+    const btn = el("button", { class: "btn " + cls, type: "button" }, "Download figure");
+    btn.addEventListener("click", () => {
+        const d = document.getElementById(chartId);
+        if (d && typeof _showOraChartExportMenu === "function") {
+            _showOraChartExportMenu(d, slug, null, kind, kindLabel);
+            const menu = document.querySelector(".ora-chart-export-menu");
+            if (menu) {
+                const r = btn.getBoundingClientRect();
+                menu.style.top = (r.bottom + window.scrollY + 4) + "px";
+                menu.style.left = Math.max(8, r.left + window.scrollX) + "px";
+            }
+        }
+    });
+    return btn;
+}
+
+const CORR_TABLE_SHOWN = 2000;
+// Diverging scales (negative end first, positive end last, neutral in the middle), the ColorBrewer ones that stay readable
+// for colour-blind viewers. The choice colours the heatmap, the histogram and the network's lines.
+const CORR_SCALES = [
+    ["Red - Blue (default)", "redblue", ["#2166AC", "#92C5DE", "#F7F7F7", "#F4A582", "#B2182B"]],
+    ["Orange - Purple", "orangepurple", ["#542788", "#B2ABD2", "#F7F7F7", "#FDB863", "#B35806"]],
+    ["Green - Purple", "greenpurple", ["#762A83", "#C2A5CF", "#F7F7F7", "#A6DBA0", "#1B7837"]],
+    ["Teal - Brown", "tealbrown", ["#8C510A", "#DFC27D", "#F5F5F5", "#80CDC1", "#01665E"]],
+    ["Pink - Green", "pinkgreen", ["#4D9221", "#B8E186", "#F7F7F7", "#F1B6DA", "#C51B7D"]],
+    ["Blue - Yellow - Red", "bluyelred", ["#2C7BB6", "#ABD9E9", "#FFFFBF", "#FDAE61", "#D7191C"]],
+];
+
+// {colorscale, neg, pos}: the chosen gradient, optionally flipped (which end is the positive one).
+function corrScale() {
+    const c = STATE.multiomics && STATE.multiomics.corr;
+    const item = CORR_SCALES.find((x) => c && x[1] === c.heatScale) || CORR_SCALES[0];
+    const cols = c && c.heatFlip ? item[2].slice().reverse() : item[2];
+    return { colorscale: cols.map((col, i) => [i / (cols.length - 1), col]), neg: cols[0], pos: cols[cols.length - 1] };
+}
+
+function buildCorrHistogram(div, hist, slug) {
+    if (typeof Plotly === "undefined") return;
+    const mids = hist.counts.map((c, i) => (hist.edges[i] + hist.edges[i + 1]) / 2);
+    const trace = {
+        x: mids, y: hist.counts, type: "bar", marker: { color: mids.map((m) => m >= 0 ? corrScale().pos : corrScale().neg) },
+        width: 0.09, hovertemplate: "rho %{x:.2f}: %{y} genes<extra></extra>",
+    };
+    const layout = {
+        height: 320, margin: { l: 60, r: 20, t: 20, b: 60 }, bargap: 0.02, plot_bgcolor: "#FAFCFE", paper_bgcolor: "#FAFCFE",
+        xaxis: { title: { text: "Spearman / Pearson rho between a gene's transcript and its protein" }, range: [-1.05, 1.05], zeroline: true },
+        yaxis: { title: { text: "Genes" } },
+    };
+    _newOraPlot(div, [trace], layout, slug, null, "corrhist", "Concordance histogram");
+}
+
+function buildCorrHeatmap(div, heat, labelA, labelB, slug) {
+    if (typeof Plotly === "undefined") return;
+    const nr = heat.rows.length, nc = heat.cols.length;
+    const cell = 20;
+    const trace = {
+        z: heat.z, x: heat.cols, y: heat.rows, type: "heatmap", colorscale: corrScale().colorscale, zmin: -1, zmax: 1, zmid: 0,
+        xgap: 1, ygap: 1, hoverongaps: false,
+        text: heat.sig.map((row) => row.map((v) => v ? "•" : "")), texttemplate: "%{text}", textfont: { size: 14, color: "#1B2A41" },
+        hovertemplate: "%{y}  vs  %{x}<br>rho = %{z:.2f}<extra></extra>", colorbar: { title: { text: "rho" }, thickness: 14, len: 0.6 },
+    };
+    const width = Math.max(560, nc * cell + 300), height = Math.max(380, nr * cell + 240);
+    const layout = {
+        width: width, height: height, margin: { l: 150, r: 90, t: 30, b: 150 }, plot_bgcolor: "#FAFCFE", paper_bgcolor: "#FAFCFE",
+        xaxis: { title: { text: labelB }, tickangle: -60, automargin: true, tickfont: { size: 10 }, type: "category" },
+        yaxis: { title: { text: labelA }, autorange: "reversed", automargin: true, tickfont: { size: 10 }, type: "category" },
+    };
+    div.style.width = width + "px";
+    _newOraPlot(div, [trace], layout, slug, null, "corrheat", "Correlation heatmap", null, { responsive: false });
+}
+
+function buildCorrNetwork(div, network, slug) {
+    if (typeof Plotly === "undefined") return;
+    const nodes = network.nodes || [], edges = network.edges || [];
+    if (!edges.length) { div.textContent = "No pair to draw."; return; }
+    const byId = {};
+    nodes.forEach((n) => { byId[n.id] = n; });
+    const deg = {};
+    edges.forEach((e) => { deg[e.u] = (deg[e.u] || 0) + 1; deg[e.v] = (deg[e.v] || 0) + 1; });
+    const nCol = network.omics.length;
+    const pos = (n) => ({ x: n.col, y: -n.row });
+    const traces = [];
+    const buckets = {};
+    edges.forEach((e) => {
+        const a = byId[e.u], b = byId[e.v];
+        if (!a || !b) return;
+        const w = Math.abs(e.rho) >= 0.9 ? 5 : Math.abs(e.rho) >= 0.75 ? 3 : 1.5;
+        const key = (e.rho >= 0 ? "pos" : "neg") + "|" + w;
+        (buckets[key] = buckets[key] || { rho: e.rho, w: w, x: [], y: [] });
+        const pa = pos(a), pb = pos(b);
+        buckets[key].x.push(pa.x, pb.x, null);
+        buckets[key].y.push(pa.y, pb.y, null);
+    });
+    Object.keys(buckets).sort().forEach((k) => {
+        const b = buckets[k];
+        traces.push({ x: b.x, y: b.y, mode: "lines", type: "scatter", hoverinfo: "skip", showlegend: false, opacity: 0.75,
+                      line: { color: b.rho >= 0 ? corrScale().pos : corrScale().neg, width: b.w } });
+    });
+    traces.push({
+        x: edges.map((e) => (pos(byId[e.u]).x + pos(byId[e.v]).x) / 2), y: edges.map((e) => (pos(byId[e.u]).y + pos(byId[e.v]).y) / 2),
+        mode: "markers", type: "scatter", showlegend: false, marker: { size: 9, color: "rgba(0,0,0,0)" },
+        hovertext: edges.map((e) => byId[e.u].label + "  -  " + byId[e.v].label + "<br>rho = " + e.rho.toFixed(2) + ", FDR " + _fmtSci(e.fdr, 2)),
+        hoverinfo: "text",
+    });
+    network.omics.forEach((o, c) => {
+        const ns = nodes.filter((n) => n.omics === o);
+        traces.push({
+            x: ns.map((n) => pos(n).x), y: ns.map((n) => pos(n).y), mode: "markers+text", type: "scatter", name: MULTIOMICS_LABELS[o],
+            text: ns.map((n) => _escapePlotlyText(n.label)), textposition: c === 0 ? "middle left" : c === nCol - 1 ? "middle right" : "top center", textfont: { size: 11, color: "#1B2A41" },
+            marker: { size: 11, color: MULTIOMICS_COLORS[o], line: { color: "#FFFFFF", width: 1.5 } },
+            hovertext: ns.map((n) => n.label + " (" + MULTIOMICS_LABELS[o] + "), " + (deg[n.id] || 0) + " pair(s)"), hoverinfo: "text",
+        });
+    });
+    [["positive correlation", corrScale().pos], ["negative correlation", corrScale().neg]].forEach(([name, color]) => {
+        traces.push({ x: [null], y: [null], mode: "lines", type: "scatter", name: name, line: { color: color, width: 3 }, hoverinfo: "skip" });
+    });
+    const maxRows = Math.max.apply(null, nodes.map((n) => n.row + 1));
+    const layout = {
+        height: Math.max(420, maxRows * 24 + 130), margin: { l: 170, r: 170, t: 50, b: 20 }, plot_bgcolor: "#FAFCFE", paper_bgcolor: "#FAFCFE",
+        xaxis: { visible: false, range: [-0.55, nCol - 0.45], fixedrange: false }, yaxis: { visible: false, range: [-maxRows - 0.2, 0.8] },
+        legend: { orientation: "h", y: 1.02, yanchor: "bottom", x: 0 }, hovermode: "closest", dragmode: "pan",
+    };
+    _newOraPlot(div, traces, layout, slug, null, "corrnet", "Correlation network", null, { scrollZoom: true });
+}
+
+function buildCorrScatter(div, data, slug) {
+    if (typeof Plotly === "undefined") return;
+    const ok = data.x.map((v, i) => v !== null && data.y[i] !== null);
+    const trace = {
+        x: data.x.filter((v, i) => ok[i]), y: data.y.filter((v, i) => ok[i]), text: data.samples.filter((v, i) => ok[i]), mode: "markers+text",
+        textposition: "top center", textfont: { size: 9, color: "#5A6B7C" }, type: "scatter",
+        marker: { size: 10, color: "#083B6B", line: { color: "#FFFFFF", width: 1 } }, hovertemplate: "%{text}<br>x %{x:.3f}, y %{y:.3f}<extra></extra>",
+    };
+    const stat = (data.rho === null ? "n/a" : (data.method === "spearman" ? "Spearman rho " : "Pearson r ") + data.rho.toFixed(3)) +
+        ", p " + (data.p === null ? "n/a" : _fmtSci(data.p, 2)) + ", n = " + data.n;
+    const layout = {
+        height: 380, margin: { l: 70, r: 20, t: 50, b: 60 }, plot_bgcolor: "#FAFCFE", paper_bgcolor: "#FAFCFE", showlegend: false,
+        title: { text: stat, font: { size: 13 } }, xaxis: { title: { text: data.x_label } }, yaxis: { title: { text: data.y_label } },
+    };
+    _newOraPlot(div, [trace], layout, slug, null, "corrscatter", "Scatter");
+}
+
+// A table whose rows can be clicked: shows that pair's sample-level scatter underneath.
+function corrClickableTable(payload, opts, onPick) {
+    const wrap = buildTable(payload, opts);
+    const rows = wrap.querySelectorAll("tbody tr");
+    rows.forEach((tr, i) => {
+        tr.style.cursor = "pointer";
+        tr.title = "Click to see this pair's values per sample";
+        tr.addEventListener("click", () => {
+            rows.forEach((r) => { r.style.outline = ""; });
+            tr.style.outline = "2px solid #083B6B";
+            onPick(i);
+        });
+    });
+    return wrap;
+}
+
+async function corrShowScatter(host, params, slug) {
+    host.innerHTML = "";
+    const div = el("div", { class: "chart-container multiomics-corr-scatter", id: "multiomics-corr-scatter-" + slug });
+    host.appendChild(div);
+    try {
+        const data = await apiJson("/api/multiomics/correlation/scatter?" + new URLSearchParams(params).toString());
+        buildCorrScatter(div, data, slug);
+    } catch (err) {
+        host.innerHTML = "";
+        host.appendChild(alertBox("warning", "Could not load the scatter: " + err.message));
+    }
+}
+
+function _corrBlockLabel(key) {
+    const [a, b] = key.split("|");
+    return MULTIOMICS_LABELS[a] + " x " + MULTIOMICS_LABELS[b];
+}
+
+function renderMultiomicsCorrResultsScreen() {
+    const corr = STATE.multiomics.corr;
+    const run = corr.run;
+    const wrap = el("div", { class: "ora-config-screen ora-results-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Multi-omics - Correlation-based Integration: results"));
+    if (!run.results) {
+        wrap.appendChild(alertBox("info", "Running analysis..."));
+        const progressWrap = el("div", { class: "progress-wrap" });
+        progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, el("div", { id: "multiomics-corr-progress-inner", class: "progress-bar-inner", style: { width: "0%" } })));
+        progressWrap.appendChild(el("div", { id: "multiomics-corr-progress-label", class: "progress-label" }, ""));
+        wrap.appendChild(progressWrap);
+        return wrap;
+    }
+    const R = run.results;
+    const blockKeys = Object.keys(R.blocks);
+    wrap.appendChild(metricCards([
+        ["Shared samples", R.samples.length], ["Omics", R.omics.map((o) => MULTIOMICS_LABELS[o]).join(" + ")],
+        ["Correlation", R.config.method === "spearman" ? "Spearman" : "Pearson"], ["FDR / |rho| cutoff", R.config.fdr + " / " + R.config.rho_cut],
+    ], 4));
+    (R.warnings || []).forEach((w) => wrap.appendChild(alertBox("warning", w)));
+    const card = el("div", { class: "rank-card ora-db-card ora-result-card ora-db-card-multiomics-corr multiomics-corr-result" });
+    wrap.appendChild(card);
+    const nav = makeResultNav(card, { stateKey: "multiomics_corr" });
+
+    // ----- overview -----
+    const ov = nav.pane("Overview");
+    (R.notes || []).forEach((n) => ov.appendChild(alertBox("info", n)));
+    ov.appendChild(el("div", { class: "section-label" }, "Pairs tested, by omics pair"));
+    ov.appendChild(buildTable({
+        columns: ["Omics pair", "Features x features", "Pairs tested", "Significant at the FDR", "Reported (FDR and |rho|)", "Expected to be false"],
+        rows: blockKeys.map((k) => {
+            const b = R.blocks[k];
+            return { "Omics pair": _corrBlockLabel(k), "Features x features": b.n_a + " x " + b.n_b, "Pairs tested": b.n_tests.toLocaleString(),
+                     "Significant at the FDR": b.n_sig_fdr.toLocaleString(), "Reported (FDR and |rho|)": b.n_reported.toLocaleString(),
+                     "Expected to be false": "about " + b.expected_false.toFixed(1) };
+        }),
+    }, {}));
+    ov.appendChild(el("div", { class: "caption" },
+        "'Expected to be false' is the sum of the reported pairs' q-values: roughly how many of them are chance. With few samples and tens of " +
+        "thousands of pairs, treat the list as a set of leads to look at (click a row to see the points), not as findings."));
+    ov.appendChild(el("div", { class: "section-label" }, "Features used"));
+    ov.appendChild(buildTable({
+        columns: ["Omics", "In your file", "Too many missing values", "Constant", "Used for the same-gene test", "Used for the cross-omics pairs"],
+        rows: R.omics.map((o) => {
+            const f = R.feature_report[o];
+            return { "Omics": MULTIOMICS_LABELS[o], "In your file": f.n_in, "Too many missing values": f.n_too_many_missing, "Constant": f.n_constant,
+                     "Used for the same-gene test": f.n_kept_before_variance, "Used for the cross-omics pairs": f.n_out };
+        }),
+    }, {}));
+    ov.appendChild(el("div", { class: "section-label" }, "What these numbers do not tell you"));
+    ov.appendChild(el("div", { class: "caption" },
+        "A correlation across samples is an association. If your samples fall into groups (control and treated, say) and both features differ " +
+        "between the groups, they will correlate even if they are unrelated inside either group - so a strong correlation can simply be the " +
+        "treatment effect seen twice. p-values rest on the t approximation, which is unreliable below about 10 samples. Values are used as you " +
+        "gave them: normalise before uploading (or use the log2 option for raw counts)."));
+    const al = R.alignment;
+    ov.appendChild(renderCorrAlignmentCard(al));
+
+    // ----- same-gene concordance -----
+    if (R.concordance) {
+        const c = R.concordance;
+        const pane = nav.pane("Same-gene concordance");
+        if (c.note) pane.appendChild(alertBox("warning", c.note));
+        pane.appendChild(metricCards([
+            ["Genes in both tables", c.n_common], ["Genes tested", c.n_tested],
+            ["Median rho", c.median_rho === null ? "n/a" : c.median_rho.toFixed(2)],
+            ["Significantly concordant (rho > 0)", c.n_sig_pos], ["Significantly discordant (rho < 0)", c.n_sig_neg],
+        ], 5));
+        pane.appendChild(el("div", { class: "caption" },
+            "For each gene present in both tables: the correlation across the samples between its transcript level and its protein level. " +
+            "Several features of one gene (isoforms, protein groups) are averaged first. Benjamini-Hochberg is applied across the genes " +
+            "tested. In published studies the typical gene's mRNA-protein correlation is moderate (Vogel & Marcotte 2012; Liu et al. 2016), " +
+            "so a median well above zero is expected, and a negative one is worth a look. Click a row for the points."));
+        if (c.hist) {
+            const hdiv = el("div", { class: "chart-container multiomics-corr-hist", id: "multiomics-corr-hist" });
+            pane.appendChild(hdiv);
+            scheduleChart("multiomics-corr-hist", (d) => buildCorrHistogram(d, c.hist, "corr-hist"));
+        }
+        if (c.table.rows.length) {
+            const scatterHost = el("div", { class: "multiomics-corr-scatter-host" });
+            const shownC = c.table.rows.length > CORR_TABLE_SHOWN ? { columns: c.table.columns, rows: c.table.rows.slice(0, CORR_TABLE_SHOWN) } : c.table;
+            if (shownC !== c.table) pane.appendChild(alertBox("info", "Showing the " + CORR_TABLE_SHOWN.toLocaleString() + " strongest of " +
+                c.table.rows.length.toLocaleString() + " genes (by FDR); the CSV below has every one."));
+            pane.appendChild(corrClickableTable(shownC, {
+                maxHeight: 420, cellFormatFn: (col, val) => (col === "p-value" || col === "FDR" ? _fmtSci(val, 2) : col === "rho" ? _fmtFixed(val, 3) : val),
+            }, (i) => corrShowScatter(scatterHost, { kind: "gene", gene: c.table.rows[i]["Gene"] }, "gene")));
+            pane.appendChild(scatterHost);
+            const dl = el("button", { class: "btn" }, "Download concordance table (CSV)");
+            dl.addEventListener("click", () => downloadFile("/api/multiomics/correlation/download?table=concordance", "multiomics_correlation_concordance.csv"));
+            pane.appendChild(dl);
+        }
+    }
+
+    // ----- cross-omics pairs -----
+    const pairsPane = nav.pane("Cross-omics pairs");
+    const sel = el("select", { class: "text-input multiomics-corr-block" });
+    blockKeys.forEach((k) => sel.appendChild(el("option", { value: k }, _corrBlockLabel(k) + " (" + R.blocks[k].n_reported + " reported)")));
+    pairsPane.appendChild(el("div", { class: "row" }, el("div", { class: "col" }, sel)));
+    const pairsHost = el("div", {});
+    pairsPane.appendChild(pairsHost);
+    function drawPairs() {
+        pairsHost.innerHTML = "";
+        const key = sel.value, b = R.blocks[key];
+        pairsHost.appendChild(metricCards([["Pairs tested", b.n_tests.toLocaleString()], ["Significant at the FDR", b.n_sig_fdr.toLocaleString()],
+            ["Reported", b.n_reported.toLocaleString()], ["Expected false", b.expected_false.toFixed(1)]], 4));
+        if (b.truncated) pairsHost.appendChild(alertBox("info", "More pairs passed than are listed; the strongest by FDR are shown (and downloaded)."));
+        if (!b.table.rows.length) {
+            pairsHost.appendChild(alertBox("info", "No pair of this omics pair passes both the FDR and the |rho| cutoff."));
+            return;
+        }
+        const host = el("div", { class: "multiomics-corr-scatter-host" });
+        // a page with tens of thousands of table rows freezes the browser: show the strongest CORR_TABLE_SHOWN, the CSV has them all
+        const shown = b.table.rows.length > CORR_TABLE_SHOWN ? { columns: b.table.columns, rows: b.table.rows.slice(0, CORR_TABLE_SHOWN) } : b.table;
+        if (shown !== b.table) pairsHost.appendChild(alertBox("info", "Showing the " + CORR_TABLE_SHOWN.toLocaleString() + " strongest of " +
+            b.table.rows.length.toLocaleString() + " listed pairs (by FDR); the CSV below has every one."));
+        pairsHost.appendChild(corrClickableTable(shown, {
+            maxHeight: 440, cellFormatFn: (col, val) => (col === "p-value" || col === "FDR" ? _fmtSci(val, 2) : col === "rho" ? _fmtFixed(val, 3) : val),
+        }, (i) => corrShowScatter(host, { kind: "pair", block: key, a: b.ids[i][0], b: b.ids[i][1] }, "pair")));
+        pairsHost.appendChild(host);
+        const dl = el("button", { class: "btn" }, "Download this table (CSV)");
+        dl.addEventListener("click", () => downloadFile("/api/multiomics/correlation/download?table=" + encodeURIComponent(key), "multiomics_correlation_" + key.replace("|", "_") + ".csv"));
+        pairsHost.appendChild(dl);
+    }
+    sel.addEventListener("change", drawPairs);
+    drawPairs();
+
+    // ----- heatmap -----
+    const heatPane = nav.pane("Heatmap");
+    const hsel = el("select", { class: "text-input multiomics-corr-heat-block" });
+    blockKeys.filter((k) => R.blocks[k].heat).forEach((k) => hsel.appendChild(el("option", { value: k }, _corrBlockLabel(k))));
+    heatPane.appendChild(el("div", { class: "caption" },
+        "The features with the most reported partners on each side, clustered so similar profiles sit together. Colour = rho, read from the colour bar " +
+        "(the top end is +1, a positive correlation; the bottom end is -1; pick the gradient below); a dot marks a REPORTED pair (FDR and |rho| pass). " +
+        "Drawn at a fixed cell size inside a frame you scroll."));
+    if (hsel.options.length) {
+        heatPane.appendChild(figureToolsRow("multiomics-corr-heatmap", "multiomics-corr-heat-tools"));
+        heatPane.appendChild(figureDownloadButton("multiomics-corr-heatmap", "corr-heat", "corrheat", "Correlation heatmap", "multiomics-corr-heat-download"));
+        const scaleSel = el("select", { class: "text-input multiomics-corr-scale" });
+        CORR_SCALES.forEach(([lab, val]) => scaleSel.appendChild(el("option", { value: val }, lab)));
+        scaleSel.value = STATE.multiomics.corr.heatScale;
+        const flipCb = el("input", { type: "checkbox", class: "ora-db-checkbox multiomics-corr-flip" });
+        flipCb.checked = STATE.multiomics.corr.heatFlip;
+        // the gradient also colours the histogram and the network, so the screen is drawn again (the pane you are on is kept)
+        const applyScale = () => { STATE.multiomics.corr.heatScale = scaleSel.value; STATE.multiomics.corr.heatFlip = flipCb.checked; render(); };
+        scaleSel.addEventListener("change", applyScale);
+        flipCb.addEventListener("change", applyScale);
+        const flipLab = el("label", { style: { display: "inline-flex", alignItems: "center", gap: "0.5rem", margin: "0.4rem 0 0.8rem 0" } },
+            [flipCb, document.createTextNode("Swap the colours (positive and negative)")]);
+        heatPane.appendChild(el("div", { class: "row" }, [
+            el("div", { class: "col" }, [el("div", { class: "chart-option-label" }, "Omics pair"), hsel]),
+            el("div", { class: "col" }, [el("div", { class: "chart-option-label" }, "Colour gradient"), scaleSel]),
+        ]));
+        heatPane.appendChild(flipLab);
+        const frame = el("div", { class: "multiomics-corr-heat-frame", style: { overflow: "auto", maxHeight: "80vh", border: "1px solid #D5DEE7" } });
+        heatPane.appendChild(frame);
+        const drawHeat = (queued) => {
+            frame.innerHTML = "";
+            const d = el("div", { class: "chart-container multiomics-corr-heatmap", id: "multiomics-corr-heatmap" });
+            frame.appendChild(d);
+            const k = hsel.value, b = R.blocks[k];
+            const build = (div) => buildCorrHeatmap(div, b.heat, MULTIOMICS_LABELS[b.omics_a], MULTIOMICS_LABELS[b.omics_b], "corr-heat");
+            if (queued) scheduleChart("multiomics-corr-heatmap", build); else build(d);
+        };
+        hsel.addEventListener("change", () => drawHeat(false));
+        drawHeat(true);
+    } else {
+        heatPane.appendChild(alertBox("info", "No pair passed the cutoffs, so there is nothing to draw."));
+    }
+
+    // ----- network -----
+    const netPane = nav.pane("Network");
+    netPane.appendChild(el("div", { class: "caption" },
+        "The strongest reported pairs of every omics pair (the number is a setup option). One column per omics; line colour = sign, thickness = " +
+        "|rho|; rows are ordered to keep crossing lines to a minimum (" + R.network.crossings + " crossings here). Hover a line or a node."));
+    if (R.network.edges.length) {
+        netPane.appendChild(figureToolsRow("multiomics-corr-network", "multiomics-corr-net-tools"));
+        netPane.appendChild(figureDownloadButton("multiomics-corr-network", "corr-net", "corrnet", "Correlation network", "multiomics-corr-net-download"));
+        const ndiv = el("div", { class: "chart-container multiomics-corr-network", id: "multiomics-corr-network" });
+        netPane.appendChild(ndiv);
+        scheduleChart("multiomics-corr-network", (d) => buildCorrNetwork(d, R.network, "corr-net"));
+    } else {
+        netPane.appendChild(alertBox("info", "No pair passed the cutoffs, so there is nothing to draw."));
+    }
+    nav.finish();
+
+    const actions = el("div", { class: "right-actions", style: { marginTop: "1rem" } });
+    const again = el("button", { class: "btn" }, "Change settings");
+    again.addEventListener("click", () => { corr.run = { results: null, busy: false }; STATE.aaPage = "multiomics_corr"; render(); });
+    actions.appendChild(el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, again));
+    wrap.appendChild(actions);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToMultiomicsActions());
+    return wrap;
+}
+
+
+// ===========================================================================
+// Multi-omics - Network-based Integration
+//
+// Two networks from one run (the maths is in Multiomics_network.py and the existing network engines; this is the screens):
+//   1. the STRING gene / protein network: seeds from every omics (equal weight per omics) -> random walk with restart ->
+//      central and recruited proteins, modules, and which omics feed each module;
+//   2. the Reactome pathway-overlap network: pathways hit by the omics, joined where their hit members overlap.
+// The figures of the single-omics network tiles (buildNetpropNetwork / buildNetpropHistogram / buildDotPlot) are reused.
+// State: STATE.multiomics.net.
+// ===========================================================================
+
+const NET_DB_CHOICES = [["GO", "GO"], ["Reactome", "Reactome"], ["Complex Portal", "Complex Portal"]];
+const NET_DB = "multiomics_network";
+
+function freshNetState() {
+    return { draft: null, run: { results: null, busy: false } };
+}
+
+function _netDefaultDraft() {
+    return {
+        cutoffs: { transcriptomics: { padj: 0.05, lfc: 1.0 }, proteomics: { padj: 0.05, lfc: 1.0 } },
+        confidence: 700, nPermutations: 1000, fdrAlpha: 0.05, minModuleSize: 3, maxHits: 600, moduleDatabase: "GO",
+        includeIea: true, maxReactions: 60, maxReactionProteins: 30, pathwayTopN: 40, pathwayMinJaccard: 0.4, pathwayMergeJaccard: 0.7,
+    };
+}
+
+function renderMultiomicsNetScreen() {
+    const mo = STATE.multiomics;
+    const wrap = el("div", { class: "ora-config-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Multi-omics - Network-based Integration: setup"));
+    if (!mo || !mo.resolved) {
+        wrap.appendChild(alertBox("warning", "Resolve the identifiers first."));
+        wrap.appendChild(backToMultiomicsActions());
+        return wrap;
+    }
+    if (!mo.net) mo.net = freshNetState();
+    if (!mo.net.draft) mo.net.draft = _netDefaultDraft();
+    const d = mo.net.draft;
+    wrap.appendChild(el("div", { class: "caption" },
+        "Two networks from your uploads. (1) The STRING network: the hits of every omics are placed on the protein-protein network " +
+        "together, a random walk finds the proteins at the centre of the COMBINED response (including proteins nobody measured), " +
+        "and clustering groups them into modules that show which omics feed each one. (2) The pathway network: the Reactome " +
+        "pathways your omics hit, joined where the hit members overlap. It is descriptive: a protein's score is a position in a " +
+        "network, not a measurement."));
+    wrap.appendChild(el("div", { class: "section-label" }, "How each omics takes part"));
+    const how = {
+        genomics: "the genes of your list are seeds.",
+        transcriptomics: "the genes passing the cutoffs below are seeds.",
+        proteomics: "the proteins passing the cutoffs below are seeds.",
+        metabolomics: "a hit metabolite seeds the proteins Reactome lists in the reactions it takes part in (metabolites are not in a protein network).",
+    };
+    const ul = el("div", { class: "caption" });
+    mo.selected.forEach((o) => ul.appendChild(el("div", {}, "- " + MULTIOMICS_LABELS[o] + ": " + how[o])));
+    ul.appendChild(el("div", { style: { marginTop: "0.4rem" } },
+        "Equal weight per omics: each omics' seeds are scaled to sum to 1 and averaged, so an omics with 3,000 hits does not drown one " +
+        "with 40; a protein hit by several omics gets a larger seed."));
+    wrap.appendChild(ul);
+
+    const deOmics = mo.selected.filter((o) => MULTIOMICS_DE_OMICS.indexOf(o) !== -1);
+    if (deOmics.length) {
+        wrap.appendChild(el("div", { class: "section-label" }, "Seed selection (differential-expression tables)"));
+        const row = el("div", { class: "row" });
+        deOmics.forEach((o) => {
+            row.appendChild(_corrNumberField(MULTIOMICS_LABELS[o] + ": adjusted p-value cutoff (padj <=)", d.cutoffs[o].padj, 0.01, 0.000001, 1, (v) => { d.cutoffs[o].padj = v; }));
+            row.appendChild(_corrNumberField(MULTIOMICS_LABELS[o] + ": minimum |log2 fold-change|", d.cutoffs[o].lfc, 0.1, 0, 20, (v) => { d.cutoffs[o].lfc = v; }));
+        });
+        wrap.appendChild(row);
+    }
+
+    wrap.appendChild(el("div", { class: "section-label" }, "STRING network and significance"));
+    const r1 = el("div", { class: "row" });
+    const confSel = el("select", { class: "text-input multiomics-net-confidence" });
+    NETPROP_CONFIDENCE_CHOICES.forEach(([lab, val]) => confSel.appendChild(el("option", { value: val }, lab)));
+    confSel.value = String(d.confidence);
+    confSel.addEventListener("change", () => { d.confidence = Number(confSel.value); });
+    r1.appendChild(el("div", { class: "col" }, [el("div", { class: "chart-option-label" }, "STRING confidence cutoff"), confSel]));
+    const permSel = el("select", { class: "text-input multiomics-net-perm" });
+    NETWORK_PERMUTATION_CHOICES.forEach(([lab, val]) => permSel.appendChild(el("option", { value: val }, lab)));
+    permSel.value = String(d.nPermutations);
+    const hint = el("div", { class: "caption" }, "Estimated run time: " + _networkRuntimeHint(d.nPermutations) + " (plus the first download of STRING / Reactome files).");
+    permSel.addEventListener("change", () => { d.nPermutations = Number(permSel.value); hint.textContent = "Estimated run time: " + _networkRuntimeHint(d.nPermutations) + " (plus the first download of STRING / Reactome files)."; });
+    r1.appendChild(el("div", { class: "col" }, [el("div", { class: "chart-option-label" }, "Number of permutations"), permSel, hint]));
+    wrap.appendChild(r1);
+    const r2 = el("div", { class: "row" });
+    r2.appendChild(_corrNumberField("Significance threshold (FDR <)", d.fdrAlpha, 0.01, 0.000001, 1, (v) => { d.fdrAlpha = v; }));
+    wrap.appendChild(r2);
+    wrap.appendChild(el("div", { class: "caption" },
+        "STRING's combined score folds in text-mining and cross-organism transfer as well as experiments, so it leans toward well-studied " +
+        "proteins - which is why 0.7 (high) is the default. Each permutation re-runs the whole propagation, so the count drives the run time."));
+
+    wrap.appendChild(el("div", { class: "section-label" }, "Modules"));
+    const r3 = el("div", { class: "row" });
+    r3.appendChild(_corrNumberField("Minimum module size", d.minModuleSize, 1, 2, 1000, (v) => { d.minModuleSize = Math.round(v); }));
+    r3.appendChild(_corrNumberField("Maximum hits used for clustering", d.maxHits, 50, 50, 20000, (v) => { d.maxHits = Math.round(v); }));
+    const dbSel = el("select", { class: "text-input multiomics-net-moduledb" });
+    NET_DB_CHOICES.forEach(([lab, val]) => dbSel.appendChild(el("option", { value: val }, lab)));
+    dbSel.value = d.moduleDatabase;
+    dbSel.addEventListener("change", () => { d.moduleDatabase = dbSel.value; });
+    r3.appendChild(el("div", { class: "col" }, [el("div", { class: "chart-option-label" }, "Label modules using"), dbSel]));
+    wrap.appendChild(r3);
+
+    if (mo.selected.indexOf("metabolomics") !== -1) {
+        wrap.appendChild(el("div", { class: "section-label" }, "Metabolites"));
+        const r4 = el("div", { class: "row" });
+        r4.appendChild(_corrNumberField("Leave out a compound found in more than this many Reactome reactions", d.maxReactions, 5, 5, 1000, (v) => { d.maxReactions = Math.round(v); }));
+        r4.appendChild(_corrNumberField("Skip a reaction that lists more than this many proteins (a whole receptor / ligase family)", d.maxReactionProteins, 5, 2, 500, (v) => { d.maxReactionProteins = Math.round(v); }));
+        wrap.appendChild(r4);
+        wrap.appendChild(el("div", { class: "caption" },
+            "Cofactors such as ATP, water, NAD+ or H+ sit in hundreds of reactions and would seed a large part of the proteome, so they are " +
+            "not used; a reaction that lists a whole family of receptors or ligases (a ligand-binding step lists every GPCR) is skipped too. The metabolite table lists every compound with the reason. Reactome lists every protein taking part in a reaction " +
+            "(enzyme, complex member, regulator, substrate), so a metabolite's proteins are an association, not proven catalysts."));
+    }
+
+    wrap.appendChild(el("div", { class: "section-label" }, "Pathway network (Reactome)"));
+    const r5 = el("div", { class: "row" });
+    r5.appendChild(_corrNumberField("Pathways drawn (best combined p-values)", d.pathwayTopN, 5, 5, 100, (v) => { d.pathwayTopN = Math.round(v); }));
+    r5.appendChild(_corrNumberField("Join two pathways when their hit members overlap by (Jaccard) at least", d.pathwayMinJaccard, 0.05, 0.01, 1, (v) => { d.pathwayMinJaccard = v; }));
+    r5.appendChild(_corrNumberField("Merge a pathway into a better-ranked one when they overlap by (Jaccard) at least", d.pathwayMergeJaccard, 0.05, 0.3, 1, (v) => { d.pathwayMergeJaccard = v; }));
+    wrap.appendChild(r5);
+
+    const run = el("button", { class: "btn btn-primary ora-run-btn multiomics-net-run", style: { marginTop: "0.8rem" } }, "Run network analysis");
+    run.addEventListener("click", () => startNetRun());
+    wrap.appendChild(run);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToMultiomicsActions());
+    return wrap;
+}
+
+async function startNetRun() {
+    const mo = STATE.multiomics;
+    const d = mo.net.draft;
+    mo.net.run = { results: null, busy: true };
+    STATE.aaPage = "multiomics_net_results";
+    render();
+    const payload = {
+        confidence: d.confidence, n_permutations: d.nPermutations, fdr_alpha: d.fdrAlpha, min_module_size: d.minModuleSize,
+        max_hits_for_modules: d.maxHits, module_database: d.moduleDatabase, include_iea: d.includeIea, max_reactions: d.maxReactions, max_reaction_proteins: d.maxReactionProteins,
+        pathway_top_n: d.pathwayTopN, pathway_min_jaccard: d.pathwayMinJaccard, pathway_merge_jaccard: d.pathwayMergeJaccard, de_cutoffs: d.cutoffs,
+    };
+    const fail = (msg) => { alert(msg); mo.net.run = { results: null, busy: false }; STATE.aaPage = "multiomics_net"; render(); };
+    try {
+        await apiPostJson("/api/multiomics/network/configure", payload);
+        const { job_id } = await apiPostJson("/api/multiomics/network/run", {});
+        pollJob(job_id, {
+            onProgress: (job) => {
+                const bar = document.getElementById("multiomics-net-progress-inner");
+                const label = document.getElementById("multiomics-net-progress-label");
+                if (bar) bar.style.width = Math.round((job.progress || 0) * 100) + "%";
+                if (label) label.textContent = job.message || "";
+            },
+            onDone: (result) => { mo.net.run = { results: result, busy: false }; render(); },
+            onError: (err) => fail("Network analysis failed: " + err),
+        });
+    } catch (err) { fail(err.message); }
+}
+
+// ---- charts ---------------------------------------------------------------
+
+// Where each module's members come from: seeds of each omics (a seed hit by several omics is counted under each, so the bar can
+// exceed the module size) and recruited proteins (no omics supplied them).
+function buildNetModuleBars(div, mods, slug) {
+    if (typeof Plotly === "undefined") return;
+    const rows = mods.table.rows || [];
+    if (!rows.length) return;
+    const ids = rows.map((r) => r["Module ID"]);
+    const traces = (mods.omics || []).map((o) => ({
+        type: "bar", orientation: "h", name: MULTIOMICS_LABELS[o], y: ids,
+        x: rows.map((r) => r["Seeds from " + MULTIOMICS_LABELS[o]] || 0), marker: { color: MULTIOMICS_COLORS[o] },
+        hovertemplate: MULTIOMICS_LABELS[o] + " seeds in %{y}: %{x}<extra></extra>",
+    }));
+    traces.push({ type: "bar", orientation: "h", name: "Recruited (no omics supplied them)", y: ids, x: rows.map((r) => r["Recruited"] || 0),
+                  marker: { color: "#CBD5E0" }, hovertemplate: "Recruited in %{y}: %{x}<extra></extra>" });
+    const layout = {
+        barmode: "stack", height: Math.max(300, ids.length * 34 + 140), margin: { l: 90, r: 20, t: 20, b: 60 },
+        plot_bgcolor: "#FAFCFE", paper_bgcolor: "#FAFCFE", legend: { orientation: "h", y: -0.2 },
+        xaxis: { title: { text: "Proteins in the module (a seed hit by several omics counts under each)" } }, yaxis: { autorange: "reversed", type: "category" },
+    };
+    _newOraPlot(div, traces, layout, slug, null, "netbars", "Module composition");
+}
+
+// opts: scale (1 = one pixel per layout unit; the chart is drawn that many times larger or smaller - names and markers keep their size),
+// labels ("all" | "top" = the ten best-ranked pathways | "none").
+function buildPathwayNetwork(div, pw, slug, opts) {
+    if (typeof Plotly === "undefined") return;
+    opts = opts || {};
+    const scale = Math.max(0.1, Number(opts.scale) || 1);
+    const labelMode = opts.labels || "all";
+    const nodes = pw.nodes || [];
+    if (!nodes.length) { div.textContent = pw.note || "No pathway to draw."; return; }
+    // The engine lays the network out in PIXELS on a canvas it sized and keeps every label box (width x height below) from overlapping, so one data unit is one pixel here.
+    const cv = pw.canvas || { width: Math.max(1100, Math.round(Math.sqrt(nodes.length) * 300)), height: 860 };
+    const W = cv.width, H = cv.height;
+    const byId = {};
+    nodes.forEach((n) => { byId[n.id] = n; });
+    const PAL = (typeof NETPROP_MODULE_COLORS !== "undefined" && NETPROP_MODULE_COLORS.length) ? NETPROP_MODULE_COLORS : ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#B279A2"];
+    const edgeTraces = (pw.edges || []).map((e) => {
+        const a = byId[e.a], b = byId[e.b];
+        return { x: [a.x, b.x], y: [a.y, b.y], mode: "lines", type: "scatter", hoverinfo: "skip", showlegend: false,
+                 line: { color: "rgba(80,100,125,0.4)", width: 1 + 2.5 * e.jaccard } };
+    });
+    const edgeHover = {
+        x: (pw.edges || []).map((e) => (byId[e.a].x + byId[e.b].x) / 2), y: (pw.edges || []).map((e) => (byId[e.a].y + byId[e.b].y) / 2),
+        mode: "markers", type: "scatter", showlegend: false, marker: { size: 10, color: "rgba(0,0,0,0)" }, hoverinfo: "text",
+        hovertext: (pw.edges || []).map((e) => byId[e.a].name + "  -  " + byId[e.b].name + "<br>shared hit members: " + e.shared + ", Jaccard " + e.jaccard.toFixed(2)),
+    };
+    // wrap a long pathway name into at most 3 short lines; each line is escaped on its own and joined with a REAL <br> (escaping the joined
+    // string turned the tags into visible text and left one long line that ran into its neighbours)
+    const wrapLabel = (s) => { const words = String(s).split(" "); const out = []; let cur = ""; words.forEach((w) => { if ((cur + " " + w).trim().length > 24 && cur) { out.push(cur); cur = w; } else cur = (cur + " " + w).trim(); }); if (cur) out.push(cur); return out.slice(0, 3).map(_escapePlotlyText).join("<br>") + (out.length > 3 ? "..." : ""); };
+    const size = (n) => 14 + 4 * Math.sqrt(n.n_hit_members);
+    const nodeTrace = {
+        x: nodes.map((n) => n.x), y: nodes.map((n) => n.y), mode: "markers+text", type: "scatter", showlegend: false,
+        text: nodes.map((n, i) => (labelMode === "none" || (labelMode === "top" && i >= 10)) ? "" : wrapLabel(n.name)), textposition: "top center", textfont: { size: 11, color: "#1B2A41" },
+        marker: { size: nodes.map(size), color: nodes.map((n) => PAL[(n.group - 1) % PAL.length]),
+                  line: { color: nodes.map((n) => n.significant ? "#111111" : "#FFFFFF"), width: nodes.map((n) => n.significant ? 3 : 1.5) } },
+        hovertext: nodes.map((n) => "<b>" + _escapePlotlyText(n.name) + "</b> (" + n.id + ")<br>combined p " + _fmtSci(n.combined_p, 2) +
+            (n.combined_fdr === null ? "" : ", FDR " + _fmtSci(n.combined_fdr, 2)) + "<br>" +
+            ((n.merged || []).length ? "also stands for " + n.merged.length + " near-identical pathway(s): " + n.merged.slice(0, 4).map((m) => _escapePlotlyText(m.name)).join("; ") + (n.merged.length > 4 ? "; ..." : "") + "<br>" : "") +
+            pw.omics.map((o) => MULTIOMICS_LABELS[o] + ": " + (n.hits[o] || 0) + " hit(s)" + ((n.members[o] || []).length ? " (" + n.members[o].slice(0, 6).map(_escapePlotlyText).join(", ") + ((n.members[o].length > 6 || n.hits[o] > 6) ? ", ..." : "") + ")" : "")).join("<br>")),
+        hoverinfo: "text", customdata: nodes.map((n) => n.id),
+    };
+    // evidence chips: one per omics that hit the pathway, in the fixed omics order, in a row under the node (pixel offsets turned into data units)
+    const chipTraces = (pw.omics || []).map((o, k) => {
+        const have = nodes.filter((n) => (n.hits[o] || 0) > 0);
+        const slot = (n) => { const present = pw.omics.filter((q) => (n.hits[q] || 0) > 0); const i = present.indexOf(o); return (i - (present.length - 1) / 2) * 13; };
+        return { x: have.map((n) => n.x + slot(n) / scale), y: have.map((n) => n.y + (size(n) / 2 + 9) / scale), mode: "markers", type: "scatter", name: MULTIOMICS_LABELS[o],
+                 marker: { size: 9, color: MULTIOMICS_COLORS[o], line: { color: "#FFFFFF", width: 1 } }, hoverinfo: "skip" };
+    });
+    const layout = {
+        width: Math.round(W * scale), height: Math.round(H * scale) + 70, margin: { l: 0, r: 0, t: 60, b: 10 }, plot_bgcolor: "#FAFCFE", paper_bgcolor: "#FAFCFE", hovermode: "closest", dragmode: "pan",
+        xaxis: { visible: false, range: [0, W], fixedrange: false }, yaxis: { visible: false, range: [H, 0] },       // y grows downward, 1 unit = 1 pixel
+        legend: { orientation: "h", y: 1.0, yanchor: "bottom", x: 0 },
+    };
+    div.style.width = Math.round(W * scale) + "px";
+    div._figHome = { x: [0, W], y: [H, 0] };
+    _newOraPlot(div, edgeTraces.concat([edgeHover, nodeTrace], chipTraces), layout, slug, null, "netpath", "Pathway network", null, { responsive: false });
+}
+
+function renderMultiomicsNetResultsScreen() {
+    const mo = STATE.multiomics;
+    const run = mo.net.run;
+    const wrap = el("div", { class: "ora-config-screen ora-results-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Multi-omics - Network-based Integration: results"));
+    const payload = run.results;
+    if (!payload) {
+        wrap.appendChild(alertBox("info", "Running analysis... (the first run downloads the STRING network and Reactome files, then runs the permutation test)"));
+        const progressWrap = el("div", { class: "progress-wrap" });
+        progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, el("div", { id: "multiomics-net-progress-inner", class: "progress-bar-inner", style: { width: "0%" } })));
+        progressWrap.appendChild(el("div", { id: "multiomics-net-progress-label", class: "progress-label" }, ""));
+        wrap.appendChild(progressWrap);
+        return wrap;
+    }
+    const prop = payload.propagation, params = payload.parameters, seeds = payload.seeds, pw = payload.pathway_network || { nodes: [], edges: [], groups: [], omics: [] };
+    const mods = payload.modules;
+    (payload.caveats || []).forEach((c) => wrap.appendChild(alertBox("warning", c)));
+    const card = el("div", { class: "rank-card ora-db-card ora-result-card multiomics-net-result" });
+    wrap.appendChild(card);
+    const navHost = el("div", {});
+    card.appendChild(navHost);
+    const nav = makeResultNav(navHost, { stateKey: "multiomics_net" });
+    const hitAlpha = params.fdr_alpha || 0.05;
+
+    // ----- overview -----
+    const ov = nav.pane("Overview");
+    ov.appendChild(metricCards([
+        ["Omics in the network", payload.omics_used.map((o) => MULTIOMICS_LABELS[o]).join(" + ")], ["Seeds", seeds.n_seeds],
+        ["Seeds from several omics", seeds.n_multi_omics_seeds], ["Significant proteins", prop.n_hits], ["Recruited", prop.n_recruited],
+        ["Modules", mods ? (mods.table.rows || []).length : 0], ["Pathways in the pathway network", (pw.nodes || []).length],
+    ], 4));
+    ov.appendChild(el("div", { class: "section-label" }, "What each omics contributed"));
+    ov.appendChild(buildTable({ columns: Object.keys(payload.omics[0] || {}), rows: payload.omics }, {
+        cellFormatFn: (col, val) => (col === "Share of the combined weight" ? _fmtFixed(val, 3) : col === "Used" ? (val ? "yes" : "no - left out") : val) }));
+    const dlOm = el("button", { class: "btn" }, "Download this table (CSV)");
+    dlOm.addEventListener("click", () => downloadFile("/api/multiomics/network/download?which=omics", "multiomics_network_omics_seeds.csv"));
+    ov.appendChild(dlOm);
+    ov.appendChild(el("div", { class: "caption" },
+        "'Recruited' proteins are proteins no omics supplied that the network places at the centre of the combined response - what this adds over " +
+        "testing each omics alone. A seed scoring significantly is largely expected: it receives signal directly and is compared against permutations " +
+        "in which it is usually not a seed, so read the recruited set as the discovery. Equal weight per omics: every omics' seeds carry the same total weight."));
+    const nd = prop.null_diagnostics || {};
+    ov.appendChild(el("div", { class: "caption" },
+        "Significance comes from " + (nd.n_permutations || params.n_permutations) + " degree-preserving permutations; p-values use a skew-aware fit where the null is skewed " +
+        "enough (" + (nd.n_gamma_tail || 0) + " of " + prop.n_proteins + " proteins). Treat the ranking as more reliable than any single protein's exact FDR."));
+
+    // ----- hit table -----
+    const hp = nav.pane("Hit table");
+    hp.appendChild(el("div", { class: "caption" },
+        "Every protein in the network, ranked by FDR. 'Seed omics' names the omics that seeded a protein; a blank means no omics did (a recruited protein). The log2FC / padj columns are what YOUR tables measured, per omics."));
+    let recruitedOnly = (prop.n_recruited || 0) > 0;
+    const hrow = el("div", { class: "row", style: { alignItems: "center", margin: "0.5rem 0" } });
+    const hlab = el("label", { style: { display: "flex", alignItems: "center", gap: "0.4rem" } });
+    const hcb = el("input", { type: "checkbox", class: "multiomics-net-recruited-only" });
+    hcb.checked = recruitedOnly;
+    hlab.appendChild(hcb);
+    hlab.appendChild(document.createTextNode(" Show RECRUITED proteins only (" + (prop.n_recruited || 0) + " of " + (prop.n_hits || 0) + " significant proteins - none was a seed)"));
+    hrow.appendChild(hlab);
+    hp.appendChild(hrow);
+    const hhost = el("div", {});
+    hp.appendChild(hhost);
+    const drawHits = () => {
+        hhost.innerHTML = "";
+        let tp = prop.table;
+        if (recruitedOnly) tp = { columns: prop.table.columns, rows: prop.table.rows.filter((r) => r["Seed"] === false && r["FDR (recruited family)"] !== null && Number(r["FDR (recruited family)"]) < hitAlpha) };
+        hhost.appendChild(buildTable(tp, { maxHeight: 520,
+            rowClassFn: (r) => { const c = recruitedOnly ? "FDR (recruited family)" : "FDR"; return (r[c] !== null && Number(r[c]) < hitAlpha) ? "row-significant" : ""; },
+            cellFormatFn: (col, val) => {
+                if (["p-value", "Empirical p-value", "FDR", "FDR (recruited family)", "Transcriptomics padj", "Proteomics padj"].indexOf(col) !== -1) return _fmtSci(val, 3);
+                if (col === "Propagated score") { const n = Number(val); return val === "" ? "" : (isFinite(n) ? n.toExponential(2) : val); }
+                if (col === "Z-score") return _fmtFixed(val, 2);
+                if (["log2FC", "Seed score", "Transcriptomics log2FC", "Proteomics log2FC"].indexOf(col) !== -1) return _fmtFixed(val, 3);
+                return val;
+            } }));
+    };
+    hcb.addEventListener("change", () => { recruitedOnly = hcb.checked; drawHits(); });
+    drawHits();
+    const hd = el("button", { class: "btn" }, "Download hit table (CSV)");
+    hd.addEventListener("click", () => downloadFile("/api/multiomics/network/download?which=hits", "multiomics_network_hits.csv"));
+    hp.appendChild(hd);
+
+    // ----- figures (the single-omics network tiles' own builders) -----
+    const fp = nav.pane("Figures");
+    const fig = { nodesShown: 50, fontSize: 12, colorScaleName: ORA_DOT_COLOR_SCALES[0][1], minEdgeConfidence: 0 };
+    const toggles = [];
+    const controls = el("div", { class: "chart-toggle-row" });
+    const opt = (label, choices, current, onChange) => {
+        const w = el("label", { class: "chart-option-control" });
+        w.appendChild(el("span", { class: "chart-option-label" }, label));
+        const sel = el("select", { class: "chart-option-select" });
+        choices.forEach(([lbl, val]) => sel.appendChild(el("option", { value: String(val) }, lbl)));
+        sel.value = String(current);
+        sel.addEventListener("change", () => { onChange(sel.value); toggles.forEach((t) => t.redraw()); });
+        w.appendChild(sel);
+        controls.appendChild(w);
+    };
+    opt("Nodes shown", [["25", 25], ["50", 50], ["100", 100], ["200", 200]], fig.nodesShown, (v) => { fig.nodesShown = Number(v); });
+    opt("Font size", [["10", 10], ["12", 12], ["14", 14]], fig.fontSize, (v) => { fig.fontSize = Number(v); });
+    opt("Colour scale", ORA_DOT_COLOR_SCALES, fig.colorScaleName, (v) => { fig.colorScaleName = v; });
+    opt("Min edge confidence", [["any", 0], ["0.7", 0.7], ["0.9", 0.9]], fig.minEdgeConfidence, (v) => { fig.minEdgeConfidence = Number(v); });
+    fp.appendChild(controls);
+    const t1 = _netpropChartToggle("Show network figure", "propnet", (d) => buildNetpropNetwork(d, payload, "score", { ...fig, dbName: NET_DB }), _oraChartId("propnet", NET_DB, "score"), NET_DB);
+    const t2 = _netpropChartToggle("Show null distribution", "histogram", (d) => buildNetpropHistogram(d, payload, { fontSize: fig.fontSize, dbName: NET_DB }), _oraChartId("histogram", NET_DB, "null"), NET_DB);
+    toggles.push(t1, t2);
+    fp.appendChild(t1.el);
+    fp.appendChild(t2.el);
+    if (nd.skew_caveat) fp.appendChild(alertBox("warning", nd.skew_caveat));
+
+    // ----- modules -----
+    if (mods && (mods.table.rows || []).length) {
+        const mp = nav.pane("Modules");
+        mp.appendChild(el("div", { class: "caption" },
+            "Densely connected groups among the significant proteins. The columns 'Seeds from ...' count how many members each omics supplied (a seed hit by several omics counts under each, 'Seeds from several omics' says how many); a module fed by ONE omics is that omics' own story, one fed by several is where they agree."));
+        if (mods.cap_info && mods.cap_info.capped) mp.appendChild(alertBox("info", "Clustering used the " + mods.cap_info.n_used_for_modules + " strongest of " + mods.cap_info.n_hits + " significant proteins."));
+        mp.appendChild(buildTable(mods.table, { maxHeight: 440,
+            cellFormatFn: (col, val) => (col === "Top enriched FDR" || col === "Top enriched FDR (raw, uncorrected)") ? _fmtSci(val, 3) : val }));
+        const md = el("button", { class: "btn" }, "Download modules (CSV)");
+        md.addEventListener("click", () => downloadFile("/api/multiomics/network/download?which=modules", "multiomics_network_modules.csv"));
+        mp.appendChild(md);
+        const bars = el("div", { class: "chart-container multiomics-net-bars", id: "multiomics-net-bars" });
+        mp.appendChild(el("div", { class: "section-label" }, "Where each module's members come from"));
+        mp.appendChild(bars);
+        scheduleChart("multiomics-net-bars", (d) => buildNetModuleBars(d, mods, "net-bars"));
+        const t3 = _netpropChartToggle("Show module-coloured network", "modulenet", (d) => buildNetpropNetwork(d, payload, "module", { ...fig, dbName: NET_DB }), _oraChartId("modulenet", NET_DB, "module"), NET_DB);
+        toggles.push(t3);
+        mp.appendChild(t3.el);
+
+        const withEnr = (mods.table.rows || []).map((r) => r["Module ID"]).filter((m) => mods.enrichment && mods.enrichment[m] && (mods.enrichment[m].table.rows || []).length);
+        if (withEnr.length) {
+            const ep = nav.pane("Module enrichment");
+            ep.appendChild(el("div", { class: "caption" }, mods.selection_caveat || ""));
+            const msel = el("select", { class: "text-input multiomics-net-module-select" });
+            withEnr.forEach((m) => msel.appendChild(el("option", { value: m }, m)));
+            const dsel = el("select", { class: "text-input" });
+            ep.appendChild(el("div", { class: "row" }, [el("div", { class: "col" }, [el("div", { class: "chart-option-label" }, "Module"), msel]),
+                                                          el("div", { class: "col" }, [el("div", { class: "chart-option-label" }, "Annotation source"), dsel])]));
+            const ehost = el("div", {});
+            ep.appendChild(ehost);
+            let etoggle = null;
+            const drawEnr = () => {
+                ehost.innerHTML = "";
+                const e = mods.enrichment[msel.value];
+                const cand = e && e.candidates ? e.candidates[dsel.value] : null;
+                if (!cand) return;
+                ehost.appendChild(buildTable(cand.table, { maxHeight: 360, cellFormatFn: (col, val) => (["p-value", "FDR", "Bonferroni"].indexOf(col) !== -1 ? _fmtSci(val, 3) : col === "Fold Enrichment" ? _fmtFixed(val, 2) : val) }));
+                const dl = el("button", { class: "btn" }, "Download this module's enrichment (CSV)");
+                dl.addEventListener("click", () => downloadFile("/api/multiomics/network/download?which=enrichment&key=" + encodeURIComponent(msel.value) + "&db=" + encodeURIComponent(dsel.value), "multiomics_network_enrichment_" + msel.value.toLowerCase() + ".csv"));
+                ehost.appendChild(dl);
+                etoggle = _netpropChartToggle("Show dot plot", "dot", (d) => buildDotPlot(d, cand.table, NET_DB, "enrichment", ORA_DOT_COLOR_SCALES[0][1], { topN: 20, sortBy: "fdr", fontSize: 12, alpha: hitAlpha }), _oraChartId("dot", NET_DB, "enrichment"), NET_DB);
+                ehost.appendChild(etoggle.el);
+            };
+            const fillDb = () => {
+                dsel.innerHTML = "";
+                const e = mods.enrichment[msel.value];
+                const keys = Object.keys((e && e.candidates) || {}).filter((k) => e.candidates[k]);
+                keys.sort((a, b) => (a === e.namespace ? -1 : b === e.namespace ? 1 : 0));
+                keys.forEach((k) => dsel.appendChild(el("option", { value: k }, k)));
+                drawEnr();
+            };
+            msel.addEventListener("change", fillDb);
+            dsel.addEventListener("change", drawEnr);
+            fillDb();
+        }
+    }
+
+    // ----- metabolites -----
+    if (payload.metabolites) {
+        const mt = nav.pane("Metabolite enzymes");
+        mt.appendChild(el("div", { class: "caption" },
+            "How each hit metabolite reached the network: its ChEBI match, the number of Reactome reactions it takes part in, the proteins listed in those reactions, and whether it was used. " +
+            "A compound in more reactions than the limit (a cofactor such as ATP or water) is left out - it would seed a large part of the proteome. Reactome lists every protein taking part in a reaction, not only its catalyst."));
+        mt.appendChild(buildTable(payload.metabolites, { maxHeight: 460 }));
+        const dm = el("button", { class: "btn" }, "Download metabolite table (CSV)");
+        dm.addEventListener("click", () => downloadFile("/api/multiomics/network/download?which=metabolites", "multiomics_network_metabolite_enzymes.csv"));
+        mt.appendChild(dm);
+    }
+
+    // ----- pathway network -----
+    const pp = nav.pane("Pathway network");
+    pp.appendChild(el("div", { class: "caption" },
+        "Reactome pathways your omics hit (the best combined p-values of the Joint Pathway Enrichment test), joined when the members that were HIT overlap (Jaccard similarity; " +
+        "genes pooled across omics by symbol, metabolites kept apart). Colour = a group of connected pathways; the chips under a pathway name the omics that hit it; size = hit members; " +
+        "a black outline = combined FDR <= 0.05. After Merico et al. 2010 (Enrichment Map)."));
+    if (pw.note) pp.appendChild(alertBox("info", pw.note));
+    if ((pw.nodes || []).length) {
+        const barP = el("div", { class: "row multiomics-net-path-toolbar" });
+        const labSel = el("select", { class: "text-input multiomics-net-path-labels" });
+        [["Pathway names: all", "all"], ["Pathway names: the 10 best only", "top"], ["Pathway names: none", "none"]].forEach(([lab, val]) => labSel.appendChild(el("option", { value: val }, lab)));
+        const sizeSelP = el("select", { class: "text-input multiomics-net-path-size" });
+        [["Size: fit to page", "fit"], ["Size: 50%", "0.5"], ["Size: 75%", "0.75"], ["Size: 100% (readable)", "1"], ["Size: 150%", "1.5"], ["Size: 200%", "2"]].forEach(([lab, val]) => sizeSelP.appendChild(el("option", { value: val }, lab)));
+        sizeSelP.value = "1";
+        const dlFig = figureDownloadButton("multiomics-net-pathway", "net-pathway", "netpath", "Pathway network", "multiomics-net-path-download");
+        barP.appendChild(el("div", { class: "col" }, labSel));
+        barP.appendChild(el("div", { class: "col" }, sizeSelP));
+        barP.appendChild(el("div", { class: "col" }, dlFig));
+        pp.appendChild(barP);
+        pp.appendChild(figureToolsRow("multiomics-net-pathway", "multiomics-net-path-tools"));
+        const frame = el("div", { class: "multiomics-net-path-frame", style: { overflow: "auto", maxHeight: "82vh", border: "1px solid #D5DEE7" } });
+        const pdiv = el("div", { class: "chart-container multiomics-net-pathway", id: "multiomics-net-pathway" });
+        frame.appendChild(pdiv);
+        pp.appendChild(frame);
+        const pathOpts = () => ({
+            labels: labSel.value,
+            scale: sizeSelP.value === "fit" ? Math.min(1, ((frame.clientWidth || 900) - 4) / ((pw.canvas && pw.canvas.width) || 1100)) : Number(sizeSelP.value),
+        });
+        scheduleChart("multiomics-net-pathway", (d) => buildPathwayNetwork(d, pw, "net-pathway", pathOpts()));
+        const rebuildPath = () => {
+            // a fresh element, not a redraw: the old chart is purged and the new one sized from scratch (as the pathway map does)
+            const old = frame.firstChild;
+            if (old && typeof Plotly !== "undefined") { try { Plotly.purge(old); } catch (e) { /* not a plot */ } }
+            frame.innerHTML = "";
+            const fresh = el("div", { class: "chart-container multiomics-net-pathway", id: "multiomics-net-pathway" });
+            frame.appendChild(fresh);
+            buildPathwayNetwork(fresh, pw, "net-pathway", pathOpts());
+        };
+        labSel.addEventListener("change", rebuildPath);
+        sizeSelP.addEventListener("change", rebuildPath);
+        pp.appendChild(el("div", { class: "caption" }, (pw.groups || []).length + " group(s) of pathways; " + (pw.edges || []).length + " overlap link(s) at the chosen threshold. " +
+            (pw.n_merged ? pw.n_merged + " further pathway(s) were merged into a better-ranked one that shares at least " + Math.round((pw.merge_jaccard || 0) * 100) + "% of its hit members (hover a pathway to see which; the CSV lists them)." : "")));
+        const pd = el("button", { class: "btn" }, "Download pathways (CSV)");
+        pd.addEventListener("click", () => downloadFile("/api/multiomics/network/download?which=pathway_nodes", "multiomics_network_pathways.csv"));
+        const ed = el("button", { class: "btn" }, "Download overlap links (CSV)");
+        ed.addEventListener("click", () => downloadFile("/api/multiomics/network/download?which=pathway_edges", "multiomics_network_pathway_links.csv"));
+        pp.appendChild(pd);
+        pp.appendChild(ed);
+    }
+
+    // ----- parameters -----
+    const pa = nav.pane("Parameters used");
+    const pbox = el("div", { class: "rank-card ora-db-card" });
+    [["STRING version", params.string_version], ["Confidence cutoff", params.confidence], ["Seed weighting", params.weighting],
+     ["Restart probability", params.restart_prob], ["Permutations", params.n_permutations + " (" + params.permutation_type + ", seed " + params.seed_rng + ")"],
+     ["Significance", "FDR < " + params.fdr_alpha], ["MCL inflation", params.mcl_inflation], ["Min module size", params.min_module_size],
+     ["Max hits clustered", params.max_hits_for_modules], ["Module labels", (params.enrichment_databases || []).join(" + ")],
+     ["Metabolite reaction limit", params.max_reactions], ["Protein limit per reaction", params.max_reaction_proteins]].forEach(([k, v]) => pbox.appendChild(el("div", { class: "caption" }, "- " + k + ": " + v)));
+    pa.appendChild(pbox);
+    nav.finish();
+
+    const again = el("button", { class: "btn", style: { marginTop: "0.8rem" } }, "Change settings");
+    again.addEventListener("click", () => { mo.net.run = { results: null, busy: false }; STATE.aaPage = "multiomics_net"; render(); });
+    wrap.appendChild(again);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToMultiomicsActions());
+    return wrap;
+}
+
+
+// ===========================================================================
+// Multi-omics - MOFA / Factor-based Integration
+//
+// The maths is in Multiomics_mofa.py (the authors' own mofapy2 model plus the checks around it); this is the screens. The omics tables are
+// the ones of Correlation-based Integration (uploaded and matched on the Correlation screen, run in "MOFA mode"), so the upload / match
+// step is shared; the setup and results are here. State: STATE.multiomics.mofa.
+// ===========================================================================
+
+const MOFA_CONVERGENCE = [["Convergence: fast (default)", "fast"], ["Convergence: medium", "medium"], ["Convergence: slow - the most careful", "slow"]];
+const MOFA_SIZES = [["Size: fit to page", "fit"], ["Size: 50%", "0.5"], ["Size: 75%", "0.75"], ["Size: 100% (readable)", "1"], ["Size: 150%", "1.5"], ["Size: 200%", "2"]];
+const MOFA_GROUP_COLORS = ["#083B6B", "#E9A23B", "#2A9D8F", "#E45756", "#B279A2", "#72B7B2", "#9D755D", "#BAB0AC"];
+const MOFA_ENRICH_COLUMNS = ["Term ID", "Term Name", "Members", "AUC", "z", "p-value", "FDR", "Direction", "Top members"];
+
+function freshMofaState() {
+    return {
+        draft: null, options: null, optionsError: "", run: { results: null, busy: false }, enrich: {}, enrichBusy: false,
+        sizes: {}, fx: 0, fy: 1, vfactor: 0, wOmics: null, wFactor: 0, eOmics: null, eFactor: 0, eMode: "signed", eMin: 10, eMax: 500,
+    };
+}
+
+function _mofaReset() {
+    if (STATE.multiomics) STATE.multiomics.mofa = freshMofaState();
+}
+
+// The Correlation screen, in MOFA mode: the same upload / organism / matching, then a button to the MOFA setup instead of the correlation setup.
+function renderMofaContinue() {
+    const mo = STATE.multiomics;
+    const wrap = el("div", { class: "multiomics-mofa-continue" });
+    const n = mo.corr.alignment ? mo.corr.alignment.n_shared : 0;
+    wrap.appendChild(el("div", { class: "section-label" }, "Next"));
+    if (n < 6) {
+        wrap.appendChild(alertBox("warning", "Only " + n + " sample(s) are in every file. MOFA needs at least 6, and below about 15 its factors and weights are unreliable."));
+    } else if (n < 15) {
+        wrap.appendChild(alertBox("warning", n + " samples are shared. With fewer than about 15, MOFA's factors, and above all its weights, are unreliable - read the results as leads."));
+    }
+    const btn = el("button", { class: "btn btn-primary ora-run-btn multiomics-mofa-continue-btn", style: { marginTop: "0.6rem" } }, "Continue to MOFA setup");
+    btn.disabled = n < 6;
+    btn.addEventListener("click", () => { mo.mofa.options = null; mo.mofa.optionsError = ""; STATE.aaPage = "multiomics_mofa"; render(); });
+    wrap.appendChild(btn);
+    return wrap;
+}
+
+// ---- one figure, with every control the app's other figures have -------------------------------------------------------
+// A row (the figure's own selects, a Size menu, Download figure), the tools row (zoom, pan, in / out, autoscale, reset), and the figure in
+// a scroll frame. spec = { id, slug, kind, kindLabel, baseW, extra: [elements], draw(div, scale) }; returns { redraw }.
+function mofaFigure(host, spec) {
+    const mofa = STATE.multiomics.mofa;
+    const bar = el("div", { class: "row multiomics-mofa-fig-bar" });
+    (spec.extra || []).forEach((x) => bar.appendChild(el("div", { class: "col" }, x)));
+    const sizeSel = el("select", { class: "text-input multiomics-mofa-size", "data-fig": spec.id });
+    MOFA_SIZES.forEach(([lab, val]) => sizeSel.appendChild(el("option", { value: val }, lab)));
+    sizeSel.value = mofa.sizes[spec.id] || "1";
+    bar.appendChild(el("div", { class: "col" }, sizeSel));
+    bar.appendChild(el("div", { class: "col" }, figureDownloadButton(spec.id, spec.slug, spec.kind, spec.kindLabel, "multiomics-mofa-download")));
+    host.appendChild(bar);
+    host.appendChild(figureToolsRow(spec.id, "multiomics-mofa-tools"));
+    const frame = el("div", { class: "multiomics-mofa-frame", style: { overflow: "auto", maxHeight: "82vh", border: "1px solid #D5DEE7" } });
+    host.appendChild(frame);
+    const scaleNow = () => {
+        if (sizeSel.value !== "fit") return Number(sizeSel.value);
+        const w = typeof spec.baseW === "function" ? spec.baseW() : spec.baseW;
+        return Math.min(1, ((frame.clientWidth || 900) - 4) / w);
+    };
+    const redraw = () => {
+        const old = frame.firstChild;
+        if (old && typeof Plotly !== "undefined") { try { Plotly.purge(old); } catch (e) { /* not a plot */ } }
+        frame.innerHTML = "";
+        const d = el("div", { class: "chart-container multiomics-mofa-fig", id: spec.id, style: { minHeight: "0" } });
+        frame.appendChild(d);
+        spec.draw(d, scaleNow());
+    };
+    sizeSel.addEventListener("change", () => { mofa.sizes[spec.id] = sizeSel.value; redraw(); });
+    // first draw once the screen is in the page, so the frame has its real width
+    // drawn at once when the screen is already in the page (a select changed, a result arrived), else once the screen has been built
+    if (document.body.contains(frame)) {
+        redraw();
+    } else {
+        frame.appendChild(el("div", { class: "chart-container multiomics-mofa-fig", id: spec.id }));
+        scheduleChart(spec.id, () => redraw());
+    }
+    return { redraw: redraw };
+}
+
+function _mofaFinishPlot(div, W, H, traces, layout, slug, kind, kindLabel, extra) {
+    layout.width = W;
+    layout.height = H;
+    layout.plot_bgcolor = "#FAFCFE";
+    layout.paper_bgcolor = "#FAFCFE";
+    div.style.width = W + "px";
+    _newOraPlot(div, traces, layout, slug, null, kind, kindLabel, null, Object.assign({ responsive: false }, extra || {}));
+}
+
+function _mofaSelect(options, value, cls, onChange) {
+    const sel = el("select", { class: "text-input " + cls });
+    options.forEach(([lab, val]) => sel.appendChild(el("option", { value: String(val) }, lab)));
+    sel.value = String(value);
+    sel.addEventListener("change", () => onChange(sel.value));
+    return sel;
+}
+
+function _mofaLabelled(label, control) {
+    return el("div", {}, [el("div", { class: "chart-option-label" }, label), control]);
+}
+
+// ---- the figures ----------------------------------------------------------------------------------------------------------
+
+function buildMofaR2Heatmap(div, R, slug, s) {
+    if (typeof Plotly === "undefined") return;
+    const z = R.r2.values, names = R.r2.factors, rows = R.r2.omics;
+    const zmax = Math.max(1, Math.max.apply(null, z.map((r) => Math.max.apply(null, r))));
+    const W = Math.round((names.length * 76 + 260) * s), H = Math.round((rows.length * 56 + 170) * s);
+    const trace = {
+        type: "heatmap", z: z, x: names, y: rows, colorscale: [[0, "#FFFFFF"], [1, corrScale().pos]], zmin: 0, zmax: zmax, xgap: 2, ygap: 2,
+        text: z.map((r) => r.map((v) => _fmtFixed(v, 1))), texttemplate: "%{text}", textfont: { size: 12 },
+        hovertemplate: "%{y}, %{x}<br>%{z:.2f}% of this omics' variance<extra></extra>",
+        colorbar: { title: { text: "% of the variance" }, thickness: 14, len: 0.8 },
+    };
+    const layout = {
+        margin: { l: 130, r: 110, t: 30, b: 70 }, xaxis: { type: "category", title: { text: "Factor" }, side: "bottom" },
+        yaxis: { type: "category", autorange: "reversed", automargin: true },
+    };
+    _mofaFinishPlot(div, W, H, [trace], layout, slug, "mofar2", "Variance explained per factor and omics");
+}
+
+function buildMofaTotals(div, R, slug, s) {
+    if (typeof Plotly === "undefined") return;
+    const keys = R.omics;
+    const W = Math.round(660 * s), H = Math.round((keys.length * 56 + 130) * s);
+    const trace = {
+        type: "bar", orientation: "h", y: keys.map((o) => R.omics_labels[o]), x: keys.map((o) => R.r2_total[o]),
+        marker: { color: keys.map((o) => MULTIOMICS_COLORS[o]) }, text: keys.map((o) => _fmtFixed(R.r2_total[o], 1) + "%"), textposition: "outside",
+        hovertemplate: "%{y}: %{x:.2f}% of its variance explained by all factors<extra></extra>",
+    };
+    const layout = {
+        margin: { l: 130, r: 60, t: 20, b: 60 }, xaxis: { title: { text: "% of the omics' variance explained by all factors together" }, range: [0, Math.min(100, Math.max.apply(null, keys.map((o) => R.r2_total[o])) * 1.2 + 4)] },
+        yaxis: { autorange: "reversed", automargin: true }, showlegend: false,
+    };
+    _mofaFinishPlot(div, W, H, [trace], layout, slug, "mofatotal", "Total variance explained");
+}
+
+function _mofaGroupList(R) {
+    if (!R.groups) return [];
+    return Array.from(new Set(Object.values(R.groups).filter((g) => g))).sort();
+}
+
+function buildMofaFactorScatter(div, R, fx, fy, slug, s) {
+    if (typeof Plotly === "undefined") return;
+    const fv = R.factor_values, groups = _mofaGroupList(R);
+    const W = Math.round(660 * s), H = Math.round(540 * s);
+    const mk = (idx, name, color) => ({
+        type: "scatter", mode: "markers", name: name, x: idx.map((i) => fv.values[i][fx]), y: idx.map((i) => fv.values[i][fy]),
+        text: idx.map((i) => fv.samples[i]), marker: { size: 11, color: color, line: { color: "#FFFFFF", width: 1 } },
+        hovertemplate: "%{text}<br>" + fv.names[fx] + " %{x:.3f}<br>" + fv.names[fy] + " %{y:.3f}<extra></extra>",
+    });
+    const all = fv.samples.map((x, i) => i);
+    const traces = groups.length
+        ? groups.map((g, k) => mk(all.filter((i) => R.groups[fv.samples[i]] === g), g, MOFA_GROUP_COLORS[k % MOFA_GROUP_COLORS.length]))
+            .concat(all.some((i) => !R.groups[fv.samples[i]]) ? [mk(all.filter((i) => !R.groups[fv.samples[i]]), "no group", "#BAB0AC")] : [])
+        : [mk(all, "samples", "#083B6B")];
+    const layout = {
+        margin: { l: 80, r: 30, t: 30, b: 70 }, xaxis: { title: { text: fv.names[fx] }, zeroline: true }, yaxis: { title: { text: fv.names[fy] }, zeroline: true },
+        showlegend: groups.length > 0, legend: { orientation: "h", y: 1.02, yanchor: "bottom", x: 0 }, hovermode: "closest", dragmode: "zoom",
+    };
+    _mofaFinishPlot(div, W, H, traces, layout, slug, "mofascatter", "Factor scatter");
+}
+
+function buildMofaFactorByGroup(div, R, k, slug, s) {
+    if (typeof Plotly === "undefined") return;
+    const fv = R.factor_values, groups = _mofaGroupList(R);
+    const all = fv.samples.map((x, i) => i);
+    const sets = groups.length ? groups.map((g) => [g, all.filter((i) => R.groups[fv.samples[i]] === g)]) : [["All samples", all]];
+    const W = Math.round(Math.max(500, sets.length * 150 + 180) * s), H = Math.round(460 * s);
+    const traces = sets.map(([g, idx], j) => ({
+        type: "box", name: g, y: idx.map((i) => fv.values[i][k]), text: idx.map((i) => fv.samples[i]), boxpoints: "all", jitter: 0.45, pointpos: 0,
+        marker: { color: MOFA_GROUP_COLORS[j % MOFA_GROUP_COLORS.length], size: 8, opacity: 0.85 }, line: { color: MOFA_GROUP_COLORS[j % MOFA_GROUP_COLORS.length] },
+        fillcolor: "rgba(0,0,0,0)", hovertemplate: "%{text}<br>%{y:.3f}<extra>" + _escapePlotlyText(g) + "</extra>",
+    }));
+    const layout = {
+        margin: { l: 80, r: 30, t: 30, b: 60 }, yaxis: { title: { text: fv.names[k] + " value" }, zeroline: true }, showlegend: false, boxmode: "group",
+    };
+    _mofaFinishPlot(div, W, H, traces, layout, slug, "mofabox", "Factor values by group");
+}
+
+function buildMofaWeights(div, R, omics, factor, slug, s) {
+    if (typeof Plotly === "undefined") return;
+    const items = (R.top_weights[omics] || {})[factor] || [];
+    const W = Math.round(780 * s), H = Math.round((items.length * 22 + 130) * s);
+    const sc = corrScale();
+    // two features can carry one gene symbol (isoforms, protein groups): a repeated label would stack both bars on one row, so it gets its feature id
+    const seen = {};
+    items.forEach((x) => { seen[x.label] = (seen[x.label] || 0) + 1; });
+    const rowLabel = (x) => _escapePlotlyText(seen[x.label] > 1 && x.feature !== x.label ? x.label + " [" + x.feature + "]" : x.label);
+    const trace = {
+        type: "bar", orientation: "h", y: items.map(rowLabel), x: items.map((x) => x.weight),
+        marker: { color: items.map((x) => x.weight >= 0 ? sc.pos : sc.neg) },
+        customdata: items.map((x) => x.feature), hovertemplate: "%{y} (%{customdata})<br>weight %{x:.4f}<extra></extra>",
+    };
+    const layout = {
+        margin: { l: 190, r: 30, t: 20, b: 60 }, xaxis: { title: { text: "Weight on " + factor + " (" + R.omics_labels[omics] + ")" }, zeroline: true },
+        yaxis: { autorange: "reversed", automargin: true, type: "category", tickfont: { size: 11 } }, showlegend: false, bargap: 0.25,
+    };
+    _mofaFinishPlot(div, W, H, [trace], layout, slug, "mofaweights", "Top weights");
+}
+
+function buildMofaEnrichDots(div, table, mode, slug, s) {
+    if (typeof Plotly === "undefined") return;
+    const rows = (table.rows || []).slice().sort((a, b) => a.FDR - b.FDR).slice(0, 20);
+    if (!rows.length) { div.textContent = "No pathway to plot."; return; }
+    const names = rows.map((r) => _wrapOraLabel(String(r["Term Name"] || ""), 44));
+    const base = _oraCategoricalChartHeight(names, 12);
+    const W = Math.round(960 * s), H = Math.round(base * s);
+    const trace = {
+        type: "scatter", mode: "markers", y: names, x: rows.map((r) => r.AUC),
+        customdata: rows.map((r) => [String(r["Term Name"] || ""), r.FDR, r.Members, r.Direction]),
+        marker: { size: _magnitudeMarkerSizes(rows.map((r) => Number(r.Members)), 8, 30), color: rows.map((r) => -Math.log10(r.FDR + 1e-300)),
+                  colorscale: ORA_DOT_COLOR_SCALES[0][2], reversescale: ORA_DOT_COLOR_SCALES[0][3], showscale: true,
+                  colorbar: { title: "-log10(FDR)", thickness: 14, len: 0.7 } },
+        hovertemplate: "%{customdata[0]}<br>AUC %{x:.3f}<br>FDR %{customdata[1]:.2e}<br>members %{customdata[2]}, %{customdata[3]}<extra></extra>",
+    };
+    const layout = {
+        font: { size: 12 }, margin: { l: 385, r: 105, t: 22, b: 70 },
+        xaxis: { title: { text: mode === "absolute" ? "AUC of |weight| (0.5 = no difference; above = larger weights)" : "AUC (0.5 = no difference; above = higher weights, below = lower)" }, zeroline: false },
+        yaxis: { autorange: "reversed", automargin: true }, showlegend: false,
+    };
+    _mofaFinishPlot(div, W, H, [trace], layout, slug, "mofaenrich", "Pathway dot plot");
+}
+
+// ---- setup ------------------------------------------------------------------------------------------------------------------
+
+function _mofaDraft(options) {
+    const d = options.defaults;
+    return {
+        factors: d.factors, convergence: d.convergence, top_variance: d.top_variance, log2: false, scale_views: true, n_refits: d.n_refits,
+        min_r2: d.min_r2, stability_cut: d.stability_cut, group_column: options.group_options.length ? options.group_options[0].key : "",
+    };
+}
+
+function renderMultiomicsMofaScreen() {
+    const mo = STATE.multiomics;
+    const mofa = mo.mofa;
+    const wrap = el("div", { class: "ora-config-screen ora-module-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Multi-omics - MOFA / Factor-based Integration: setup"));
+    const back = el("button", { class: "btn" }, "Back to the tables and matched samples");
+    back.addEventListener("click", () => { STATE.aaPage = "multiomics_corr"; render(); });
+    if (!mofa.options) {
+        if (mofa.optionsError) {
+            wrap.appendChild(alertBox("warning", mofa.optionsError));
+        } else {
+            wrap.appendChild(alertBox("info", "Loading..."));
+            apiJson("/api/multiomics/mofa/options").then((o) => { mofa.options = o; mofa.optionsError = ""; if (!mofa.draft || !o.ready) mofa.draft = o.ready ? _mofaDraft(o) : null; render(); })
+                .catch((err) => { mofa.optionsError = "Could not read the session: " + err.message; render(); });
+        }
+        wrap.appendChild(el("div", { class: "right-actions" }, el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, back)));
+        return wrap;
+    }
+    const o = mofa.options;
+    if (!o.ready) {
+        wrap.appendChild(alertBox("warning", "The uploaded tables are no longer matched in this session. Go back, resolve the identifiers and match the samples again."));
+        wrap.appendChild(el("div", { class: "right-actions" }, el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, back)));
+        return wrap;
+    }
+    if (!mofa.draft) mofa.draft = _mofaDraft(o);
+    const d = mofa.draft;
+    wrap.appendChild(el("div", { class: "caption" },
+        "MOFA (Multi-Omics Factor Analysis) looks for a few hidden FACTORS that explain the differences between your samples across all the omics at once. " +
+        "For each factor it tells you how much of each omics' variation it explains (so whether it is shared or belongs to one omics), what value each sample has " +
+        "on it, and which features carry it. It runs the authors' own program (mofapy2) on the " + o.samples.length + " samples your tables share (" +
+        o.omics.map((k) => MULTIOMICS_LABELS[k]).join(", ") + "). It is descriptive: a factor is a pattern of co-variation, not a pathway or a cause."));
+    if (o.samples.length < o.warn_samples) {
+        wrap.appendChild(alertBox("warning", o.samples.length + " samples are shared. Below about " + o.warn_samples + " the factors, and above all the weights, are unreliable."));
+    }
+    wrap.appendChild(el("div", { class: "section-label" }, "Model"));
+    const r1 = el("div", { class: "row" });
+    r1.appendChild(_corrNumberField("Factors to offer (2 to 25)", d.factors, 1, 2, 25, (v) => { d.factors = Math.round(v); }));
+    r1.appendChild(el("div", { class: "col" }, [el("div", { class: "chart-option-label" }, "Convergence"),
+        _mofaSelect(MOFA_CONVERGENCE, d.convergence, "multiomics-mofa-convergence", (v) => { d.convergence = v; })]));
+    wrap.appendChild(r1);
+    wrap.appendChild(el("div", { class: "caption" },
+        "Offer MORE factors than you expect: MOFA switches off the ones the data do not need (and the setup drops any factor that explains less than the minimum below in every omics). " +
+        "Offering too few can also lose a real one - in a test with three planted factors, offering 3, 4, 5 or 6 lost one of them every time, and 8 or more found all three."));
+    const r2 = el("div", { class: "row" });
+    r2.appendChild(_corrNumberField("Most variable features kept per omics (50 to 5000)", d.top_variance, 100, 50, 5000, (v) => { d.top_variance = Math.round(v); }));
+    r2.appendChild(_corrNumberField("Drop a factor explaining less than this % in every omics", d.min_r2, 0.5, 0, 20, (v) => { d.min_r2 = v; }));
+    wrap.appendChild(r2);
+    const scaleRow = el("label", { class: "ora-db-pill" });
+    const scaleCb = el("input", { type: "checkbox", class: "ora-db-checkbox multiomics-mofa-scale" });
+    scaleCb.checked = d.scale_views;
+    scaleCb.addEventListener("change", () => { d.scale_views = scaleCb.checked; });
+    scaleRow.appendChild(scaleCb);
+    scaleRow.appendChild(document.createTextNode(" Give every omics the same total variance (otherwise the omics with the most features dominates)"));
+    wrap.appendChild(corrPillBlock(scaleRow));
+    const logRow = el("label", { class: "ora-db-pill" });
+    const logCb = el("input", { type: "checkbox", class: "ora-db-checkbox multiomics-mofa-log2" });
+    logCb.checked = d.log2;
+    logCb.addEventListener("change", () => { d.log2 = logCb.checked; });
+    logRow.appendChild(logCb);
+    logRow.appendChild(document.createTextNode(" Apply log2(x + 1) first (for raw counts / intensities; values must be non-negative)"));
+    wrap.appendChild(corrPillBlock(logRow));
+    wrap.appendChild(el("div", { class: "caption" },
+        "Features missing in more than half of the samples and constant features are dropped; the rest are centred. Missing values are allowed - MOFA handles them."));
+
+    wrap.appendChild(el("div", { class: "section-label" }, "Is the result stable?"));
+    const r3 = el("div", { class: "row" });
+    r3.appendChild(_corrNumberField("Refits with other random starts (0 to 5)", d.n_refits, 1, 0, 5, (v) => { d.n_refits = Math.round(v); }));
+    r3.appendChild(_corrNumberField("Flag a factor as unstable below this |r| (0 to 1)", d.stability_cut, 0.05, 0, 1, (v) => { d.stability_cut = v; }));
+    wrap.appendChild(r3);
+    wrap.appendChild(el("div", { class: "caption" },
+        "MOFA starts from a random point, so the authors advise refitting and keeping only factors that come back. Each refit uses another seed; a factor whose best match " +
+        "in the refits correlates (median |r|) less than the cut-off is flagged unstable - shown, never hidden."));
+
+    wrap.appendChild(el("div", { class: "section-label" }, "Sample groups (only to colour and test the factors)"));
+    const gsel = el("select", { class: "text-input multiomics-mofa-group" });
+    gsel.appendChild(el("option", { value: "" }, "No groups"));
+    o.group_options.forEach((g) => gsel.appendChild(el("option", { value: g.key }, g.label + " - " + g.groups.join(", ") + " (" + g.n_samples + " of " + o.samples.length + " samples)")));
+    gsel.value = o.group_options.some((g) => g.key === d.group_column) ? d.group_column : "";
+    d.group_column = gsel.value;
+    gsel.addEventListener("change", () => { d.group_column = gsel.value; });
+    wrap.appendChild(el("div", { class: "row" }, el("div", { class: "col" }, gsel)));
+    wrap.appendChild(el("div", { class: "caption" },
+        "The model is fitted on ALL samples together; groups play no part in it. They only colour the plots and let each factor be tested for a difference between groups. " +
+        "A label column found in your files (a Group column in the metabolite table) is offered above; or upload a small sample sheet: the first column = the sample id, " +
+        "every other column = a label (Group, Batch, Sex ...)."));
+    wrap.appendChild(fileInputWidget({
+        accept: ".csv,.tsv,.txt", buttonLabel: "Choose sample sheet", initialFilename: o.sheet ? o.sheet.filename : "",
+        onChange: async (file) => {
+            if (!file) return;
+            const fd = new FormData();
+            fd.append("file", file);
+            try {
+                const res = await apiUpload("/api/multiomics/mofa/groups", fd);
+                o.group_options = res.group_options;
+                o.sheet = { filename: res.filename, n_matched: res.n_matched };
+                const first = res.group_options.find((g) => g.key.indexOf("sheet:") === 0);
+                if (first) d.group_column = first.key;
+                render();
+            } catch (err) { alert(err.message); }
+        },
+    }));
+    if (o.sheet) wrap.appendChild(el("div", { class: "caption" }, "Sample sheet '" + o.sheet.filename + "': " + o.sheet.n_matched + " of " + o.samples.length + " samples found in it."));
+
+    const run = el("button", { class: "btn btn-primary ora-run-btn multiomics-mofa-run", style: { marginTop: "1rem" } }, "Run MOFA");
+    run.addEventListener("click", () => startMofaRun());
+    wrap.appendChild(run);
+    wrap.appendChild(el("div", { class: "right-actions", style: { marginTop: "1rem" } }, el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, back)));
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToMultiomicsActions());
+    return wrap;
+}
+
+async function startMofaRun() {
+    const mofa = STATE.multiomics.mofa;
+    mofa.run = { results: null, busy: true };
+    mofa.enrich = {};
+    STATE.aaPage = "multiomics_mofa_results";
+    render();
+    const fail = (msg) => { alert("Run failed: " + msg); mofa.run = { results: null, busy: false }; STATE.aaPage = "multiomics_mofa"; render(); };
+    try {
+        await apiPostJson("/api/multiomics/mofa/configure", mofa.draft);
+        const { job_id } = await apiPostJson("/api/multiomics/mofa/run", {});
+        pollJob(job_id, {
+            onProgress: (job) => {
+                const bar = document.getElementById("multiomics-mofa-progress-inner");
+                const label = document.getElementById("multiomics-mofa-progress-label");
+                if (bar) bar.style.width = Math.round((job.progress || 0) * 100) + "%";
+                if (label) label.textContent = job.message || "";
+            },
+            onDone: (result) => {
+                mofa.run = { results: result, busy: false };
+                mofa.fx = 0; mofa.fy = Math.min(1, result.n_factors - 1); mofa.vfactor = 0; mofa.wOmics = result.omics[0]; mofa.wFactor = 0;
+                mofa.eOmics = result.omics[0]; mofa.eFactor = 0;
+                render();
+            },
+            onError: fail,
+        });
+    } catch (err) { fail(err.message); }
+}
+
+// ---- results ----------------------------------------------------------------------------------------------------------------
+
+function renderMultiomicsMofaResultsScreen() {
+    const mo = STATE.multiomics;
+    const mofa = mo.mofa;
+    const run = mofa.run;
+    const wrap = el("div", { class: "ora-config-screen ora-results-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Multi-omics - MOFA / Factor-based Integration: results"));
+    if (!run.results) {
+        wrap.appendChild(alertBox("info", "Running analysis... (MOFA fits the model, then refits it with other random starts to check the factors are stable)"));
+        const progressWrap = el("div", { class: "progress-wrap" });
+        progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, el("div", { id: "multiomics-mofa-progress-inner", class: "progress-bar-inner", style: { width: "0%" } })));
+        progressWrap.appendChild(el("div", { id: "multiomics-mofa-progress-label", class: "progress-label" }, ""));
+        wrap.appendChild(progressWrap);
+        return wrap;
+    }
+    const R = run.results;
+    const names = R.factor_values.names;
+    const omicsLabel = (k) => R.omics_labels[k];
+    wrap.appendChild(metricCards([
+        ["Samples", R.samples.length], ["Omics", R.omics.map(omicsLabel).join(" + ")],
+        ["Factors kept / offered", R.n_factors + " / " + R.n_factors_requested], ["Fit", (R.converged ? "converged" : "did NOT converge") + " (" + R.n_iterations + " iterations)"],
+    ], 4));
+    (R.warnings || []).forEach((w) => wrap.appendChild(alertBox("warning", w)));
+    const card = el("div", { class: "rank-card ora-db-card ora-result-card ora-db-card-multiomics-mofa multiomics-mofa-result" });
+    wrap.appendChild(card);
+    const nav = makeResultNav(card, { stateKey: "multiomics_mofa" });
+
+    // ----- overview -----
+    const ov = nav.pane("Overview");
+    ov.appendChild(el("div", { class: "section-label" }, "Factors"));
+    const stab = R.stability.per_factor;
+    ov.appendChild(buildTable({
+        columns: ["Factor"].concat(R.omics.map(omicsLabel).map((l) => l + " (% variance)")).concat(["Stability (median |r| in the refits)", "Verdict"]),
+        rows: names.map((f, k) => {
+            const row = { "Factor": f };
+            R.omics.forEach((o, i) => { row[omicsLabel(o) + " (% variance)"] = _fmtFixed(R.r2.values[i][k], 1); });
+            const st = stab[k];
+            row["Stability (median |r| in the refits)"] = st.stability === null ? "not checked" : _fmtFixed(st.stability, 2);
+            row["Verdict"] = st.unstable ? "UNSTABLE - did not reappear" : st.stability === null ? "" : "stable";
+            return row;
+        }),
+    }, {}));
+    ov.appendChild(el("div", { class: "caption" },
+        "Each row is a factor, ordered by the total variance it explains. A factor with a large share in SEVERAL omics is a shared pattern (the omics move together); one with a large share in a single omics " +
+        "is specific to it. Factors are ordered and their sign fixed (the largest weight positive) so a re-run gives the same table; the sign itself has no meaning - a factor can be read upside down. " +
+        "Stability: the model was refitted " + R.stability.n_refits + " time(s) with other random starts; a factor that does not come back (|r| below " + R.stability.cut + ") is flagged."));
+    ov.appendChild(el("div", { class: "section-label" }, "What these results do not tell you"));
+    ov.appendChild(el("div", { class: "caption" },
+        "A factor is a statistical pattern, not a pathway and not a cause: read its biology from the top-weighted features and the pathway test, and treat it as a lead. " +
+        "Variance explained is how much of the variation of the features that entered the model (" + R.omics.map((o) => R.n_features[o] + " " + omicsLabel(o).toLowerCase()).join(", ") + ") the factor accounts for, not a proportion of the biology. " +
+        "With few samples the weights are noisy; with sample groups, a factor that follows the groups is the treatment effect seen across the omics, which is not a discovery of a mechanism."));
+
+    // ----- variance explained -----
+    const vp = nav.pane("Variance explained");
+    vp.appendChild(el("div", { class: "caption" },
+        "How much of each omics' variation each factor explains (percent; mofapy2's own definition, 1 - residual / total on the data the model saw). " +
+        "A column with several filled rows is a SHARED factor; one filled row is a factor of that omics alone. Colour = share, from white (none) to the strongest."));
+    mofaFigure(vp, { id: "multiomics-mofa-r2", slug: "mofa-r2", kind: "mofar2", kindLabel: "Variance explained", baseW: R.n_factors * 76 + 260,
+        draw: (d, s) => buildMofaR2Heatmap(d, R, "mofa-r2", s) });
+    vp.appendChild(el("div", { class: "section-label" }, "Total per omics"));
+    mofaFigure(vp, { id: "multiomics-mofa-totals", slug: "mofa-totals", kind: "mofatotal", kindLabel: "Total variance explained", baseW: 660,
+        draw: (d, s) => buildMofaTotals(d, R, "mofa-totals", s) });
+    const dlR2 = el("button", { class: "btn" }, "Download variance explained (CSV)");
+    dlR2.addEventListener("click", () => downloadFile("/api/multiomics/mofa/download?table=r2", "multiomics_mofa_r2.csv"));
+    vp.appendChild(dlR2);
+
+    // ----- factors -----
+    const fp = nav.pane("Factors");
+    fp.appendChild(el("div", { class: "caption" },
+        "Each sample's value on each factor. " + (R.groups ? "Colours follow the sample groups; they were NOT used to fit the model. " : "No sample groups were given, so the samples are not coloured. ") +
+        "Pick two factors to see whether the samples separate, and one factor to see its values by group."));
+    const factorOptions = names.map((n, i) => [n, i]);
+    const sx = _mofaSelect(factorOptions, mofa.fx, "multiomics-mofa-fx", () => {});
+    const sy = _mofaSelect(factorOptions, mofa.fy, "multiomics-mofa-fy", () => {});
+    const scatterFig = mofaFigure(fp, { id: "multiomics-mofa-scatter", slug: "mofa-scatter", kind: "mofascatter", kindLabel: "Factor scatter", baseW: 660,
+        extra: [_mofaLabelled("Horizontal factor", sx), _mofaLabelled("Vertical factor", sy)],
+        draw: (d, s) => buildMofaFactorScatter(d, R, Number(sx.value), Number(sy.value), "mofa-scatter", s) });
+    sx.addEventListener("change", () => { mofa.fx = Number(sx.value); scatterFig.redraw(); });
+    sy.addEventListener("change", () => { mofa.fy = Number(sy.value); scatterFig.redraw(); });
+    fp.appendChild(el("div", { class: "section-label" }, "One factor, by group"));
+    const sv = _mofaSelect(factorOptions, mofa.vfactor, "multiomics-mofa-vfactor", () => {});
+    const boxFig = mofaFigure(fp, { id: "multiomics-mofa-box", slug: "mofa-box", kind: "mofabox", kindLabel: "Factor values by group", baseW: () => Math.max(500, Math.max(1, _mofaGroupList(R).length) * 150 + 180),
+        extra: [_mofaLabelled("Factor", sv)], draw: (d, s) => buildMofaFactorByGroup(d, R, Number(sv.value), "mofa-box", s) });
+    sv.addEventListener("change", () => { mofa.vfactor = Number(sv.value); boxFig.redraw(); });
+    fp.appendChild(el("div", { class: "section-label" }, "Does a factor differ between the groups?"));
+    const gt = R.group_tests;
+    if (!R.group_column) {
+        fp.appendChild(alertBox("info", "No sample groups were chosen on the setup page, so no factor was tested."));
+    } else if (!gt.rows.length) {
+        fp.appendChild(alertBox("info", gt.note || "No group test was run."));
+    } else {
+        fp.appendChild(el("div", { class: "caption" },
+            gt.test + " on each factor's values across the groups (" + gt.groups.map((g) => g + ": " + gt.counts[g]).join(", ") + " samples); Benjamini-Hochberg across the " + gt.rows.length +
+            " factors. Effect = " + (gt.test === "Mann-Whitney U" ? "rank-biserial correlation, from -1 to +1 (+1: every '" + gt.groups[0] + "' sample is above every '" + gt.groups[1] + "' sample)" : "eta squared from the Kruskal-Wallis H, from 0 to 1 (roughly the share of the rank variance the groups explain)") +
+            ". It describes the factor; it was not used to fit the model."));
+        const cols = Object.keys(gt.rows[0]);
+        fp.appendChild(buildTable({ columns: cols, rows: gt.rows }, {
+            cellFormatFn: (col, val) => (col === "p-value" || col === "FDR" ? _fmtSci(val, 2) : (col === "Effect" || col.indexOf("Median") === 0) ? _fmtFixed(val, 3) : val),
+        }));
+    }
+    const dlF = el("button", { class: "btn" }, "Download factor values per sample (CSV)");
+    dlF.addEventListener("click", () => downloadFile("/api/multiomics/mofa/download?table=factors", "multiomics_mofa_factors.csv"));
+    fp.appendChild(dlF);
+    if (R.group_column) {
+        const dlG = el("button", { class: "btn" }, "Download the group tests (CSV)");
+        dlG.addEventListener("click", () => downloadFile("/api/multiomics/mofa/download?table=groups", "multiomics_mofa_group_tests.csv"));
+        fp.appendChild(dlG);
+    }
+
+    // ----- weights -----
+    const wp = nav.pane("Weights");
+    wp.appendChild(el("div", { class: "caption" },
+        "A weight says how strongly a feature belongs to a factor: a large positive weight means the feature is high in the samples with a high factor value, a large negative one that it is low there (only the " +
+        "sign relative to the other features of the same factor means something). The " + 25 + " largest |weights| of the chosen factor and omics are shown; the CSV has every feature of the omics, for every factor."));
+    const wo = _mofaSelect(R.omics.map((k) => [omicsLabel(k), k]), mofa.wOmics || R.omics[0], "multiomics-mofa-womics", () => {});
+    const wf = _mofaSelect(factorOptions, mofa.wFactor, "multiomics-mofa-wfactor", () => {});
+    const wtab = el("div", {});
+    const drawWTable = () => {
+        wtab.innerHTML = "";
+        const items = ((R.top_weights[wo.value] || {})[names[Number(wf.value)]]) || [];
+        wtab.appendChild(buildTable({ columns: ["Feature", "Label", "Weight"], rows: items.map((x) => ({ "Feature": x.feature, "Label": x.label, "Weight": x.weight })) },
+            { maxHeight: 420, cellFormatFn: (col, val) => (col === "Weight" ? _fmtFixed(val, 4) : val) }));
+        const dl = el("button", { class: "btn" }, "Download all weights of " + omicsLabel(wo.value) + " (CSV)");
+        dl.addEventListener("click", () => downloadFile("/api/multiomics/mofa/download?table=" + encodeURIComponent("weights:" + wo.value), "multiomics_mofa_weights_" + wo.value + ".csv"));
+        wtab.appendChild(dl);
+    };
+    const wFig = mofaFigure(wp, { id: "multiomics-mofa-weights", slug: "mofa-weights", kind: "mofaweights", kindLabel: "Top weights", baseW: 780,
+        extra: [_mofaLabelled("Omics", wo), _mofaLabelled("Factor", wf)],
+        draw: (d, s) => buildMofaWeights(d, R, wo.value, names[Number(wf.value)], "mofa-weights", s) });
+    const onW = () => { mofa.wOmics = wo.value; mofa.wFactor = Number(wf.value); wFig.redraw(); drawWTable(); };
+    wo.addEventListener("change", onW);
+    wf.addEventListener("change", onW);
+    wp.appendChild(wtab);
+    drawWTable();
+
+    // ----- enrichment -----
+    renderMofaEnrichmentPane(nav.pane("Pathway enrichment"), R, names, factorOptions);
+
+    // ----- data used -----
+    const dp = nav.pane("Data used");
+    dp.appendChild(el("div", { class: "section-label" }, "Features that entered the model"));
+    dp.appendChild(buildTable({
+        columns: ["Omics", "In your file", "Too many missing values", "Constant", "Kept (most variable)"],
+        rows: R.omics.map((o) => {
+            const f = R.reports[o];
+            return { "Omics": omicsLabel(o), "In your file": f.n_in, "Too many missing values": f.n_too_many_missing, "Constant": f.n_constant, "Kept (most variable)": f.n_out };
+        }),
+    }, {}));
+    dp.appendChild(el("div", { class: "caption" }, "The same " + R.samples.length + " samples in every omics (the ones every file has). Missing values stay missing: MOFA handles them, nothing is filled in by Omiscera."));
+    const dlS = el("button", { class: "btn" }, "Download stability (CSV)");
+    dlS.addEventListener("click", () => downloadFile("/api/multiomics/mofa/download?table=stability", "multiomics_mofa_stability.csv"));
+    dp.appendChild(dlS);
+
+    // ----- parameters -----
+    const pa = nav.pane("Parameters used");
+    const pbox = el("div", { class: "rank-card ora-db-card" });
+    const c = R.config;
+    [["Model", "MOFA (Argelaguet et al. 2018; MOFA+ 2020), mofapy2 0.7.5, Gaussian likelihood in every omics"], ["Factors offered", c.factors],
+     ["Convergence", c.convergence], ["Most variable features per omics", c.top_variance], ["log2(x + 1) first", c.log2 ? "yes" : "no"],
+     ["Equal total variance per omics", c.scale_views ? "yes" : "no"], ["Features missing in more than", Math.round(c.max_missing * 100) + "% of the samples are dropped"],
+     ["Factor dropped below", c.min_r2 + "% variance in every omics"], ["Stability refits", c.n_refits + " (flag below |r| " + c.stability_cut + ")"],
+     ["Random seed", c.seed], ["Sample groups", c.group_column || "none"]].forEach(([k, v]) => {
+        pbox.appendChild(el("div", { class: "caption" }, "- " + k + ": " + v));
+    });
+    pa.appendChild(pbox);
+    nav.finish();
+
+    const actions = el("div", { class: "right-actions", style: { marginTop: "1rem" } });
+    const again = el("button", { class: "btn" }, "Change settings");
+    again.addEventListener("click", () => { mofa.run = { results: null, busy: false }; STATE.aaPage = "multiomics_mofa"; render(); });
+    actions.appendChild(el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, again));
+    wrap.appendChild(actions);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToMultiomicsActions());
+    return wrap;
+}
+
+function renderMofaEnrichmentPane(pane, R, names, factorOptions) {
+    const mofa = STATE.multiomics.mofa;
+    pane.appendChild(el("div", { class: "caption" },
+        "Which Reactome pathways does a factor's weight pattern point to? The weights of every feature of one omics for one factor are compared pathway by pathway: the weights of the " +
+        "pathway's members against all the others (Mann-Whitney U, the idea of PCGSE, Frost et al. 2015; MOFA's own enrichment works the same way). 'Signed' asks whether a pathway's " +
+        "members have HIGHER or LOWER weights; 'absolute' asks whether they have LARGER |weights|, whatever the sign. Benjamini-Hochberg across the pathways tested. Features are matched to a pathway " +
+        "by gene (transcripts and proteins) or by compound; features that match nothing are left out of the test, and several features of one gene count once. Run per omics and factor, " +
+        "so the pathway sets are built only when you ask (once per omics: seconds for transcripts and proteins, several minutes for metabolites; later factors reuse them)."));
+    const eo = _mofaSelect(R.omics.map((k) => [R.omics_labels[k], k]), mofa.eOmics || R.omics[0], "multiomics-mofa-eomics", () => {});
+    const ef = _mofaSelect(factorOptions, mofa.eFactor, "multiomics-mofa-efactor", () => {});
+    const em = _mofaSelect([["Signed weights (higher / lower)", "signed"], ["Absolute weights (larger |weight|)", "absolute"]], mofa.eMode, "multiomics-mofa-emode", () => {});
+    pane.appendChild(el("div", { class: "row" }, [el("div", { class: "col" }, _mofaLabelled("Omics", eo)), el("div", { class: "col" }, _mofaLabelled("Factor", ef)),
+                                                  el("div", { class: "col" }, _mofaLabelled("Test", em))]));
+    const r2 = el("div", { class: "row" });
+    r2.appendChild(_corrNumberField("Smallest pathway (members matched)", mofa.eMin, 1, 3, 200, (v) => { mofa.eMin = Math.round(v); drawResult(); }));
+    r2.appendChild(_corrNumberField("Largest pathway", mofa.eMax, 50, 10, 5000, (v) => { mofa.eMax = Math.round(v); drawResult(); }));
+    pane.appendChild(r2);
+    const runBtn = el("button", { class: "btn multiomics-mofa-enrich-run", style: { marginTop: "0.6rem" } }, "Run pathway enrichment");
+    const progressWrap = el("div", { class: "progress-wrap hidden" });
+    const inner = el("div", { class: "progress-bar-inner", style: { width: "0%" } });
+    const lab = el("div", { class: "progress-label" }, "");
+    progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, inner));
+    progressWrap.appendChild(lab);
+    pane.appendChild(runBtn);
+    pane.appendChild(progressWrap);
+    const host = el("div", { class: "multiomics-mofa-enrich-result" });
+    pane.appendChild(host);
+    const keyNow = () => [eo.value, names[Number(ef.value)], em.value, mofa.eMin, mofa.eMax].join("|");
+    function drawResult() {
+        host.innerHTML = "";
+        const res = mofa.enrich[keyNow()];
+        if (!res) { host.appendChild(el("div", { class: "caption" }, "Not run yet for this omics, factor and test.")); return; }
+        if (res.note) host.appendChild(alertBox(res.n_tested ? "info" : "warning", res.note));
+        if (!res.n_tested) return;
+        host.appendChild(metricCards([["Pathways tested", res.n_tested], ["Features matched to a pathway", res.n_features_matched + " of " + res.n_features],
+            ["Significant (FDR < 0.05)", res.table.rows.filter((r) => r.FDR < 0.05).length]], 3));
+        host.appendChild(buildTable(res.table, { maxHeight: 420, cellFormatFn: (col, val) => (col === "p-value" || col === "FDR" ? _fmtSci(val, 2) : (col === "AUC" || col === "z") ? _fmtFixed(val, 3) : val) }));
+        if (res.n_tested > res.table.rows.length) host.appendChild(el("div", { class: "caption" }, "The " + res.table.rows.length + " most significant of " + res.n_tested + " are shown; the CSV has them all."));
+        const dl = el("button", { class: "btn" }, "Download this enrichment (CSV)");
+        dl.addEventListener("click", () => downloadFile("/api/multiomics/mofa/download?table=" + encodeURIComponent("enrichment:" + res.omics + ":" + res.factor + ":" + res.mode),
+            "multiomics_mofa_enrichment_" + res.omics + "_" + res.factor + "_" + res.mode + ".csv"));
+        host.appendChild(dl);
+        const figHost = el("div", {});
+        host.appendChild(figHost);
+        const figId = "multiomics-mofa-enrich-dots";
+        const fig = mofaFigure(figHost, { id: figId, slug: "mofa-enrich", kind: "mofaenrich", kindLabel: "Pathway dot plot", baseW: 960,
+            draw: (d, s) => buildMofaEnrichDots(d, res.table, res.mode, "mofa-enrich", s) });
+        void fig;
+    }
+    [eo, ef, em].forEach((s) => s.addEventListener("change", () => { mofa.eOmics = eo.value; mofa.eFactor = Number(ef.value); mofa.eMode = em.value; drawResult(); }));
+    runBtn.addEventListener("click", async () => {
+        const key = keyNow();
+        runBtn.disabled = true;
+        progressWrap.classList.remove("hidden");
+        const done = () => { runBtn.disabled = false; progressWrap.classList.add("hidden"); };
+        try {
+            const { job_id } = await apiPostJson("/api/multiomics/mofa/enrich", { omics: eo.value, factor: names[Number(ef.value)], mode: em.value, min_size: mofa.eMin, max_size: mofa.eMax });
+            pollJob(job_id, {
+                onProgress: (job) => { inner.style.width = Math.round((job.progress || 0) * 100) + "%"; lab.textContent = job.message || ""; },
+                onDone: (result) => { mofa.enrich[key] = result; done(); render(); },
+                onError: (err) => { alert(err); done(); },
+            });
+        } catch (err) { alert(err.message); done(); }
+    });
+    drawResult();
+}
+
+const MOFA_EXAMPLE_FILES = {
+    transcriptomics: "example_mofa_transcriptomics.csv", proteomics: "example_mofa_proteomics.csv", metabolomics: "example_mofa_metabolomics.csv",
+};
+
+
+// ===========================================================================
+// Multi-omics - DIABLO / Multiblock Integration
+//
+// The maths is in Multiomics_diablo.py (a from-scratch Python port of DIABLO's algorithm, checked against a real mixOmics
+// run - see the module's own docstring); this is the screens. DIABLO is SUPERVISED: it needs a sample group, unlike MOFA.
+// It shares the Correlation screen's upload / match step ("DIABLO mode"); the setup and results are here.
+// State: STATE.multiomics.diablo.
+// ===========================================================================
+
+const DIABLO_SIZES = [["Size: fit to page", "fit"], ["Size: 50%", "0.5"], ["Size: 75%", "0.75"], ["Size: 100% (readable)", "1"], ["Size: 150%", "1.5"], ["Size: 200%", "2"]];
+const DIABLO_GROUP_COLORS = ["#083B6B", "#E9A23B", "#2A9D8F", "#E45756", "#B279A2", "#72B7B2", "#9D755D", "#BAB0AC"];
+const DIABLO_DISTANCES = [["Centroid distance (default)", "centroids.dist"], ["Maximum distance", "max.dist"], ["Mahalanobis distance", "mahalanobis.dist"]];
+
+function freshDiabloState() {
+    return {
+        draft: null, options: null, optionsError: "", run: { results: null, busy: false }, enrich: {}, enrichBusy: false,
+        sizes: {}, cx: 0, cy: 1, vcomp: 0, wOmics: null, wComp: 0, eOmics: null, eMin: 10, eMax: 500,
+    };
+}
+
+function _diabloReset() {
+    if (STATE.multiomics) STATE.multiomics.diablo = freshDiabloState();
+}
+
+// The Correlation screen, in DIABLO mode: the same upload / organism / matching, then a button to the DIABLO setup
+// (which asks for the REQUIRED sample group) instead of the correlation setup.
+function renderDiabloContinue() {
+    const mo = STATE.multiomics;
+    const wrap = el("div", { class: "multiomics-diablo-continue" });
+    const n = mo.corr.alignment ? mo.corr.alignment.n_shared : 0;
+    wrap.appendChild(el("div", { class: "section-label" }, "Next"));
+    if (n < 6) {
+        wrap.appendChild(alertBox("warning", "Only " + n + " sample(s) are in every file. DIABLO needs at least two groups of 3 or more samples each (so at least 6 in total)."));
+    } else if (n < 20) {
+        wrap.appendChild(alertBox("warning", n + " samples are shared. DIABLO is a SUPERVISED method - with few samples its cross-validated error is noisy and its selected features unstable; read the results as leads, not findings."));
+    }
+    const btn = el("button", { class: "btn btn-primary ora-run-btn multiomics-diablo-continue-btn", style: { marginTop: "0.6rem" } }, "Continue to DIABLO setup");
+    btn.disabled = n < 6;
+    btn.addEventListener("click", () => { mo.diablo.options = null; mo.diablo.optionsError = ""; STATE.aaPage = "multiomics_diablo"; render(); });
+    wrap.appendChild(btn);
+    return wrap;
+}
+
+// ---- one figure, with every control the app's other figures have (the same pattern as MOFA's mofaFigure, written
+// separately so a change to one tile's figure chrome never silently changes the other's) ------------------------
+function diabloFigure(host, spec) {
+    const diablo = STATE.multiomics.diablo;
+    const bar = el("div", { class: "row multiomics-diablo-fig-bar" });
+    (spec.extra || []).forEach((x) => bar.appendChild(el("div", { class: "col" }, x)));
+    const sizeSel = el("select", { class: "text-input multiomics-diablo-size", "data-fig": spec.id });
+    DIABLO_SIZES.forEach(([lab, val]) => sizeSel.appendChild(el("option", { value: val }, lab)));
+    sizeSel.value = diablo.sizes[spec.id] || "1";
+    bar.appendChild(el("div", { class: "col" }, sizeSel));
+    bar.appendChild(el("div", { class: "col" }, figureDownloadButton(spec.id, spec.slug, spec.kind, spec.kindLabel, "multiomics-diablo-download")));
+    host.appendChild(bar);
+    host.appendChild(figureToolsRow(spec.id, "multiomics-diablo-tools"));
+    const frame = el("div", { class: "multiomics-diablo-frame", style: { overflow: "auto", maxHeight: "82vh", border: "1px solid #D5DEE7" } });
+    host.appendChild(frame);
+    const scaleNow = () => {
+        if (sizeSel.value !== "fit") return Number(sizeSel.value);
+        const w = typeof spec.baseW === "function" ? spec.baseW() : spec.baseW;
+        return Math.min(1, ((frame.clientWidth || 900) - 4) / w);
+    };
+    const redraw = () => {
+        frame.innerHTML = "";
+        const d = el("div", { class: "chart-container multiomics-diablo-fig", id: spec.id, style: { minHeight: "0" } });
+        frame.appendChild(d);
+        spec.draw(d, scaleNow());
+    };
+    sizeSel.addEventListener("change", () => { diablo.sizes[spec.id] = sizeSel.value; redraw(); });
+    if (document.body.contains(frame)) {
+        redraw();
+    } else {
+        frame.appendChild(el("div", { class: "chart-container multiomics-diablo-fig", id: spec.id }));
+        scheduleChart(spec.id, () => redraw());
+    }
+    return { redraw: redraw };
+}
+
+function _diabloFinishPlot(div, W, H, traces, layout, slug, kind, kindLabel, extra) {
+    layout.width = W;
+    layout.height = H;
+    layout.plot_bgcolor = "#FAFCFE";
+    layout.paper_bgcolor = "#FAFCFE";
+    div.style.width = W + "px";
+    _newOraPlot(div, traces, layout, slug, null, kind, kindLabel, null, Object.assign({ responsive: false }, extra || {}));
+}
+
+function _diabloSelect(options, value, cls, onChange) {
+    const sel = el("select", { class: "text-input " + cls });
+    options.forEach(([lab, val]) => sel.appendChild(el("option", { value: String(val) }, lab)));
+    sel.value = String(value);
+    sel.addEventListener("change", () => onChange(sel.value));
+    return sel;
+}
+
+function _diabloLabelled(label, control) {
+    return el("div", {}, [el("div", { class: "chart-option-label" }, label), control]);
+}
+
+function _diabloGroupList(R) {
+    return Array.from(new Set(Object.values(R.groups || {}))).sort();
+}
+
+// ---- the figures ----------------------------------------------------------------------------------------------------------
+
+function buildDiabloComponentScatter(div, R, cx, cy, slug, s) {
+    if (typeof Plotly === "undefined") return;
+    const samples = R.samples, groups = _diabloGroupList(R);
+    const W = Math.round(660 * s), H = Math.round(540 * s);
+    // one trace per OMICS x GROUP (small markers per omics, same colour per group) so the "do the omics agree" question
+    // (the point of DIABLO's design) is visible: the same sample's omics should cluster near each other if they agree
+    const traces = [];
+    R.omics.forEach((o, oi) => {
+        const vals = R.component_values[o];
+        groups.forEach((g, gi) => {
+            const idx = samples.map((x, i) => i).filter((i) => R.groups[samples[i]] === g);
+            traces.push({
+                type: "scatter", mode: "markers", name: MULTIOMICS_LABELS[o] + " - " + g,
+                x: idx.map((i) => vals[i][cx]), y: idx.map((i) => vals[i][cy]), text: idx.map((i) => samples[i]),
+                marker: { size: 10, color: DIABLO_GROUP_COLORS[gi % DIABLO_GROUP_COLORS.length], symbol: ["circle", "square", "diamond", "triangle-up"][oi % 4],
+                         line: { color: "#FFFFFF", width: 1 } },
+                hovertemplate: "%{text}<br>" + MULTIOMICS_LABELS[o] + ", " + g + "<br>%{x:.3f}, %{y:.3f}<extra></extra>",
+            });
+        });
+    });
+    const names = R.component_names;
+    const layout = {
+        margin: { l: 80, r: 30, t: 30, b: 70 }, xaxis: { title: { text: names[cx] }, zeroline: true }, yaxis: { title: { text: names[cy] || names[cx] }, zeroline: true },
+        showlegend: true, legend: { orientation: "h", y: 1.05, yanchor: "bottom", x: 0, font: { size: 10 } }, hovermode: "closest", dragmode: "zoom",
+    };
+    _diabloFinishPlot(div, W, H, traces, layout, slug, "diabloscatter", "Component scatter");
+}
+
+function buildDiabloComponentByGroup(div, R, k, slug, s) {
+    if (typeof Plotly === "undefined") return;
+    const samples = R.samples, groups = _diabloGroupList(R);
+    const W = Math.round(Math.max(500, R.omics.length * groups.length * 90 + 180) * s), H = Math.round(460 * s);
+    const traces = [];
+    R.omics.forEach((o) => {
+        const vals = R.component_values[o];
+        groups.forEach((g, gi) => {
+            const idx = samples.map((x, i) => i).filter((i) => R.groups[samples[i]] === g);
+            traces.push({
+                type: "box", name: MULTIOMICS_LABELS[o] + " - " + g, x0: MULTIOMICS_LABELS[o],
+                y: idx.map((i) => vals[i][k]), text: idx.map((i) => samples[i]), boxpoints: "all", jitter: 0.45, pointpos: 0,
+                marker: { color: DIABLO_GROUP_COLORS[gi % DIABLO_GROUP_COLORS.length], size: 7, opacity: 0.85 },
+                line: { color: DIABLO_GROUP_COLORS[gi % DIABLO_GROUP_COLORS.length] }, fillcolor: "rgba(0,0,0,0)",
+                offsetgroup: g, hovertemplate: "%{text}<br>%{y:.3f}<extra>" + _escapePlotlyText(MULTIOMICS_LABELS[o] + " - " + g) + "</extra>",
+            });
+        });
+    });
+    const layout = {
+        margin: { l: 80, r: 30, t: 30, b: 60 }, yaxis: { title: { text: R.component_names[k] + " value" }, zeroline: true },
+        xaxis: { type: "category" }, showlegend: false, boxmode: "group",
+    };
+    _diabloFinishPlot(div, W, H, traces, layout, slug, "diablobox", "Component values by omics and group");
+}
+
+function buildDiabloWeights(div, R, omics, comp, slug, s) {
+    if (typeof Plotly === "undefined") return;
+    const items = (R.top_weights[omics] || {})[comp] || [];
+    const shown = items.filter((x) => x.weight !== 0).slice(0, 40);
+    const W = Math.round(780 * s), H = Math.round((shown.length * 22 + 130) * s);
+    const sc = corrScale();
+    const seen = {};
+    shown.forEach((x) => { seen[x.label] = (seen[x.label] || 0) + 1; });
+    const rowLabel = (x) => _escapePlotlyText(seen[x.label] > 1 && x.feature !== x.label ? x.label + " [" + x.feature + "]" : x.label);
+    const trace = {
+        type: "bar", orientation: "h", y: shown.map(rowLabel), x: shown.map((x) => x.weight),
+        marker: { color: shown.map((x) => x.weight >= 0 ? sc.pos : sc.neg) },
+        customdata: shown.map((x) => x.feature), hovertemplate: "%{y} (%{customdata})<br>loading %{x:.4f}<extra></extra>",
+    };
+    const layout = {
+        margin: { l: 190, r: 30, t: 20, b: 60 }, xaxis: { title: { text: "Loading on " + comp + " (" + MULTIOMICS_LABELS[omics] + ") - the selected features only" }, zeroline: true },
+        yaxis: { autorange: "reversed", automargin: true, type: "category", tickfont: { size: 11 } }, showlegend: false, bargap: 0.25,
+    };
+    _diabloFinishPlot(div, W, H, [trace], layout, slug, "diabloweights", "Selected-feature loadings");
+}
+
+function buildDiabloPerformance(div, R, slug, s) {
+    if (typeof Plotly === "undefined") return;
+    const rows = R.component_search;
+    const W = Math.round(Math.max(480, rows.length * 110 + 160) * s), H = Math.round(420 * s);
+    const trace = {
+        type: "bar", x: rows.map((r) => "Component " + r.ncomp), y: rows.map((r) => r.BER),
+        error_y: { type: "data", array: rows.map((r) => r.BER_sd), visible: true, color: "#5A6B7C" },
+        marker: { color: rows.map((r) => r.ncomp === R.n_components ? "#083B6B" : "#AFC3D6") },
+        hovertemplate: "%{x}: BER %{y:.3f}<extra></extra>",
+    };
+    const layout = {
+        margin: { l: 70, r: 20, t: 30, b: 60 }, yaxis: { title: { text: "Cross-validated balanced error rate (BER)" }, rangemode: "tozero" },
+        xaxis: { type: "category" }, showlegend: false,
+        shapes: [{ type: "line", x0: -0.5, x1: rows.length - 0.5, y0: 0.5, y1: 0.5, line: { color: "#C0392B", width: 1, dash: "dot" } }],
+        annotations: [{ x: rows.length - 1, y: 0.5, text: "chance (2 groups)", showarrow: false, yshift: 10, font: { size: 10, color: "#C0392B" } }],
+    };
+    _diabloFinishPlot(div, W, H, [trace], layout, slug, "diabloperf", "Component-count search");
+}
+
+function buildDiabloPermutation(div, R, slug, s) {
+    if (typeof Plotly === "undefined") return;
+    const nulls = R.permutation.null_bers;
+    const W = Math.round(620 * s), H = Math.round(380 * s);
+    const trace = { type: "histogram", x: nulls, marker: { color: "#AFC3D6" }, nbinsx: Math.max(6, Math.min(20, nulls.length)), hovertemplate: "BER %{x:.3f}<extra></extra>" };
+    const layout = {
+        margin: { l: 60, r: 20, t: 36, b: 60 }, xaxis: { title: { text: "Cross-validated BER with the group labels shuffled" } }, yaxis: { title: { text: "Permutations" } },
+        shapes: [{ type: "line", x0: R.cv.BER, x1: R.cv.BER, y0: 0, y1: 1, yref: "paper", line: { color: "#C0392B", width: 2 } }],
+        // the arrow points UP to the line's top (y: 1, paper-relative); the label sits BELOW that point (positive ay), inside the
+        // plot area, not above it - placed above (negative ay) it could run past the top margin and clip, as it did at first.
+        annotations: [{ x: R.cv.BER, y: 1, yref: "paper", text: "observed", showarrow: true, ax: 30, ay: 18, font: { size: 11, color: "#C0392B" } }],
+        showlegend: false,
+    };
+    _diabloFinishPlot(div, W, H, [trace], layout, slug, "diabloperm", "Permutation null distribution");
+}
+
+function buildDiabloEnrichDots(div, table, slug, s) {
+    if (typeof Plotly === "undefined") return;
+    const rows = (table.rows || []).slice().sort((a, b) => a.FDR - b.FDR).slice(0, 20);
+    if (!rows.length) { div.textContent = "No pathway to plot."; return; }
+    const names = rows.map((r) => _wrapOraLabel(String(r["Term Name"] || ""), 44));
+    const base = _oraCategoricalChartHeight(names, 12);
+    const W = Math.round(960 * s), H = Math.round(base * s);
+    const trace = {
+        type: "scatter", mode: "markers", y: names, x: rows.map((r) => r["Fold Enrichment"]),
+        customdata: rows.map((r) => [String(r["Term Name"] || ""), r.FDR, r.k, r.K]),
+        marker: { size: _magnitudeMarkerSizes(rows.map((r) => Number(r.k)), 8, 30), color: rows.map((r) => -Math.log10(r.FDR + 1e-300)),
+                  colorscale: ORA_DOT_COLOR_SCALES[0][2], reversescale: ORA_DOT_COLOR_SCALES[0][3], showscale: true,
+                  colorbar: { title: "-log10(FDR)", thickness: 14, len: 0.7 } },
+        hovertemplate: "%{customdata[0]}<br>fold enrichment %{x:.2f}<br>FDR %{customdata[1]:.2e}<br>%{customdata[2]} of %{customdata[3]} selected<extra></extra>",
+    };
+    const layout = {
+        font: { size: 12 }, margin: { l: 385, r: 105, t: 22, b: 60 }, xaxis: { title: { text: "Fold enrichment of the selected features" }, zeroline: false },
+        yaxis: { autorange: "reversed", automargin: true }, showlegend: false,
+    };
+    _diabloFinishPlot(div, W, H, [trace], layout, slug, "diabloenrich", "Pathway dot plot");
+}
+
+// ---- setup ------------------------------------------------------------------------------------------------------------------
+
+function _diabloDraft(options) {
+    const d = options.defaults;
+    return {
+        group_column: options.group_options.length ? (options.group_options.find((g) => g.usable) || options.group_options[0]).key : "",
+        design_value: d.design_value, max_components: Math.min(d.max_components, options.max_components), keepX_grid: d.keepX_grid.slice(),
+        n_folds: d.n_folds, n_repeats: d.n_repeats, distance: d.distance, top_variance: d.top_variance, log2: false,
+    };
+}
+
+function renderMultiomicsDiabloScreen() {
+    const mo = STATE.multiomics;
+    const diablo = mo.diablo;
+    const wrap = el("div", { class: "ora-config-screen ora-module-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Multi-omics - DIABLO / Multiblock Integration: setup"));
+    const back = el("button", { class: "btn" }, "Back to the tables and matched samples");
+    back.addEventListener("click", () => { STATE.aaPage = "multiomics_corr"; render(); });
+    if (!diablo.options) {
+        if (diablo.optionsError) {
+            wrap.appendChild(alertBox("warning", diablo.optionsError));
+        } else {
+            wrap.appendChild(alertBox("info", "Loading..."));
+            apiJson("/api/multiomics/diablo/options").then((o) => { diablo.options = o; diablo.optionsError = ""; if (!diablo.draft || !o.ready) diablo.draft = o.ready ? _diabloDraft(o) : null; render(); })
+                .catch((err) => { diablo.optionsError = "Could not read the session: " + err.message; render(); });
+        }
+        wrap.appendChild(el("div", { class: "right-actions" }, el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, back)));
+        return wrap;
+    }
+    const o = diablo.options;
+    if (!o.ready) {
+        wrap.appendChild(alertBox("warning", "The uploaded tables are no longer matched in this session. Go back, resolve the identifiers and match the samples again."));
+        wrap.appendChild(el("div", { class: "right-actions" }, el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, back)));
+        return wrap;
+    }
+    if (!diablo.draft) diablo.draft = _diabloDraft(o);
+    const d = diablo.draft;
+    wrap.appendChild(el("div", { class: "caption" },
+        "DIABLO (Singh et al. 2019) is SUPERVISED: given your sample groups, it finds a few COMPONENTS per omics that (i) agree with " +
+        "one another across the omics and (ii) separate the groups, using only a SMALL, chosen set of features per omics (sparse). " +
+        "Unlike a model fitted and judged on the same data - which always looks like it separates the groups, whether or not there is " +
+        "a real signal - the result shown here is the CROSS-VALIDATED error on samples the model did not see when choosing its features, " +
+        "plus a permutation test of whether that error is better than this data's own chance structure. It runs on the " + o.samples.length +
+        " samples your tables share (" + o.omics.map((k) => MULTIOMICS_LABELS[k]).join(", ") + ")."));
+    if (o.samples.length < 20) {
+        wrap.appendChild(alertBox("warning", o.samples.length + " samples are shared. Below about 20 the cross-validated error is noisy and the selected features unstable - read the result's spread (+/- s.d.), not just the number."));
+    }
+    wrap.appendChild(el("div", { class: "section-label" }, "Sample groups (required - DIABLO is supervised)"));
+    const gsel = el("select", { class: "text-input multiomics-diablo-group" });
+    const usable = o.group_options.filter((g) => g.usable);
+    if (!usable.length) gsel.appendChild(el("option", { value: "" }, "No usable group source yet"));
+    usable.forEach((g) => gsel.appendChild(el("option", { value: g.key }, g.label + " - " + g.groups.join(", ") + " (" + g.n_samples + " of " + o.samples.length + " samples)")));
+    gsel.value = usable.some((g) => g.key === d.group_column) ? d.group_column : (usable[0] ? usable[0].key : "");
+    d.group_column = gsel.value;
+    gsel.addEventListener("change", () => { d.group_column = gsel.value; });
+    wrap.appendChild(el("div", { class: "row" }, el("div", { class: "col" }, gsel)));
+    wrap.appendChild(el("div", { class: "caption" },
+        "A label column found in your files (a Group column in the metabolite table) is offered above if it has at least two groups of 3 or more " +
+        "samples each; or upload a small sample sheet: the first column = the sample id, every other column = a label (Group, Batch, Sex ...)."));
+    wrap.appendChild(fileInputWidget({
+        accept: ".csv,.tsv,.txt", buttonLabel: "Choose sample sheet", initialFilename: o.sheet ? o.sheet.filename : "",
+        onChange: async (file) => {
+            if (!file) return;
+            const fd = new FormData();
+            fd.append("file", file);
+            try {
+                const res = await apiUpload("/api/multiomics/diablo/groups", fd);
+                o.group_options = res.group_options;
+                o.sheet = { filename: res.filename, n_matched: res.n_matched };
+                const first = res.group_options.find((g) => g.key.indexOf("sheet:") === 0 && g.usable);
+                if (first) d.group_column = first.key;
+                render();
+            } catch (err) { alert(err.message); }
+        },
+    }));
+    if (o.sheet) wrap.appendChild(el("div", { class: "caption" }, "Sample sheet '" + o.sheet.filename + "': " + o.sheet.n_matched + " of " + o.samples.length + " samples found in it."));
+
+    wrap.appendChild(el("div", { class: "section-label" }, "Model"));
+    const r1 = el("div", { class: "row" });
+    r1.appendChild(_corrNumberField("Components to search over (1 to " + o.max_components + ")", d.max_components, 1, 1, o.max_components, (v) => { d.max_components = Math.round(v); }));
+    r1.appendChild(_corrNumberField("Link between omics in the design (0 to 1)", d.design_value, 0.05, 0, 1, (v) => { d.design_value = v; }));
+    wrap.appendChild(r1);
+    wrap.appendChild(el("div", { class: "caption" },
+        "The number of components is chosen by cross-validated error (not typed in blind). The design value is how strongly the omics are " +
+        "linked to EACH OTHER while fitting (they are always linked to the groups); 0.1, the default, is the DIABLO paper's own case-study " +
+        "choice - a compromise between finding a signal shared across the omics and finding one specific to a single omics."));
+    const r2 = el("div", { class: "row" });
+    r2.appendChild(_corrNumberField("Most variable features kept per omics (50 to 5000)", d.top_variance, 100, 50, 5000, (v) => { d.top_variance = Math.round(v); }));
+    r2.appendChild(el("div", { class: "col" }, [el("div", { class: "chart-option-label" }, "Distance (classification rule)"),
+        _diabloSelect(DIABLO_DISTANCES, d.distance, "multiomics-diablo-distance", (v) => { d.distance = v; })]));
+    wrap.appendChild(r2);
+    const logRow = el("label", { class: "ora-db-pill" });
+    const logCb = el("input", { type: "checkbox", class: "ora-db-checkbox multiomics-diablo-log2" });
+    logCb.checked = d.log2;
+    logCb.addEventListener("change", () => { d.log2 = logCb.checked; });
+    logRow.appendChild(logCb);
+    logRow.appendChild(document.createTextNode(" Apply log2(x + 1) first (for raw counts / intensities; values must be non-negative)"));
+    wrap.appendChild(corrPillBlock(logRow));
+
+    wrap.appendChild(el("div", { class: "section-label" }, "How many features to keep (tuned by cross-validation)"));
+    const gridInput = el("input", { class: "text-input multiomics-diablo-grid", type: "text" });
+    gridInput.value = d.keepX_grid.join(", ");
+    gridInput.addEventListener("change", () => {
+        const vals = gridInput.value.split(",").map((x) => parseInt(x.trim(), 10)).filter((x) => Number.isFinite(x) && x >= 2 && x <= 500);
+        if (vals.length) { d.keepX_grid = Array.from(new Set(vals)).sort((a, b) => a - b); gridInput.value = d.keepX_grid.join(", "); }
+        else gridInput.value = d.keepX_grid.join(", ");
+    });
+    wrap.appendChild(el("div", { class: "row" }, el("div", { class: "col" }, [el("div", { class: "chart-option-label" }, "Feature counts to try per omics and component (comma-separated)"), gridInput])));
+    wrap.appendChild(el("div", { class: "caption" },
+        "Every value in this list is tried, for every omics, one component at a time (the combination with the lowest cross-validated error " +
+        "is kept); more values and more omics make this step slower."));
+
+    wrap.appendChild(el("div", { class: "section-label" }, "Cross-validation"));
+    const r3 = el("div", { class: "row" });
+    r3.appendChild(_corrNumberField("Folds (2 to 10)", d.n_folds, 1, 2, 10, (v) => { d.n_folds = Math.round(v); }));
+    r3.appendChild(_corrNumberField("Repeats (1 to 50)", d.n_repeats, 1, 1, 50, (v) => { d.n_repeats = Math.round(v); }));
+    wrap.appendChild(r3);
+    wrap.appendChild(el("div", { class: "caption" },
+        "Stratified, repeated cross-validation: in each fold every sample is held out exactly once; repeating with different folds shows " +
+        "how much the error itself varies. More folds need more samples per group (a fold cannot be larger than the smallest group)."));
+
+    const run = el("button", { class: "btn btn-primary ora-run-btn multiomics-diablo-run", style: { marginTop: "1rem" } }, "Run DIABLO");
+    run.disabled = !d.group_column;
+    run.addEventListener("click", () => startDiabloRun());
+    wrap.appendChild(run);
+    if (!d.group_column) wrap.appendChild(el("div", { class: "caption" }, "Choose a sample-group source first."));
+    wrap.appendChild(el("div", { class: "right-actions", style: { marginTop: "1rem" } }, el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, back)));
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToMultiomicsActions());
+    return wrap;
+}
+
+async function startDiabloRun() {
+    const diablo = STATE.multiomics.diablo;
+    diablo.run = { results: null, busy: true };
+    diablo.enrich = {};
+    STATE.aaPage = "multiomics_diablo_results";
+    render();
+    const fail = (msg) => { alert("Run failed: " + msg); diablo.run = { results: null, busy: false }; STATE.aaPage = "multiomics_diablo"; render(); };
+    try {
+        await apiPostJson("/api/multiomics/diablo/configure", diablo.draft);
+        const { job_id } = await apiPostJson("/api/multiomics/diablo/run", {});
+        pollJob(job_id, {
+            onProgress: (job) => {
+                const bar = document.getElementById("multiomics-diablo-progress-inner");
+                const label = document.getElementById("multiomics-diablo-progress-label");
+                if (bar) bar.style.width = Math.round((job.progress || 0) * 100) + "%";
+                if (label) label.textContent = job.message || "";
+            },
+            onDone: (result) => {
+                diablo.run = { results: result, busy: false };
+                diablo.cx = 0; diablo.cy = Math.min(1, result.n_components - 1); diablo.vcomp = 0;
+                diablo.wOmics = result.omics[0]; diablo.wComp = 0; diablo.eOmics = result.omics[0];
+                render();
+            },
+            onError: fail,
+        });
+    } catch (err) { fail(err.message); }
+}
+
+// ---- results ----------------------------------------------------------------------------------------------------------------
+
+function renderMultiomicsDiabloResultsScreen() {
+    const mo = STATE.multiomics;
+    const diablo = mo.diablo;
+    const run = diablo.run;
+    const wrap = el("div", { class: "ora-config-screen ora-results-screen" });
+    wrap.appendChild(aaHeader());
+    wrap.appendChild(el("div", { class: "aa-omics-subtitle ora-config-title" }, "Multi-omics - DIABLO / Multiblock Integration: results"));
+    if (!run.results) {
+        wrap.appendChild(alertBox("info", "Running analysis... (choosing the number of components, then which features to keep, both by cross-validation, then a permutation test - this can take a while)"));
+        const progressWrap = el("div", { class: "progress-wrap" });
+        progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, el("div", { id: "multiomics-diablo-progress-inner", class: "progress-bar-inner", style: { width: "0%" } })));
+        progressWrap.appendChild(el("div", { id: "multiomics-diablo-progress-label", class: "progress-label" }, ""));
+        wrap.appendChild(progressWrap);
+        return wrap;
+    }
+    const R = run.results;
+    const names = R.component_names;
+    const omicsLabel = (k) => R.omics_labels[k];
+    wrap.appendChild(metricCards([
+        ["Samples", R.samples.length], ["Omics", R.omics.map(omicsLabel).join(" + ")],
+        ["Components", R.n_components + " of " + R.n_components_offered + " offered"],
+        ["Cross-validated error (BER)", _fmtFixed(R.cv.BER, 3) + " +/- " + _fmtFixed(R.cv.BER_sd, 3)],
+    ], 4));
+    (R.warnings || []).forEach((w) => wrap.appendChild(alertBox("warning", w)));
+    const card = el("div", { class: "rank-card ora-db-card ora-result-card ora-db-card-multiomics-diablo multiomics-diablo-result" });
+    wrap.appendChild(card);
+    const nav = makeResultNav(card, { stateKey: "multiomics_diablo" });
+
+    // ----- overview -----
+    const ov = nav.pane("Overview");
+    ov.appendChild(el("div", { class: "section-label" }, "Is the cross-validated error better than chance, on THIS data?"));
+    const pVal = R.permutation.p_value;
+    ov.appendChild(metricCards([
+        ["Cross-validated BER", _fmtFixed(R.cv.BER, 3)], ["Overall error rate", _fmtFixed(R.cv.ER, 3)],
+        ["Permutation p-value", _fmtSci(pVal, 2)], ["Permutations run", R.permutation.n_perm],
+    ], 4));
+    ov.appendChild(el("div", { class: "caption" },
+        "The model is refitted and re-cross-validated " + R.permutation.n_perm + " times with the SAME data but the group labels shuffled " +
+        "(the number of features kept per component is kept at the chosen setting - this asks only whether the LABELS matter, not whether more " +
+        "tuning would help). The p-value is the share of those shuffles that did AT LEAST AS WELL as the real labels. With few samples, a single " +
+        "shuffle of a FIXED dataset can look deceptively good by chance (checked directly while building this: averaged over many independent " +
+        "random datasets the cross-validated error is unbiased at the 50% chance level, but on one fixed dataset a single permutation varied from " +
+        "about 30% to 70% error) - this is why a permutation test, not a single number, is the honest check."));
+    ov.appendChild(el("div", { class: "section-label" }, "Features selected"));
+    ov.appendChild(buildTable({
+        columns: ["Omics", "Features offered", "Features used (most variable)", "Selected (any component)"],
+        rows: R.omics.map((o) => ({ "Omics": omicsLabel(o), "Features offered": R.n_features_in[o], "Features used (most variable)": R.n_features[o], "Selected (any component)": R.n_selected[o] })),
+    }, {}));
+    ov.appendChild(el("div", { class: "section-label" }, "What these results do not tell you"));
+    ov.appendChild(el("div", { class: "caption" },
+        "A selected feature is one the model found useful for discriminating your groups, not necessarily the biologically important one - " +
+        "correlated features compete, and a feature can be dropped only because another, equally informative one was picked instead. The design " +
+        "value, the number of components and the folds are all yours to choose; different reasonable choices can select different features, " +
+        "so read a single run's selection as a lead, not a final list. The permutation p-value answers 'could labels this good happen by chance " +
+        "on this data', not 'is the biology correct'."));
+
+    // ----- components -----
+    const cp = nav.pane("Components");
+    cp.appendChild(el("div", { class: "caption" },
+        "Each sample's value on each component, coloured by group, one marker shape per omics - DIABLO fits the omics so their components AGREE " +
+        "(the whole point of the method), so markers of different shapes but the same colour sitting near each other is a good sign."));
+    if (R.n_components >= 2) {
+        const compOptions = names.map((n, i) => [n, i]);
+        const sx = _diabloSelect(compOptions, diablo.cx, "multiomics-diablo-cx", () => {});
+        const sy = _diabloSelect(compOptions, diablo.cy, "multiomics-diablo-cy", () => {});
+        const scatterFig = diabloFigure(cp, { id: "multiomics-diablo-scatter", slug: "diablo-scatter", kind: "diabloscatter", kindLabel: "Component scatter", baseW: 660,
+            extra: [_diabloLabelled("Horizontal component", sx), _diabloLabelled("Vertical component", sy)],
+            draw: (d, s) => buildDiabloComponentScatter(d, R, Number(sx.value), Number(sy.value), "diablo-scatter", s) });
+        sx.addEventListener("change", () => { diablo.cx = Number(sx.value); scatterFig.redraw(); });
+        sy.addEventListener("change", () => { diablo.cy = Number(sy.value); scatterFig.redraw(); });
+    }
+    cp.appendChild(el("div", { class: "section-label" }, "One component, by omics and group"));
+    const compOptions2 = names.map((n, i) => [n, i]);
+    const sv = _diabloSelect(compOptions2, diablo.vcomp, "multiomics-diablo-vcomp", () => {});
+    const boxFig = diabloFigure(cp, { id: "multiomics-diablo-box", slug: "diablo-box", kind: "diablobox", kindLabel: "Component values by omics and group",
+        baseW: () => Math.max(500, R.omics.length * _diabloGroupList(R).length * 90 + 180),
+        extra: [_diabloLabelled("Component", sv)], draw: (d, s) => buildDiabloComponentByGroup(d, R, Number(sv.value), "diablo-box", s) });
+    sv.addEventListener("change", () => { diablo.vcomp = Number(sv.value); boxFig.redraw(); });
+    const dlC = el("button", { class: "btn" }, "Download component values (CSV)");
+    dlC.addEventListener("click", () => downloadFile("/api/multiomics/diablo/download?table=" + encodeURIComponent("components:" + R.omics[0]), "multiomics_diablo_components_" + R.omics[0] + ".csv"));
+    cp.appendChild(dlC);
+
+    // ----- selected features -----
+    const wp = nav.pane("Selected features");
+    wp.appendChild(el("div", { class: "caption" },
+        "A feature's loading says how strongly it contributes to this omics' component; only the SELECTED features (the sparse model's non-zero " +
+        "ones) are shown. Only the sign relative to the other selected features of the same component means something."));
+    const wo = _diabloSelect(R.omics.map((k) => [omicsLabel(k), k]), diablo.wOmics || R.omics[0], "multiomics-diablo-womics", () => {});
+    const wcSel = _diabloSelect(compOptions2, diablo.wComp, "multiomics-diablo-wcomp", () => {});
+    const wtab = el("div", {});
+    const drawWTable = () => {
+        wtab.innerHTML = "";
+        const items = ((R.top_weights[wo.value] || {})[names[Number(wcSel.value)]]) || [];
+        const sel = items.filter((x) => x.weight !== 0);
+        wtab.appendChild(buildTable({ columns: ["Feature", "Label", "Loading"], rows: sel.map((x) => ({ "Feature": x.feature, "Label": x.label, "Loading": x.weight })) },
+            { maxHeight: 420, cellFormatFn: (col, val) => (col === "Loading" ? _fmtFixed(val, 4) : val) }));
+        const dl = el("button", { class: "btn" }, "Download all loadings of " + omicsLabel(wo.value) + " (every component, CSV)");
+        dl.addEventListener("click", () => downloadFile("/api/multiomics/diablo/download?table=" + encodeURIComponent("weights:" + wo.value), "multiomics_diablo_weights_" + wo.value + ".csv"));
+        wtab.appendChild(dl);
+    };
+    const wFig = diabloFigure(wp, { id: "multiomics-diablo-weights", slug: "diablo-weights", kind: "diabloweights", kindLabel: "Selected-feature loadings", baseW: 780,
+        extra: [_diabloLabelled("Omics", wo), _diabloLabelled("Component", wcSel)],
+        draw: (d, s) => buildDiabloWeights(d, R, wo.value, names[Number(wcSel.value)], "diablo-weights", s) });
+    const onW = () => { diablo.wOmics = wo.value; diablo.wComp = Number(wcSel.value); wFig.redraw(); drawWTable(); };
+    wo.addEventListener("change", onW);
+    wcSel.addEventListener("change", onW);
+    wp.appendChild(wtab);
+    drawWTable();
+
+    // ----- performance -----
+    const pp = nav.pane("Performance");
+    pp.appendChild(el("div", { class: "caption" },
+        "How the cross-validated error changed as more components were offered (the dashed line is chance level for two groups); the chosen " +
+        "number of components is the darker bar. Below it, the permutation check: where the REAL cross-validated error sits against " + R.permutation.n_perm +
+        " refits with shuffled labels."));
+    diabloFigure(pp, { id: "multiomics-diablo-perf", slug: "diablo-perf", kind: "diabloperf", kindLabel: "Component-count search", baseW: Math.max(480, R.component_search.length * 110 + 160),
+        draw: (d, s) => buildDiabloPerformance(d, R, "diablo-perf", s) });
+    pp.appendChild(el("div", { class: "section-label" }, "Permutation test"));
+    diabloFigure(pp, { id: "multiomics-diablo-perm", slug: "diablo-perm", kind: "diabloperm", kindLabel: "Permutation null distribution", baseW: 620,
+        draw: (d, s) => buildDiabloPermutation(d, R, "diablo-perm", s) });
+    const dlP = el("button", { class: "btn" }, "Download the component-count search (CSV)");
+    dlP.addEventListener("click", () => downloadFile("/api/multiomics/diablo/download?table=component_search", "multiomics_diablo_component_search.csv"));
+    pp.appendChild(dlP);
+    const dlCv = el("button", { class: "btn" }, "Download the cross-validated error (CSV)");
+    dlCv.addEventListener("click", () => downloadFile("/api/multiomics/diablo/download?table=cv", "multiomics_diablo_cv.csv"));
+    pp.appendChild(dlCv);
+
+    // ----- enrichment -----
+    renderDiabloEnrichmentPane(nav.pane("Pathway enrichment"), R, names);
+
+    // ----- data used -----
+    const dp = nav.pane("Data used");
+    dp.appendChild(el("div", { class: "section-label" }, "Features that entered the model"));
+    dp.appendChild(buildTable({
+        columns: ["Omics", "In your file", "Used (most variable)", "Selected (any component)"],
+        rows: R.omics.map((o) => ({ "Omics": omicsLabel(o), "In your file": R.n_features_in[o], "Used (most variable)": R.n_features[o], "Selected (any component)": R.n_selected[o] })),
+    }, {}));
+    dp.appendChild(el("div", { class: "caption" }, "The same " + R.samples.length + " samples in every omics (the ones every file has)."));
+
+    // ----- parameters -----
+    const pa = nav.pane("Parameters used");
+    const pbox = el("div", { class: "rank-card ora-db-card" });
+    const c = R.config;
+    [["Model", "DIABLO (Singh et al. 2019), a Python port of mixOmics' block.splsda, checked against a real mixOmics run"],
+     ["Components offered", c.max_components], ["Design value (between omics)", c.design_value],
+     ["Most variable features per omics", c.top_variance], ["log2(x + 1) first", c.log2 ? "yes" : "no"],
+     ["Distance", DIABLO_DISTANCES.find((x) => x[1] === c.distance)[0]], ["Feature-count grid tried", c.keepX_grid.join(", ")],
+     ["Cross-validation", c.n_folds + " folds x " + c.n_repeats + " repeat(s)"], ["Random seed", c.seed], ["Sample groups", c.group_column]].forEach(([k, v]) => {
+        pbox.appendChild(el("div", { class: "caption" }, "- " + k + ": " + v));
+    });
+    pa.appendChild(pbox);
+    nav.finish();
+
+    const actions = el("div", { class: "right-actions", style: { marginTop: "1rem" } });
+    const again = el("button", { class: "btn" }, "Change settings");
+    again.addEventListener("click", () => { diablo.run = { results: null, busy: false }; STATE.aaPage = "multiomics_diablo"; render(); });
+    actions.appendChild(el("div", { class: "btn-row", style: { width: "25%", minWidth: "220px" } }, again));
+    wrap.appendChild(actions);
+    wrap.appendChild(el("div", { class: "aa-bottom-nav-spacer" }));
+    wrap.appendChild(backToMultiomicsActions());
+    return wrap;
+}
+
+function renderDiabloEnrichmentPane(pane, R, names) {
+    const diablo = STATE.multiomics.diablo;
+    pane.appendChild(el("div", { class: "caption" },
+        "Are the SELECTED features of an omics over-represented in a Reactome pathway, against every feature that entered the model as the " +
+        "background (one-sided Fisher exact test, the same convention the single-omics ORA tiles use)? Benjamini-Hochberg across the pathways " +
+        "tested. Features are matched to a pathway by gene (transcripts and proteins) or by compound; features that match nothing are left out " +
+        "of the test. Run per omics, on request, so the pathway sets are built only when you ask (the first metabolite run can take a few " +
+        "minutes; later requests reuse it)."));
+    const eo = _diabloSelect(R.omics.map((k) => [R.omics_labels[k], k]), diablo.eOmics || R.omics[0], "multiomics-diablo-eomics", () => {});
+    pane.appendChild(el("div", { class: "row" }, el("div", { class: "col" }, _diabloLabelled("Omics", eo))));
+    const r2 = el("div", { class: "row" });
+    r2.appendChild(_corrNumberField("Smallest pathway (members matched)", diablo.eMin, 1, 3, 200, (v) => { diablo.eMin = Math.round(v); drawResult(); }));
+    r2.appendChild(_corrNumberField("Largest pathway", diablo.eMax, 50, 10, 5000, (v) => { diablo.eMax = Math.round(v); drawResult(); }));
+    pane.appendChild(r2);
+    const runBtn = el("button", { class: "btn multiomics-diablo-enrich-run", style: { marginTop: "0.6rem" } }, "Run pathway enrichment");
+    const progressWrap = el("div", { class: "progress-wrap hidden" });
+    const inner = el("div", { class: "progress-bar-inner", style: { width: "0%" } });
+    const lab = el("div", { class: "progress-label" }, "");
+    progressWrap.appendChild(el("div", { class: "progress-bar-outer" }, inner));
+    progressWrap.appendChild(lab);
+    pane.appendChild(runBtn);
+    pane.appendChild(progressWrap);
+    const host = el("div", { class: "multiomics-diablo-enrich-result" });
+    pane.appendChild(host);
+    const keyNow = () => [eo.value, diablo.eMin, diablo.eMax].join("|");
+    function drawResult() {
+        host.innerHTML = "";
+        const res = diablo.enrich[keyNow()];
+        if (!res) { host.appendChild(el("div", { class: "caption" }, "Not run yet for this omics.")); return; }
+        if (res.note) host.appendChild(alertBox(res.n_tested ? "info" : "warning", res.note));
+        if (!res.n_tested) return;
+        host.appendChild(metricCards([["Pathways tested", res.n_tested], ["Selected features matched to a pathway", res.n_selected_matched + " of " + res.n_selected],
+            ["Significant (FDR < 0.05)", res.table.rows.filter((r) => r.FDR < 0.05).length]], 3));
+        host.appendChild(buildTable(res.table, { maxHeight: 420, cellFormatFn: (col, val) => (col === "p-value" || col === "FDR" ? _fmtSci(val, 2) : col === "Fold Enrichment" ? _fmtFixed(val, 2) : val) }));
+        if (res.n_tested > res.table.rows.length) host.appendChild(el("div", { class: "caption" }, "The " + res.table.rows.length + " most significant of " + res.n_tested + " are shown; the CSV has them all."));
+        const dl = el("button", { class: "btn" }, "Download this enrichment (CSV)");
+        dl.addEventListener("click", () => downloadFile("/api/multiomics/diablo/download?table=" + encodeURIComponent("enrichment:" + res.omics), "multiomics_diablo_enrichment_" + res.omics + ".csv"));
+        host.appendChild(dl);
+        const figHost = el("div", {});
+        host.appendChild(figHost);
+        diabloFigure(figHost, { id: "multiomics-diablo-enrich-dots", slug: "diablo-enrich", kind: "diabloenrich", kindLabel: "Pathway dot plot", baseW: 960,
+            draw: (d, s) => buildDiabloEnrichDots(d, res.table, "diablo-enrich", s) });
+    }
+    eo.addEventListener("change", () => { diablo.eOmics = eo.value; drawResult(); });
+    runBtn.addEventListener("click", async () => {
+        const key = keyNow();
+        runBtn.disabled = true;
+        progressWrap.classList.remove("hidden");
+        const done = () => { runBtn.disabled = false; progressWrap.classList.add("hidden"); };
+        try {
+            const { job_id } = await apiPostJson("/api/multiomics/diablo/enrich", { omics: eo.value, min_size: diablo.eMin, max_size: diablo.eMax });
+            pollJob(job_id, {
+                onProgress: (job) => { inner.style.width = Math.round((job.progress || 0) * 100) + "%"; lab.textContent = job.message || ""; },
+                onDone: (result) => { diablo.enrich[key] = result; done(); render(); },
+                onError: (err) => { alert(err); done(); },
+            });
+        } catch (err) { alert(err.message); done(); }
+    });
+    drawResult();
+}

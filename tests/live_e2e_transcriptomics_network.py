@@ -64,26 +64,44 @@ r = requests.post(f"{BASE}/api/transcriptomics/network/configure", headers=HEADE
                   # underestimate the null variance badly enough to report
                   # false extreme significance) - 500 is the fastest valid one.
                   json={"confidence": 700, "n_permutations": 500, "module_detection": True,
-                        "enrichment_database": "GO", "direction": "all", "weighting": "equal"},
+                        "enrichment_databases": ["GO"], "direction": "all", "weighting": "equal"},
                   timeout=120)
 check(r.status_code == 200, f"configure accepted ({r.status_code}: {r.text[:300]})")
 cfg = r.json().get("config", {})
 check(cfg.get("n_permutations") == 500 and cfg.get("confidence") == 700,
       f"config echoes the requested parameters ({cfg.get('confidence')}, {cfg.get('n_permutations')})")
+check(cfg.get("enrichment_databases") == ["GO"],
+      f"enrichment_databases is now a LIST, echoed back as requested (got {cfg.get('enrichment_databases')})")
 
 # 200 is now REJECTED to the default (1000), not merely undocumented - a
 # hostile or stale client asking for it must not silently get it.
 r200 = requests.post(f"{BASE}/api/transcriptomics/network/configure", headers=HEADERS,
-                     json={"confidence": 700, "n_permutations": 200, "module_detection": False},
+                     json={"confidence": 700, "n_permutations": 200, "module_detection": False,
+                           "enrichment_databases": ["GO"]},
                      timeout=120)
 check(r200.status_code == 200, f"configure with n_permutations=200 still succeeds ({r200.status_code})")
 check(r200.json().get("config", {}).get("n_permutations") == 1000,
       f"...but n_permutations=200 is rejected to the default (1000), not honoured "
       f"(got {r200.json().get('config', {}).get('n_permutations')})")
+
+# No database selected at all is rejected outright, never silently defaulted.
+r_empty_db = requests.post(f"{BASE}/api/transcriptomics/network/configure", headers=HEADERS,
+                           json={"confidence": 700, "enrichment_databases": []}, timeout=120)
+check(r_empty_db.status_code == 400, f"an empty database selection is rejected (got {r_empty_db.status_code})")
+
+# Multiple databases at once (GO + MSigDB) is now a real, supported configure.
+r_multi = requests.post(f"{BASE}/api/transcriptomics/network/configure", headers=HEADERS,
+                        json={"confidence": 700, "enrichment_databases": ["GO", "MSigDB"],
+                              "msigdb_collections": ["hallmark"]},
+                        timeout=120)
+check(r_multi.status_code == 200 and r_multi.json().get("config", {}).get("enrichment_databases") == ["GO", "MSigDB"],
+      f"GO + MSigDB together is accepted as a real multi-database configure "
+      f"(got status={r_multi.status_code}, databases={r_multi.json().get('config', {}).get('enrichment_databases')})")
+
 # Restore the fast (500) config used for the real run below.
 requests.post(f"{BASE}/api/transcriptomics/network/configure", headers=HEADERS,
               json={"confidence": 700, "n_permutations": 500, "module_detection": True,
-                    "enrichment_database": "GO", "direction": "all", "weighting": "equal"},
+                    "enrichment_databases": ["GO"], "direction": "all", "weighting": "equal"},
               timeout=120)
 
 print("=== run ===")
@@ -175,7 +193,7 @@ r = requests.post(f"{BASE}/api/transcriptomics/network/configure",
 check(r.status_code == 400, f"configure without a resolved table is refused ({r.status_code})")
 
 r = requests.post(f"{BASE}/api/transcriptomics/network/configure", headers=HEADERS,
-                  json={"enrichment_database": "MSigDB", "msigdb_collections": []}, timeout=120)
+                  json={"enrichment_databases": ["MSigDB"], "msigdb_collections": []}, timeout=120)
 check(r.status_code == 400,
       f"MSigDB labelling without any collection selected is refused ({r.status_code})")
 

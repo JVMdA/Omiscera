@@ -142,6 +142,49 @@ _UNNAMED = "(unnamed)"
 # Identifier bridge: transcriptomics identifiers -> STRING protein ids
 # ---------------------------------------------------------------------------
 
+def _alias_index_rank(pid: str, protein_index: dict, degrees) -> tuple:
+    """Sort key for breaking an alias collision: higher weighted degree first,
+    then lexicographically smallest STRING id. Shared by build_string_id_index
+    and Proteomics_network.build_accession_string_index - see
+    _alias_index_add's docstring for why this exists exactly once."""
+    return (-float(degrees[protein_index[pid]]), pid)
+
+
+def _alias_index_add(bucket: dict, key: str, pid: str, protein_index: dict,
+                     degrees, collisions: dict) -> None:
+    """Add one (external-id, STRING-id) candidate to an index bucket,
+    resolving a COLLISION (the same external id already pointing at a
+    DIFFERENT protein) explicitly rather than by silent last-wins
+    dict(zip(...)) overwrite (the pattern Genomics_network's own
+    uniprot_to_protein uses, which silently sends a seed to an arbitrary
+    protein - see build_string_id_index's docstring for the measured
+    numbers). Resolution order: only proteins actually present in this graph
+    are candidates; highest weighted degree wins (the better-connected
+    protein is the one the network can actually propagate through);
+    lexicographically smallest STRING id breaks exact ties, so the result is
+    reproducible across runs and machines.
+
+    Shared by build_string_id_index (gene symbol / Ensembl / Entrez, this
+    module) and Proteomics_network.build_accession_string_index (UniProt
+    accession) - the same collision hazard and the same resolution rule
+    apply to both identifier spaces, so the algorithm exists exactly once
+    rather than being reimplemented per module.
+    """
+    key = str(key).strip().upper()
+    if not key or pid not in protein_index:
+        return
+    prev = bucket.get(key)
+    if prev is None:
+        bucket[key] = pid
+        return
+    if prev == pid:
+        return
+    winner = min((prev, pid), key=lambda p: _alias_index_rank(p, protein_index, degrees))
+    loser = pid if winner == prev else prev
+    collisions.setdefault(key, []).append({"kept": winner, "dropped": loser})
+    bucket[key] = winner
+
+
 def build_string_id_index(graph: dict, aliases_path: "str | None" = None, verbose: bool = False) -> dict:
     """Build deterministic external-id -> STRING-id bridges for ONE graph.
 
@@ -153,14 +196,9 @@ def build_string_id_index(graph: dict, aliases_path: "str | None" = None, verbos
     read from the aliases file as fallbacks, which materially rescues organisms
     whose STRING nomenclature differs from mygene's.
 
-    COLLISIONS ARE RESOLVED EXPLICITLY, never by dict(zip(...)) last-wins (the
-    pattern used elsewhere in the STRING layer, which silently sends a seed to
-    an arbitrary protein). In order:
-        1. only proteins actually present in this graph are candidates;
-        2. highest weighted degree wins (the better-connected protein is the
-           one the network can actually propagate through);
-        3. lexicographically smallest STRING id breaks exact ties, so the
-           result is reproducible across runs and machines.
+    COLLISIONS ARE RESOLVED EXPLICITLY via _alias_index_add - see that
+    function's docstring for the resolution order and why this must never be
+    a silent dict(zip(...)) last-wins.
 
     NEVER cache this apart from its graph: membership is confidence-dependent,
     so an index built at one confidence maps ids onto proteins that may not
@@ -171,29 +209,10 @@ def build_string_id_index(graph: dict, aliases_path: "str | None" = None, verbos
     raw_adj = graph["raw_adjacency"]
     degrees = np.asarray(raw_adj.sum(axis=0)).ravel()
 
-    def _rank(pid):
-        # Higher degree first, then lexicographically smallest id.
-        return (-float(degrees[protein_index[pid]]), pid)
-
-    def _add(bucket, key, pid, collisions):
-        key = str(key).strip().upper()
-        if not key or pid not in protein_index:
-            return
-        prev = bucket.get(key)
-        if prev is None:
-            bucket[key] = pid
-            return
-        if prev == pid:
-            return
-        winner = min((prev, pid), key=_rank)
-        loser = pid if winner == prev else prev
-        collisions.setdefault(key, []).append({"kept": winner, "dropped": loser})
-        bucket[key] = winner
-
     by_symbol: dict = {}
     collisions: dict = {}
     for pid, name in protein_gene.items():
-        _add(by_symbol, name, pid, collisions)
+        _alias_index_add(by_symbol, name, pid, protein_index, degrees, collisions)
 
     by_ensembl: dict = {}
     by_entrez: dict = {}
@@ -208,9 +227,9 @@ def build_string_id_index(graph: dict, aliases_path: "str | None" = None, verbos
                     continue
                 a = alias.strip()
                 if a.upper().startswith("ENS") and "G" in a[:6].upper():
-                    _add(by_ensembl, a, pid, collisions)
+                    _alias_index_add(by_ensembl, a, pid, protein_index, degrees, collisions)
                 elif a.isdigit() and isinstance(source, str) and "GeneID" in source:
-                    _add(by_entrez, a, pid, collisions)
+                    _alias_index_add(by_entrez, a, pid, protein_index, degrees, collisions)
         except Exception as exc:  # a missing/odd aliases file must not kill the run
             if verbose:
                 print(f"[TxNetwork] alias parsing skipped: {exc}")
@@ -316,8 +335,17 @@ def build_seed_weights(resolved_df: pd.DataFrame, mapping: dict,
                        lfc_cutoff: float = tx.LFC_CUTOFF_DEFAULT,
                        direction: str = "all",
                        weighting: str = NETWORK_SEED_WEIGHT_DEFAULT,
-                       metric: str = tx.GSEA_RANKING_METRIC_DEFAULT) -> dict:
+                       metric: str = tx.GSEA_RANKING_METRIC_DEFAULT,
+                       deg_selector=tx.select_degs) -> dict:
     """Choose the seeds and their weights.
+
+    deg_selector: (resolved_df, padj_cutoff, lfc_cutoff, direction) -> a
+    DataFrame of significant rows, called exactly like tx.select_degs (the
+    default). Proteomics_module.select_significant_proteins has the identical
+    signature and both retrievers emit the same column names ("input_id",
+    "log2FC", "pvalue", "padj"), so this is the ONLY change Proteomics needs
+    here - everything below (weighting, winsorizing, the positivity
+    guarantee) stays single-copy and identifier-agnostic.
 
     Seeds are the DEGs from tx.select_degs (the SAME function ORA uses, so the
     two modules can never disagree about what a DEG is) that also mapped to a
@@ -350,7 +378,7 @@ def build_seed_weights(resolved_df: pd.DataFrame, mapping: dict,
 
     Every returned weight is strictly positive by construction.
     """
-    degs = tx.select_degs(resolved_df, padj_cutoff, lfc_cutoff, direction)
+    degs = deg_selector(resolved_df, padj_cutoff, lfc_cutoff, direction)
     string_by_row = mapping["string_by_row"]
 
     raw: dict = {}
@@ -471,15 +499,31 @@ def detect_modules_capped(hit_table: pd.DataFrame, graph: dict,
 # ---------------------------------------------------------------------------
 
 def enrich_modules_by_symbol(modules: list, graph: dict, taxon_id: str,
-                             database: str = NETWORK_ENRICHMENT_DATABASE_DEFAULT,
+                             taxon_name: str = "",
+                             databases: "list[str] | None" = None,
                              include_iea: bool = True,
                              msigdb_collections: "list[str] | None" = None,
                              min_term_size: int = tx.MIN_TERM_SIZE_DEFAULT,
                              max_term_size=gnet.DEFAULT_MODULE_MAX_TERM_SIZE,
                              verbose: bool = False) -> dict:
-    """Label each module with its most enriched term, via the TRANSCRIPTOMICS
-    ORA engine (tx._run_ora_for_sets, uppercase-gene-symbol-keyed). The Genomics
-    equivalent is UniProt-keyed and cannot be reused.
+    """Label each module with its most enriched term(s), via the
+    TRANSCRIPTOMICS ORA engine (tx._run_ora_for_sets, uppercase-gene-symbol-
+    keyed). The Genomics equivalent is UniProt-keyed and cannot be reused.
+
+    databases: any non-empty subset of NETWORK_ENRICHMENT_DATABASES (GO and/
+    or MSigDB); defaults to [NETWORK_ENRICHMENT_DATABASE_DEFAULT] when
+    omitted. Every requested database contributes its own namespaces/
+    collections into ONE shared "how many independent tests were compared"
+    pool (GO's 3 namespaces, each selected MSigDB collection) - selecting
+    both databases at once is not a new statistical model, it is the SAME
+    best-of-N-namespaces correction this function already applied within a
+    single database, now spanning more namespaces.
+
+    taxon_name: accepted (and unused - neither GO nor MSigDB, the two
+    databases offered here, filter by organism name) purely so
+    run_network_analysis can call whichever module_enricher it was given
+    (this function, or Proteomics_network's accession-space one, which DOES
+    need it for Reactome) through one uniform signature.
 
     THE UNIVERSE IS THE GRAPH'S GENE SYMBOLS, not the DE table's tested genes.
     Module members are drawn from the graph, so the graph is the sampling frame.
@@ -489,6 +533,14 @@ def enrich_modules_by_symbol(modules: list, graph: dict, taxon_id: str,
 
     Emits tx.RESULT_COLUMNS unchanged, so every existing ORA chart builder and
     the "Overlapping Genes" contract work with no frontend change.
+
+    Returns {"results": {module_id: {"best": {"namespace", "block",
+    "top_fdr_corrected"}, "candidates": {namespace_or_collection_key: {
+    "block"} | None for every tested key}, "n_namespaces_compared": int} |
+    None}, "universe_size", "databases", "caveat", "selection_caveat"}.
+    "candidates" keeps EVERY tested namespace/collection's own result, not
+    just the winner ("best") - so a caller can show a module's GO result and
+    its MSigDB result side by side, not only whichever one happened to win.
     """
     protein_gene = graph["protein_gene"]
     universe_symbols = {
@@ -497,28 +549,36 @@ def enrich_modules_by_symbol(modules: list, graph: dict, taxon_id: str,
         if str(protein_gene.get(pid, "")).strip()
     }
 
+    databases = list(dict.fromkeys(databases)) if databases else [NETWORK_ENRICHMENT_DATABASE_DEFAULT]
+    unsupported = [d for d in databases if d not in NETWORK_ENRICHMENT_DATABASES]
+    if unsupported:
+        raise ValueError(f"Unsupported module-enrichment database(s): {unsupported!r}")
+
     term_maps: dict = {}
-    caveat = None
-    if database == "GO":
+    caveats: list = []
+    if "GO" in databases:
         go_sets = tx.fetch_go_sets(taxon_id, include_iea=include_iea, verbose=verbose)
+        found = False
         for ns in tx.GO_NAMESPACES:
             if go_sets.get(ns):
                 term_maps[ns] = go_sets[ns]
-        if not term_maps:
-            caveat = "GO annotations could not be fetched for this organism, so modules are unlabelled."
-    elif database == "MSigDB":
+                found = True
+        if not found:
+            caveats.append("GO annotations could not be fetched for this organism, so GO-based labels are unavailable.")
+    if "MSigDB" in databases:
         keys = tx._msigdb_selected_keys(msigdb_collections)
+        found = False
         for key in keys:
             if not tx.msigdb_collection_available(key, taxon_id):
                 continue
             res = tx.fetch_msigdb_sets(key, taxon_id, verbose=verbose)
             if not res.get("fetch_failed") and res.get("sets"):
                 term_maps[f"MSigDB: {tx.MSIGDB_COLLECTIONS[key]['label']}"] = res["sets"]
-        if not term_maps:
-            caveat = ("No MSigDB collection is available for this organism (MSigDB covers human and "
-                      "mouse only), so modules are unlabelled.")
-    else:
-        raise ValueError(f"Unsupported module-enrichment database: {database!r}")
+                found = True
+        if not found:
+            caveats.append("No MSigDB collection is available for this organism (MSigDB covers human and "
+                           "mouse only), so MSigDB-based labels are unavailable.")
+    caveat = " ".join(caveats) if caveats else None
 
     results: dict = {}
     for mod in modules:
@@ -527,7 +587,8 @@ def enrich_modules_by_symbol(modules: list, graph: dict, taxon_id: str,
             for pid in mod["string_ids"]
             if str(protein_gene.get(pid, "")).strip()
         }
-        best = None
+        candidates: dict = {}
+        best_key, best_block, best_fdr = None, None, None
         # Only namespaces that actually returned a testable (non-empty)
         # result for THIS module count toward the correction below - a
         # namespace with zero eligible terms for this module's genes was
@@ -538,21 +599,26 @@ def enrich_modules_by_symbol(modules: list, graph: dict, taxon_id: str,
                                          min_term_size, max_term_size, None)
             tbl = block.get("table")
             if tbl is None or tbl.empty:
+                candidates[ns] = None
                 continue
             n_tested += 1
+            candidates[ns] = {"block": block}
             top_fdr = float(tbl.iloc[0]["FDR"])
-            if best is None or top_fdr < best["top_fdr"]:
-                best = {"namespace": ns, "block": block, "top_fdr": top_fdr}
-        if best:
+            if best_fdr is None or top_fdr < best_fdr:
+                best_key, best_block, best_fdr = ns, block, top_fdr
+        if best_block is not None:
             # Picking the smallest FDR out of n_tested independent namespaces
             # is itself a selection - an uncorrected "best of N" is
             # optimistically biased low. Bonferroni-style correction for that
             # specific selection (not a claim about the terms WITHIN a
             # namespace, which BH inside _run_ora_for_sets already handles).
             results[mod["module_id"]] = {
-                "namespace": best["namespace"],
-                "block": best["block"],
-                "top_fdr_corrected": min(best["top_fdr"] * n_tested, 1.0),
+                "best": {
+                    "namespace": best_key,
+                    "block": best_block,
+                    "top_fdr_corrected": min(best_fdr * n_tested, 1.0),
+                },
+                "candidates": candidates,
                 "n_namespaces_compared": n_tested,
             }
         else:
@@ -561,7 +627,7 @@ def enrich_modules_by_symbol(modules: list, graph: dict, taxon_id: str,
     return {
         "results": results,
         "universe_size": len(universe_symbols),
-        "database": database,
+        "databases": databases,
         "caveat": caveat,
         # Stated once, at the top level, because it applies to every module.
         "selection_caveat": (
@@ -595,11 +661,15 @@ def run_network_analysis(
     min_module_size: int = gnet.DEFAULT_MIN_MODULE_SIZE,
     mcl_inflation: float = gnet.DEFAULT_MCL_INFLATION,
     max_hits_for_modules: int = DEFAULT_MAX_HITS_FOR_MODULES,
-    enrichment_database: str = NETWORK_ENRICHMENT_DATABASE_DEFAULT,
+    enrichment_databases: "list[str] | None" = None,
     msigdb_collections: "list[str] | None" = None,
     include_iea: bool = True,
     seed: int = 42,
     force_refresh: bool = False,
+    mapper=None,
+    deg_selector=tx.select_degs,
+    module_enricher=None,
+    entity_noun: str = "gene",
     progress_callback=None,
     verbose: bool = False,
 ) -> dict:
@@ -611,7 +681,40 @@ def run_network_analysis(
     (buildNetpropNetwork, buildNetpropHistogram, _netpropSignificantHits) work
     unmodified; transcriptomics-only information is added ALONGSIDE rather than
     by changing those keys.
+
+    Everything below this docstring is identifier-agnostic EXCEPT the four
+    hooks below, which is what lets Proteomics_network.run_ppi_network_analysis
+    call this same function rather than duplicating ~340 lines of orchestration.
+    Each defaults to today's exact Transcriptomics behaviour, so the
+    Transcriptomics call path (Proteomics passes none of these) is unchanged.
+
+    mapper: (resolved_df, graph, taxon_id, verbose) -> a mapping dict with the
+        same shape map_de_table_to_string returns (table/string_by_row/
+        n_input/n_mapped/n_by_tier/fraction_mapped/low_mapping_warning/...).
+        Default builds build_string_id_index + map_de_table_to_string, exactly
+        as before. Proteomics passes one that bridges via UniProt accession.
+    deg_selector: forwarded to build_seed_weights - see that function's
+        docstring.
+    module_enricher: (modules, graph, taxon_id, taxon_name=, database=,
+        include_iea=, msigdb_collections=, max_term_size=, verbose=) -> a dict
+        shaped like enrich_modules_by_symbol's return (results/universe_size/
+        caveat/selection_caveat). Default is enrich_modules_by_symbol.
+        Proteomics passes an accession-space equivalent - see that module's
+        enrich_modules_by_accession docstring for why STRING-space labelling
+        (not the uploaded table) is the correct universe.
+    entity_noun: "gene" (default) or "protein" - used ONLY in caveat/progress
+        prose, never in a DataFrame column name (those stay identical across
+        both tiles on purpose, so no frontend chart builder needs to change -
+        see HIT_COLUMNS/MODULE_COLUMNS).
     """
+    if mapper is None:
+        def mapper(resolved_df, graph, taxon_id, verbose=False):
+            paths = gnet._string_file_paths(taxon_id)
+            id_index = build_string_id_index(graph, aliases_path=paths.get("aliases"), verbose=verbose)
+            return map_de_table_to_string(resolved_df, graph, id_index=id_index,
+                                          taxon_id=taxon_id, verbose=verbose)
+    if module_enricher is None:
+        module_enricher = enrich_modules_by_symbol
     def _progress(frac, label):
         if progress_callback:
             try:
@@ -633,21 +736,18 @@ def run_network_analysis(
             f"could ever be significant. Try a lower confidence cutoff."
         )
 
-    _progress(0.08, "Matching your genes to STRING proteins...")
-    paths = gnet._string_file_paths(taxon_id)
-    id_index = build_string_id_index(graph, aliases_path=paths.get("aliases"), verbose=verbose)
-    mapping = map_de_table_to_string(resolved_df, graph, id_index=id_index,
-                                     taxon_id=taxon_id, verbose=verbose)
+    _progress(0.08, f"Matching your {entity_noun}s to STRING proteins...")
+    mapping = mapper(resolved_df, graph, taxon_id, verbose=verbose)
     if mapping["low_mapping_warning"]:
         caveats.append(mapping["low_mapping_warning"])
 
-    _progress(0.12, "Selecting seed genes...")
+    _progress(0.12, f"Selecting seed {entity_noun}s...")
     seeds = build_seed_weights(resolved_df, mapping, padj_cutoff=padj_cutoff,
                                lfc_cutoff=lfc_cutoff, direction=direction,
-                               weighting=weighting, metric=metric)
+                               weighting=weighting, metric=metric, deg_selector=deg_selector)
     if seeds["n_seeds"] == 0:
         raise ValueError(
-            f"No differentially-expressed gene passed padj <= {padj_cutoff} and "
+            f"No differentially-expressed {entity_noun} passed padj <= {padj_cutoff} and "
             f"|log2FC| >= {lfc_cutoff} AND matched a STRING protein "
             f"({seeds['n_degs']} DEG(s) found, {seeds['n_degs_not_in_string']} of them not in STRING). "
             f"Loosen the thresholds or check your identifiers."
@@ -659,7 +759,7 @@ def run_network_analysis(
     seed_idx_score, n_unmapped_seeds = gnet._map_seeds_to_indices(
         identity, graph["protein_index"], seeds["weights"])
     if not seed_idx_score:
-        raise ValueError("None of the seed genes are present in the STRING network at this confidence.")
+        raise ValueError(f"None of the seed {entity_noun}s are present in the STRING network at this confidence.")
 
     def _core_progress(current, total, label):
         _progress(0.15 + 0.60 * (current / max(total, 1)), label)
@@ -735,7 +835,7 @@ def run_network_analysis(
     # The Genomics module shares this property and never said so.
     if n_hits_seed:
         caveats.append(
-            f"{n_hits_seed} of the {n_hits} significant proteins are genes you supplied as seeds. Seeds "
+            f"{n_hits_seed} of the {n_hits} significant proteins are {entity_noun}s you supplied as seeds. Seeds "
             f"receive signal directly, and are compared against permutations in which they are usually "
             f"not seeds, so their significance is largely expected rather than a discovery."
         )
@@ -807,7 +907,7 @@ def run_network_analysis(
             "mcl_inflation": float(mcl_inflation),
             "min_module_size": int(min_module_size),
             "max_hits_for_modules": int(max_hits_for_modules),
-            "enrichment_database": enrichment_database,
+            "enrichment_databases": list(enrichment_databases) if enrichment_databases else [NETWORK_ENRICHMENT_DATABASE_DEFAULT],
             "msigdb_collections": list(msigdb_collections or []),
             "include_iea": bool(include_iea),
             "module_max_term_size": gnet.DEFAULT_MODULE_MAX_TERM_SIZE,
@@ -858,15 +958,15 @@ def run_network_analysis(
         if cap_info["capped"]:
             caveats.append(
                 f"Module detection used the {cap_info['n_used_for_modules']} strongest of "
-                f"{cap_info['n_hits']} significant genes (ranked by Z-score), to keep clustering "
+                f"{cap_info['n_hits']} significant {entity_noun}s (ranked by Z-score), to keep clustering "
                 f"stable and interpretable."
             )
 
         _progress(0.90, "Labelling modules...")
-        enr = enrich_modules_by_symbol(
-            modules, graph, taxon_id, database=enrichment_database, include_iea=include_iea,
-            msigdb_collections=msigdb_collections, max_term_size=gnet.DEFAULT_MODULE_MAX_TERM_SIZE,
-            verbose=verbose)
+        enr = module_enricher(
+            modules, graph, taxon_id, taxon_name=taxon_name, databases=enrichment_databases,
+            include_iea=include_iea, msigdb_collections=msigdb_collections,
+            max_term_size=gnet.DEFAULT_MODULE_MAX_TERM_SIZE, verbose=verbose)
         if enr["caveat"]:
             caveats.append(enr["caveat"])
 
@@ -882,10 +982,10 @@ def run_network_analysis(
             n_seed = sum(1 for p in pids if p in seed_id_set)
             e = enr["results"].get(mod["module_id"])
             top_term, top_fdr, top_fdr_raw, db_label = "", None, None, ""
-            if e and e["block"] is not None and not e["block"]["table"].empty:
-                top = e["block"]["table"].iloc[0]
-                top_term, top_fdr_raw, db_label = top["Term Name"], float(top["FDR"]), e["namespace"]
-                top_fdr = float(e["top_fdr_corrected"])
+            if e and e["best"]["block"] is not None and not e["best"]["block"]["table"].empty:
+                top = e["best"]["block"]["table"].iloc[0]
+                top_term, top_fdr_raw, db_label = top["Term Name"], float(top["FDR"]), e["best"]["namespace"]
+                top_fdr = float(e["best"]["top_fdr_corrected"])
             module_rows.append({
                 "Module ID": mod["module_id"],
                 "Size": mod["size"],

@@ -121,7 +121,7 @@ print("=== MSigDB module labelling: never run before, now for real ===")
 msig_job, msig_resp = configure_and_run({
     "confidence": 700, "n_permutations": 500, "module_detection": True,
     "min_module_size": 3, "direction": "all", "weighting": "equal",
-    "enrichment_database": "MSigDB", "msigdb_collections": ["hallmark"],
+    "enrichment_databases": ["MSigDB"], "msigdb_collections": ["hallmark"],
 })
 check(msig_job is not None and msig_job["status"] == "done",
       f"an MSigDB-labelled run completed ({msig_resp.status_code if msig_job is None else msig_job['status']}, "

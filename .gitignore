@@ -20,8 +20,9 @@ desktop.ini
 Thumbs.db
 .DS_Store
 
-# Local Claude Code settings (machine-specific permissions etc.)
-.claude/settings.local.json
+# Claude Code's own local project config (machine-specific permissions, scheduled-task lock file) - internal
+# tooling, not part of the app; not meant for public consumption.
+.claude/
 
 # Deliberately TRACKED, listed here so nobody "tidies" them away:
 #   Data/ Data2/ Data3/   bundled example inputs the test suite depends on

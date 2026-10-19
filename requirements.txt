@@ -1,0 +1,29 @@
+# Omiscera - Python 3.12. Pinned to the versions the app was developed and tested with.
+# Install into a venv OUTSIDE the OneDrive folder (thousands of small files):
+#   py -3.12 -m venv C:\Users\cliente\omiscera-venv
+#   C:\Users\cliente\omiscera-venv\Scripts\python.exe -m pip install -r requirements.txt
+#   C:\Users\cliente\omiscera-venv\Scripts\python.exe -m playwright install chromium     (browser tests only)
+# Start the server:  C:\Users\cliente\omiscera-venv\Scripts\python.exe -m uvicorn API:app --port 8000
+#
+# numpy must be a standard pip build (it ships its own working BLAS). The Spyder runtime's numpy has no working BLAS: every matrix
+# product / SVD / inverse crashes there, and MOFA (mofapy2) needs them.
+numpy==2.3.3
+scipy==1.16.2
+pandas==2.3.2
+scikit-learn==1.7.2
+h5py>=3,<4
+mofapy2==0.7.5
+fastapi==0.138.2
+starlette==1.3.1
+pydantic==2.13.4
+uvicorn==0.49.0
+python-multipart==0.0.32
+anyio==4.13.0
+requests==2.32.5
+urllib3==2.5.0
+certifi==2025.8.3
+idna==3.10
+matplotlib==3.10.6
+pillow==11.3.0
+openpyxl==3.1.5
+playwright==1.61.0

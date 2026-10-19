@@ -1,0 +1,55 @@
+"block","comp","feature","value"
+"transcriptomics",1,"NUP205",-0.493844784677459
+"transcriptomics",1,"TPR",-0.45302625061147
+"transcriptomics",1,"HKDC1",-0.431113928832997
+"transcriptomics",1,"ISCA2",-0.357007702440791
+"transcriptomics",1,"SIRT3",-0.318302475028629
+"transcriptomics",1,"SDHA",-0.287259957496975
+"transcriptomics",1,"PFKFB1",-0.157110437018898
+"transcriptomics",1,"ADPGK",-0.14204940088753
+"transcriptomics",1,"PRKACG",-0.0745530673402304
+"transcriptomics",1,"GPI",-0.0575864160613061
+"transcriptomics",2,"HMGCR",0.586069170092537
+"transcriptomics",2,"SQLE",0.453798570914017
+"transcriptomics",2,"SREBF2",-0.333364299114751
+"transcriptomics",2,"TM7SF2",0.313182800418977
+"transcriptomics",2,"SREBF1",0.296134191571194
+"transcriptomics",2,"DHCR24",0.278686102940357
+"transcriptomics",2,"PLPP6",0.221946822533694
+"transcriptomics",2,"HMGCS1",0.163562731324981
+"proteomics",1,"Q01813",-0.595116704846394
+"proteomics",1,"P04406",-0.543751090963529
+"proteomics",1,"Q96EE3-1",-0.360231634488728
+"proteomics",1,"P78406",0.289997364909406
+"proteomics",1,"Q9BTX1",-0.247408801929083
+"proteomics",1,"Q9BUE6",-0.215673811463484
+"proteomics",1,"P55735",-0.122268888836183
+"proteomics",1,"O75694",-0.0948241802608222
+"proteomics",1,"P35658",-0.0675469667019544
+"proteomics",1,"O14521",-0.0086803960016416
+"proteomics",2,"Q01581",0.545649144963546
+"proteomics",2,"P56937",-0.47881893872843
+"proteomics",2,"Q15392",0.42092123675733
+"proteomics",2,"Q15738",0.38320655317571
+"proteomics",2,"P04035-1",0.282656782953045
+"proteomics",2,"Q8IY26",0.251972481202522
+"proteomics",2,"Q14534",0.056343939004849
+"proteomics",2,"O76062",0.0491717080250522
+"metabolomics",1,"2-Oxoglutarate",-0.54716151207489
+"metabolomics",1,"Oxaloacetate",-0.432618331487266
+"metabolomics",1,"Fumarate",-0.427295610050482
+"metabolomics",1,"cis-Aconitate",-0.343175523471832
+"metabolomics",1,"Phosphoenolpyruvate",-0.263438900724273
+"metabolomics",1,"Pyruvate",-0.243820968818837
+"metabolomics",1,"Lactate",0.192296206978209
+"metabolomics",1,"Dihydroxyacetone phosphate",0.161778849034441
+"metabolomics",1,"3-Phosphoglycerate",0.143908426968966
+"metabolomics",1,"Isocitrate",-0.019902232793037
+"metabolomics",2,"Creatinine",-0.718310076173106
+"metabolomics",2,"Xanthine",-0.498886665380054
+"metabolomics",2,"PC 34:1",0.253694988059475
+"metabolomics",2,"Fructose 6-phosphate",-0.250298692777876
+"metabolomics",2,"LPC 16:0",-0.220390882142334
+"metabolomics",2,"TG 54:3",0.2181267149667
+"metabolomics",2,"Choline",-0.109333763406932
+"metabolomics",2,"Uric acid",-0.00518367311694322

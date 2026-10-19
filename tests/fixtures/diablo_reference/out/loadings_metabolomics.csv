@@ -1,0 +1,43 @@
+"feature","comp1","comp2"
+"Citrate",0,0
+"Isocitrate",-0.019902232793037,0
+"2-Oxoglutarate",-0.54716151207489,0
+"Succinate",0,0
+"Fumarate",-0.427295610050482,0
+"Malate",0,0
+"Oxaloacetate",-0.432618331487266,0
+"cis-Aconitate",-0.343175523471832,0
+"Pyruvate",-0.243820968818837,0
+"Lactate",0.192296206978209,0
+"Glucose 6-phosphate",0,0
+"Fructose 6-phosphate",0,-0.250298692777876
+"Phosphoenolpyruvate",-0.263438900724273,0
+"3-Phosphoglycerate",0.143908426968966,0
+"Dihydroxyacetone phosphate",0.161778849034441,0
+"PC 34:1",0,0.253694988059475
+"PC 36:2",0,0
+"PC 32:0",0,0
+"PE 34:1",0,0
+"PE 36:2",0,0
+"PE 38:4",0,0
+"SM 34:1",0,0
+"SM 36:1",0,0
+"TG 52:2",0,0
+"TG 54:3",0,0.2181267149667
+"LPC 16:0",0,-0.220390882142334
+"LPC 18:0",0,0
+"DG 36:2",0,0
+"Cer d18:1/16:0",0,0
+"Palmitic acid",0,0
+"Caffeine",0,0
+"Creatinine",0,-0.718310076173106
+"Taurine",0,0
+"Uric acid",0,-0.00518367311694322
+"Hippuric acid",0,0
+"Choline",0,-0.109333763406932
+"Betaine",0,0
+"Carnitine",0,0
+"Inosine",0,0
+"Xanthine",0,-0.498886665380054
+"Tryptophan",0,0
+"Tyrosine",0,0

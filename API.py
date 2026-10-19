@@ -42,6 +42,7 @@ try:
 except ImportError:
     _PIL_AVAILABLE = False
 
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
@@ -59,6 +60,23 @@ import Transcriptomics_module as transcriptomics_engine
 import Transcriptomics_regulon as transcriptomics_regulon_engine
 import Proteomics_module_retriever as proteomics_retriever
 import Proteomics_module as proteomics_engine
+import Proteomics_network as proteomics_network_engine
+import Proteomics_ptm_retriever as proteomics_ptm_retriever
+import Proteomics_ptm as proteomics_ptm_engine
+# Metabolomics enrichment. Metabolomics_retriever is a DELIBERATE fork of
+# test_compound_resolver (imported above as resolver_module, which backs the
+# separate Metabolic Connection feature at /api/mc/*): the fork exists so this
+# module can adapt the resolver freely without any risk to that live feature,
+# so these two must never be consolidated back into one import.
+import Metabolomics_retriever as metabolomics_retriever
+import Metabolomics_module as metabolomics_engine
+import Multiomics_module as multiomics_engine
+import Multiomics_module_retriever as multiomics_retriever
+import Multiomics_mapping as multiomics_mapping
+import Multiomics_correlation as multiomics_correlation
+import Multiomics_network as multiomics_network
+import Multiomics_mofa as multiomics_mofa
+import Multiomics_diablo as multiomics_diablo
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -633,6 +651,20 @@ def _fresh_proteomics_state() -> dict:
         "ora_results": None,
         "quant_config": None,
         "quant_results": None,
+        "network_config": None,
+        "network_results": None,
+        # PTM / Phosphosite Enrichment - a SEPARATE, site-level upload/resolve
+        # path (Proteomics_ptm_retriever.py), not the protein-level
+        # de_df/resolved_df pair above. Shares taxon_id/taxon_name (an
+        # organism selection is still one per session) but nothing else -
+        # RESOLVED_SITE_COLUMNS has no protein-level analogue to reuse.
+        "ptm_sites_df": None,
+        "ptm_column_mapping": None,
+        "resolved_sites_df": None,
+        "ptm_meta": None,
+        "ptm_config": None,
+        "ptm_activity_results": None,
+        "ptm_ora_results": None,
         "custom_db": None,
         "background_accessions": None,
         # KEGG's organism is normally DERIVED from taxon_id/taxon_name above
@@ -646,6 +678,55 @@ def _fresh_proteomics_state() -> dict:
     }
 
 
+def _fresh_metabolomics_state() -> dict:
+    """Single source of truth for the 'metabolomics' session sub-dict shape.
+
+    Entirely separate from the existing Metabolic Connection state
+    (input_df/mapped_df at the top level, /api/mc/*): that feature answers
+    "does this compound occur in organism X", this one runs enrichment. They
+    deliberately share no state and no code path - see Metabolomics_module's
+    docstring and Metabolomics_retriever's cache-isolation comment.
+
+    TWO independent upload paths, mirroring how _fresh_proteomics_state
+    carries the protein-level and PTM site-level paths side by side:
+      - the LIST path (a plain compound-name list, no statistics) is SHARED
+        by three tiles - Over-Representation Analysis, Chemical Class
+        Enrichment, Lipid Class / Structural Enrichment - since all three
+        need only ONE resolve+crosswalk-match of the same uploaded list.
+      - the CONCENTRATION path (samples x compounds, Omiscera computes the
+        statistics) belongs to Quantitative Enrichment alone - it is a
+        different upload with a different compound set, so it cannot share
+        the list path's resolved table.
+    Both paths share one organism selection (taxon_id/taxon_name) and one
+    process-cached crosswalk (Metabolomics_module.build_compound_crosswalk
+    caches itself; nothing here duplicates that).
+    """
+    return {
+        "taxon_id": "", "taxon_name": "",
+        # List path - shared by ORA / Chemical Class / Lipid Class.
+        "list_df": None, "list_column_mapping": None,
+        "list_resolved_df": None, "list_matched_df": None, "list_meta": None,
+        "background_compounds": None, "background_meta": None,
+        "ora_config": None, "ora_results": None,
+        "chemclass_config": None, "chemclass_results": None,
+        "lipidclass_config": None, "lipidclass_results": None,
+        # Concentration-table path - Quantitative Enrichment only.
+        "conc_values_df": None, "conc_groups": None, "conc_meta": None,
+        "conc_resolved_df": None, "conc_matched_df": None,
+        "quant_stats_df": None, "quant_stats_meta": None,
+        "quant_config": None, "quant_results": None,
+        # Pathway Topology Analysis - a 5th tile that reuses EITHER upload
+        # path above (its own config says which): "list" reads
+        # list_matched_df exactly like ORA; "conc" reads conc_matched_df and
+        # computes its OWN per-compound statistics (topology_stats_df/meta)
+        # via the same compute_compound_statistics call metabolomics_quant_
+        # configure makes, kept separate from quant_stats_df so the two
+        # tiles' group/metric choices never need to agree.
+        "topology_stats_df": None, "topology_stats_meta": None,
+        "topology_config": None, "topology_results": None,
+    }
+
+
 def new_session_state() -> dict:
     return {
         "input_df": None,
@@ -656,6 +737,8 @@ def new_session_state() -> dict:
         "ora": _fresh_ora_state(),
         "transcriptomics": _fresh_transcriptomics_state(),
         "proteomics": _fresh_proteomics_state(),
+        "metabolomics": _fresh_metabolomics_state(),
+        "multiomics": _fresh_multiomics_state(),
     }
 
 
@@ -1194,6 +1277,552 @@ def _job_run_proteomics_quant(job_id: str, session: dict) -> dict:
     return {
         "tables": _serialize_proteomics_quant_tables(result["tables"]),
         "summary": result["summary"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Metabolomics — Over-Representation Analysis, Chemical Class Enrichment,
+# Lipid Class / Structural Enrichment, and Quantitative Enrichment.
+#
+# TWO upload paths (see _fresh_metabolomics_state's own comment): a plain
+# compound-name LIST, shared by the first three tiles, and a CONCENTRATION
+# TABLE for Quantitative Enrichment, whose statistics Omiscera computes
+# itself (never a user-supplied log2FC/pvalue - that RNA-seq/proteomics
+# convention does not fit what a metabolomics researcher actually uploads).
+# Both paths funnel through the SAME resolve+crosswalk-match pipeline
+# (_resolve_and_match_compound_names) since the underlying problem - turn a
+# compound NAME into this module's internal identifier - is identical either
+# way; only what supplies the names differs.
+# ---------------------------------------------------------------------------
+
+def _compute_user_id_mask(input_df: pd.DataFrame) -> pd.Series:
+    """True on rows where the USER'S OWN upload carried a structure
+    identifier (InChIKey/PubChem ID/ChEBI ID/LIPID MAPS ID).
+
+    Computed BEFORE resolving, while the table still shows only what the
+    user actually supplied: the retriever fills these same columns in from
+    name lookups, after which a user-supplied structure is indistinguishable
+    from a retriever-guessed one. Only matters for lipid shorthand - see
+    Metabolomics_module.match_compounds' user_id_mask parameter.
+    """
+    user_id_columns = [c for c in ("InChIKey", "PubChem ID", "ChEBI ID", "LIPID MAPS ID")
+                       if c in input_df.columns]
+    if not user_id_columns:
+        return pd.Series([False] * len(input_df))
+    return (
+        input_df[user_id_columns].astype(str)
+        .apply(lambda col: col.str.strip().replace({"nan": "", "None": ""}) != "")
+        .any(axis=1)
+    )
+
+
+def _dedupe_metabolomics_names(input_df: pd.DataFrame) -> "tuple[pd.DataFrame, int]":
+    """Remove an exact-duplicate compound Name from a plain LIST upload
+    (ORA / Chemical Class / Lipid Class), keeping the first occurrence -
+    metabolomics_retriever.remove_duplicate_input_names, reused unchanged.
+
+    A repeated Name in a plain list (no numeric column attached) is a
+    data-entry duplicate, not a second measurement - unlike the concentration
+    table, where a repeated Name genuinely is a second feature/adduct of the
+    same compound and must NOT be collapsed (see _job_resolve_metabolites_conc,
+    which deliberately never calls this).
+
+    Returns (deduped_df, n_removed).
+    """
+    deduped = metabolomics_retriever.remove_duplicate_input_names(input_df)
+    return deduped, len(input_df) - len(deduped)
+
+
+def _resolve_and_match_compound_names(
+    job_id: str, input_df: pd.DataFrame, progress_start: float = 0.0, progress_span: float = 1.0,
+    dedupe_names: bool = True,
+) -> "tuple[pd.DataFrame, pd.DataFrame, dict]":
+    """Shared by every Metabolomics resolve job: resolve compound Name(+IDs)
+    via the retriever, build/reuse the crosswalk, then match into crosswalk
+    space. Both the list path and the concentration-table path (whose
+    "names" are its own column headers) need this exact three-step
+    pipeline - only what gets uploaded differs, never how it gets resolved.
+
+    progress_start/progress_span let a caller reserve part of the job's
+    progress bar for work before/after this call (e.g. the concentration
+    path's own parse step already ran before this begins).
+
+    dedupe_names: remove an exact-duplicate Name before resolving (the list
+    path's default). The concentration path passes False - see
+    _dedupe_metabolomics_names' docstring.
+
+    Returns (resolved_df, matched_df, meta) - meta carries match_compounds'
+    own tier/skeleton/class-level-only counts plus mapping_status_counts, plus
+    n_input_rows (the ORIGINAL upload count, before any dedup) and
+    n_duplicate_names_removed.
+    """
+    def _frac(local):
+        return progress_start + progress_span * local
+
+    n_uploaded = len(input_df)
+    n_duplicate_names_removed = 0
+    if dedupe_names:
+        input_df, n_duplicate_names_removed = _dedupe_metabolomics_names(input_df)
+
+    update_job(job_id, progress=_frac(0.0), message="Resolving compound identifiers...")
+    user_id_mask = _compute_user_id_mask(input_df)
+    resolved_df = metabolomics_retriever.resolve_compound_table(input_df, verbose=False)
+    for column in ("ChEBI ID", "LIPID MAPS ID"):
+        if column in input_df.columns and column not in resolved_df.columns:
+            resolved_df[column] = input_df[column].values
+
+    update_job(job_id, progress=_frac(0.35), message="Building compound crosswalk...")
+
+    def _cw_progress(step, total, label):
+        # The crosswalk occupies the middle of this call's progress share.
+        update_job(job_id, progress=_frac(0.35 + 0.50 * (step / max(total, 1))), message=label)
+
+    crosswalk = metabolomics_engine.build_compound_crosswalk(
+        verbose=False, progress_callback=_cw_progress)
+
+    update_job(job_id, progress=_frac(0.9), message="Matching compounds...")
+    matched_df, match_meta = metabolomics_engine.match_compounds(
+        resolved_df, crosswalk, user_id_mask=user_id_mask)
+
+    meta = dict(match_meta)
+    meta["n_input_rows"] = n_uploaded
+    meta["n_duplicate_names_removed"] = n_duplicate_names_removed
+    meta["mapping_status_counts"] = (
+        resolved_df["Mapping_status"].value_counts().to_dict()
+        if "Mapping_status" in resolved_df.columns else {}
+    )
+    return resolved_df, matched_df, meta
+
+
+def _job_resolve_metabolites_list(job_id: str, session: dict, taxon_id: str, taxon_name: str) -> dict:
+    """List-path retrieval worker, shared by ORA / Chemical Class / Lipid
+    Class. Mirrors _job_resolve_proteins' commit-both-together discipline -
+    taxon_id/taxon_name/list_resolved_df/list_matched_df/list_meta are
+    written together, on success only, so a failed re-resolve can never
+    leave the session holding a new organism beside an old organism's
+    matched table."""
+    input_df = session["metabolomics"]["list_df"]
+    if input_df is None:
+        raise ValueError("No compound list uploaded.")
+
+    taxon_changed = (
+        taxon_id != session["metabolomics"].get("taxon_id", "")
+        or taxon_name != session["metabolomics"].get("taxon_name", "")
+    )
+    resolved_df, matched_df, meta = _resolve_and_match_compound_names(job_id, input_df)
+    meta["taxon_id"] = taxon_id
+    meta["taxon_name"] = taxon_name
+
+    session["metabolomics"]["taxon_id"] = taxon_id
+    session["metabolomics"]["taxon_name"] = taxon_name
+    session["metabolomics"]["list_resolved_df"] = resolved_df
+    session["metabolomics"]["list_matched_df"] = matched_df
+    session["metabolomics"]["list_meta"] = meta
+    # A new resolve invalidates any analysis built on the previous one, for
+    # all three tiles that share this list - PLUS Pathway Topology, which
+    # reuses this same list_matched_df when its own input mode is "list".
+    session["metabolomics"]["ora_results"] = None
+    session["metabolomics"]["chemclass_results"] = None
+    session["metabolomics"]["lipidclass_results"] = None
+    session["metabolomics"]["topology_results"] = None
+    if taxon_changed:
+        # The list and concentration paths share ONE organism. Quant's KEGG /
+        # Reactome / SMPDB / PathBank universes are built from that same
+        # taxon_id/taxon_name (run_quantitative_enrichment), so committing a
+        # NEW one here makes Quant's already-computed results describe an
+        # organism that is no longer current - clear them too, not only this
+        # path's own. quant_stats_df/meta are untouched: per-compound
+        # statistics do not depend on the organism, only the enrichment
+        # universes built from them do.
+        session["metabolomics"]["quant_results"] = None
+
+    update_job(job_id, progress=1.0, message="Done")
+    return {"resolved_table": df_payload(matched_df), "metrics": meta}
+
+
+def _job_resolve_background_compounds(job_id: str, session: dict, bg_df: pd.DataFrame) -> dict:
+    """Resolve an optional background compound list (list tiles only) into
+    a set of compound_keys, used to narrow a database's reference universe
+    to "compounds that could plausibly have been detected" rather than
+    every compound the database has ever annotated."""
+    _resolved_df, matched_df, _meta = _resolve_and_match_compound_names(job_id, bg_df)
+    bg_keys = set(
+        matched_df[matched_df["compound_key"].astype(str) != ""]["compound_key"].astype(str)
+    )
+    background_meta = {"n_uploaded": len(bg_df), "n_matched": len(bg_keys)}
+    session["metabolomics"]["background_compounds"] = bg_keys
+    session["metabolomics"]["background_meta"] = background_meta
+    update_job(job_id, progress=1.0, message="Done")
+    return {"metrics": background_meta}
+
+
+def _serialize_metabolomics_tables(tables: dict) -> dict:
+    """JSON-safe view of run_ora's / run_quantitative_enrichment's /
+    run_pathway_topology's 'tables'.
+
+    One serializer for all five tiles: every block differs only in which
+    optional keys it carries, and every read here is already a .get() with
+    a default. "measure" and "graphs" are Pathway Topology-only (None/{} on
+    every other tile's block, harmless).
+    """
+    payload = {}
+    for key, block in tables.items():
+        payload[key] = {
+            "table": df_payload(block["table"]),
+            "n_terms_tested": block.get("n_terms_tested", 0),
+            "n_terms_excluded_min_size": block.get("n_terms_excluded_min_size", 0),
+            "n_terms_no_overlap": block.get("n_terms_no_overlap", 0),
+            "universe_size": block.get("universe_size", 0),
+            "n_input_in_universe": block.get("n_input_in_universe", 0),
+            "n_input_dropped": block.get("n_input_dropped", 0),
+            "caveat": block.get("caveat"),
+            "note": block.get("note"),
+            "measure": block.get("measure"),
+            "graphs": block.get("graphs") or {},
+        }
+    return payload
+
+
+def _job_run_metabolomics_list_tile(job_id: str, session: dict, config_key: str,
+                                    results_key: str, databases: "list[str]") -> dict:
+    """Shared runner for ORA / Chemical Class / Lipid Class - all three call
+    Metabolomics_module.run_ora with a different `databases` list (see that
+    function's own docstring for why one function serves all three)."""
+    update_job(job_id, message="Starting analysis...")
+    matched_df = session["metabolomics"]["list_matched_df"]
+    if matched_df is None:
+        raise ValueError("No resolved compound list available.")
+    config = session["metabolomics"][config_key]
+    if config is None:
+        raise ValueError("Configure the analysis first.")
+
+    def _progress(step, total, label):
+        update_job(job_id, progress=step / max(total, 1), message=label)
+
+    crosswalk = metabolomics_engine.build_compound_crosswalk(verbose=False)
+    result = metabolomics_engine.run_ora(
+        matched_df, crosswalk, databases=databases,
+        taxon_id=session["metabolomics"].get("taxon_id", ""),
+        taxon_name=session["metabolomics"].get("taxon_name", ""),
+        min_term_size=config["min_term_size"],
+        max_term_size=config["max_term_size"],
+        chemical_class_level=config.get("chemical_class_level", "sub_class"),
+        lipid_class_level=config.get("lipid_class_level", "lm_main_class"),
+        pathbank_primary_only=config.get("pathbank_primary_only", True),
+        background_compounds=(
+            session["metabolomics"].get("background_compounds") if config.get("use_background") else None
+        ),
+        kegg_organism_code=config.get("kegg_organism_code", ""),
+        kegg_organism_name=config.get("kegg_organism_name", ""),
+        progress_callback=_progress,
+        verbose=False,
+    )
+    session["metabolomics"][results_key] = result
+    update_job(job_id, progress=1.0, message="Done")
+    return {
+        "tables": _serialize_metabolomics_tables(result["tables"]),
+        "summary": result["summary"],
+        "universe_caveats": result.get("universe_caveats", {}),
+    }
+
+
+def _job_run_metabolomics_ora(job_id: str, session: dict) -> dict:
+    """Over-Representation Analysis worker (KEGG/Reactome/SMPDB/PathBank)."""
+    config = session["metabolomics"].get("ora_config") or {}
+    return _job_run_metabolomics_list_tile(
+        job_id, session, "ora_config", "ora_results",
+        config.get("databases", ["KEGG", "Reactome", "SMPDB", "PathBank"]))
+
+
+def _job_run_metabolomics_chemclass(job_id: str, session: dict) -> dict:
+    """Chemical Class Enrichment worker (RefMet taxonomy)."""
+    return _job_run_metabolomics_list_tile(
+        job_id, session, "chemclass_config", "chemclass_results", ["Chemical Class"])
+
+
+def _job_run_metabolomics_lipidclass(job_id: str, session: dict) -> dict:
+    """Lipid Class / Structural Enrichment worker (LIPID MAPS taxonomy)."""
+    return _job_run_metabolomics_list_tile(
+        job_id, session, "lipidclass_config", "lipidclass_results", ["Lipid Class"])
+
+
+def _job_resolve_metabolites_conc(job_id: str, session: dict, taxon_id: str, taxon_name: str) -> dict:
+    """Concentration-path retrieval worker (Quantitative Enrichment only).
+    The "compound list" here is the concentration table's OWN column
+    headers - each column is one compound - resolved through the exact same
+    pipeline as the list-upload tiles."""
+    values_df = session["metabolomics"]["conc_values_df"]
+    if values_df is None:
+        raise ValueError("No concentration table uploaded.")
+    taxon_changed = (
+        taxon_id != session["metabolomics"].get("taxon_id", "")
+        or taxon_name != session["metabolomics"].get("taxon_name", "")
+    )
+    names_df = pd.DataFrame({"Name": [str(c) for c in values_df.columns]})
+
+    # dedupe_names=False: a repeated Name here is two FEATURES of one compound
+    # (e.g. two adducts) - each is its own column in values_df, and removing a
+    # "duplicate" row would desynchronize matched_df from those columns.
+    resolved_df, matched_df, meta = _resolve_and_match_compound_names(
+        job_id, names_df, dedupe_names=False)
+    meta["taxon_id"] = taxon_id
+    meta["taxon_name"] = taxon_name
+
+    session["metabolomics"]["taxon_id"] = taxon_id
+    session["metabolomics"]["taxon_name"] = taxon_name
+    session["metabolomics"]["conc_resolved_df"] = resolved_df
+    session["metabolomics"]["conc_matched_df"] = matched_df
+    session["metabolomics"]["conc_meta"] = meta
+    session["metabolomics"]["quant_stats_df"] = None
+    session["metabolomics"]["quant_stats_meta"] = None
+    session["metabolomics"]["quant_results"] = None
+    # Same reasoning as quant_stats_df/quant_results above, for Pathway
+    # Topology's own concentration-mode statistics/results.
+    session["metabolomics"]["topology_stats_df"] = None
+    session["metabolomics"]["topology_stats_meta"] = None
+    session["metabolomics"]["topology_results"] = None
+    if taxon_changed:
+        # Chemical Class / Lipid Class never use the organism at all (see
+        # Metabolomics_module._build_universes - their universes are built
+        # from crosswalk taxonomy only), so they are left alone. ORA's KEGG /
+        # Reactome / SMPDB / PathBank universes DO use it, so a taxon commit
+        # made HERE (on the concentration path) invalidates ORA's now-stale
+        # cached results - the mirror image of the list path's guard above.
+        session["metabolomics"]["ora_results"] = None
+
+    update_job(job_id, progress=1.0, message="Done")
+    return {"resolved_table": df_payload(matched_df), "metrics": meta}
+
+
+def _job_run_metabolomics_quant(job_id: str, session: dict) -> dict:
+    """Quantitative Enrichment worker (competitive two-sided Wilcoxon),
+    scored from the per-compound statistics quant_stats_df already computed
+    at configure time - see metabolomics_quant_configure."""
+    update_job(job_id, message="Starting quantitative enrichment...")
+    matched_df = session["metabolomics"]["conc_matched_df"]
+    stats_df = session["metabolomics"]["quant_stats_df"]
+    if matched_df is None or stats_df is None:
+        raise ValueError("Resolve and configure the analysis first.")
+    config = session["metabolomics"]["quant_config"]
+    if config is None:
+        raise ValueError("Configure the analysis first.")
+
+    def _progress(step, total, label):
+        update_job(job_id, progress=step / max(total, 1), message=label)
+
+    crosswalk = metabolomics_engine.build_compound_crosswalk(verbose=False)
+    result = metabolomics_engine.run_quantitative_enrichment(
+        matched_df, crosswalk, stats_df,
+        databases=config["databases"],
+        taxon_id=session["metabolomics"].get("taxon_id", ""),
+        taxon_name=session["metabolomics"].get("taxon_name", ""),
+        metric=config["metric"],
+        min_term_size=config["min_term_size"],
+        max_term_size=config["max_term_size"],
+        chemical_class_level=config.get("chemical_class_level", "sub_class"),
+        lipid_class_level=config.get("lipid_class_level", "lm_main_class"),
+        pathbank_primary_only=config.get("pathbank_primary_only", True),
+        background_compounds=(
+            session["metabolomics"].get("background_compounds") if config.get("use_background") else None
+        ),
+        kegg_organism_code=config.get("kegg_organism_code", ""),
+        kegg_organism_name=config.get("kegg_organism_name", ""),
+        progress_callback=_progress,
+        verbose=False,
+    )
+    session["metabolomics"]["quant_results"] = result
+    update_job(job_id, progress=1.0, message="Done")
+    # Per-compound log2 fold change keyed by the user's own Name (the same
+    # names the results' "Overlapping Compounds" column carries) - feeds the
+    # compound-concept network's node colouring, exactly as Proteomics'
+    # per-protein log2FC does. Always log2fc regardless of the ranking
+    # metric, so the colour keeps its plain biological meaning.
+    compound_log2fc = {
+        str(name): float(value)
+        for name, value in zip(stats_df["Name"], stats_df["log2fc"])
+        if pd.notna(value) and math.isfinite(float(value))
+    }
+    return {
+        "tables": _serialize_metabolomics_tables(result["tables"]),
+        "summary": result["summary"],
+        "universe_caveats": result.get("universe_caveats", {}),
+        "compound_log2fc": compound_log2fc,
+    }
+
+
+def _job_run_metabolomics_topology(job_id: str, session: dict) -> dict:
+    """Pathway Topology Analysis worker (KEGG only). Reads config["input_mode"]
+    to decide which of the two shared upload paths to run against - "list"
+    (list_matched_df, exactly like ORA) or "conc" (conc_matched_df plus this
+    tile's OWN topology_stats_df, computed at configure time exactly as
+    metabolomics_quant_configure computes quant_stats_df)."""
+    update_job(job_id, message="Starting pathway topology analysis...")
+    mx = session["metabolomics"]
+    config = mx.get("topology_config")
+    if config is None:
+        raise ValueError("Configure the analysis first.")
+    input_mode = config["input_mode"]
+    if input_mode == "list":
+        matched_df = mx["list_matched_df"]
+        stats_df, metric = None, metabolomics_engine.QUANT_METRIC_DEFAULT
+        if matched_df is None:
+            raise ValueError("No resolved compound list available.")
+    else:
+        matched_df = mx["conc_matched_df"]
+        stats_df = mx["topology_stats_df"]
+        metric = config.get("metric", metabolomics_engine.QUANT_METRIC_DEFAULT)
+        if matched_df is None or stats_df is None:
+            raise ValueError("Resolve and configure the analysis first.")
+
+    def _progress(step, total, label):
+        update_job(job_id, progress=step / max(total, 1), message=label)
+
+    crosswalk = metabolomics_engine.build_compound_crosswalk(verbose=False)
+    result = metabolomics_engine.run_pathway_topology(
+        matched_df, crosswalk, input_mode=input_mode,
+        stats_df=stats_df, metric=metric,
+        measure=config.get("measure", metabolomics_engine.PATHWAY_TOPOLOGY_MEASURE_DEFAULT),
+        taxon_id=mx.get("taxon_id", ""), taxon_name=mx.get("taxon_name", ""),
+        min_term_size=config["min_term_size"], max_term_size=config["max_term_size"],
+        background_compounds=(mx.get("background_compounds") if config.get("use_background") else None),
+        kegg_organism_code=config.get("kegg_organism_code", ""),
+        kegg_organism_name=config.get("kegg_organism_name", ""),
+        progress_callback=_progress,
+        verbose=False,
+    )
+    mx["topology_results"] = result
+    update_job(job_id, progress=1.0, message="Done")
+    return {
+        "tables": _serialize_metabolomics_tables(result["tables"]),
+        "summary": result["summary"],
+        "universe_caveats": result.get("universe_caveats", {}),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Proteomics — PTM / Phosphosite Enrichment
+# (a SEPARATE site-level retrieval path from ORA/Quant/Network above - see
+# _fresh_proteomics_state's own comment. Shares taxon_id/taxon_name once
+# resolved, but resolved_sites_df is independent of resolved_df.)
+# ---------------------------------------------------------------------------
+
+def _job_resolve_ptm_sites(job_id: str, session: dict, taxon_id: str, taxon_name: str) -> dict:
+    """PTM retrieval worker: resolves the uploaded SITE-level table via
+    Proteomics_ptm_retriever.resolve_site_table. Mirrors _job_resolve_proteins'
+    commit-both-together discipline. Deliberately does NOT touch resolved_df/
+    ora_results/quant_results/network_results - those belong to the
+    protein-level pipeline and are untouched by a PTM upload/resolve."""
+    update_job(job_id, message="Resolving phosphosites via UniProt ID Mapping...")
+    sites_df = session["proteomics"]["ptm_sites_df"]
+
+    def _progress(current, total, label):
+        frac = current / max(total, 1)
+        update_job(job_id, progress=frac, message=f"{label} ({current}/{total})")
+
+    resolved_sites_df, meta = proteomics_ptm_retriever.resolve_site_table(
+        sites_df, taxon_id, progress_callback=_progress, verbose=False,
+    )
+    session["proteomics"]["taxon_id"] = taxon_id
+    session["proteomics"]["taxon_name"] = taxon_name
+    session["proteomics"]["resolved_sites_df"] = resolved_sites_df
+    session["proteomics"]["ptm_meta"] = meta
+
+    update_job(job_id, progress=1.0, message="Done")
+    return {
+        "resolved_table": df_payload(resolved_sites_df),
+        "metrics": meta,
+    }
+
+
+def _serialize_ptm_activity_block(block: dict) -> dict:
+    """JSON-safe view of run_kinase_activity's return - single block (one
+    database, iPTMnet), wrapped under a "iPTMnet" key for the SAME {db:
+    block} shape _serialize_transcriptomics_regulon_activity_tables already
+    uses, so the results screen can reuse that rendering pattern almost
+    unchanged rather than inventing a second one."""
+    if block.get("table") is None:
+        return {"iPTMnet": {
+            "table": df_payload(pd.DataFrame(columns=proteomics_ptm_engine.ACTIVITY_RESULT_COLUMNS)),
+            "n_kinases_tested": 0, "note": block.get("note"),
+            "null_slopes_by_signature": {}, "kinase_regression_detail": {},
+            "ranking_values_sample": [], "y_mean": 0.0, "n_sites": 0, "metric": "",
+            "lambda_used": 1.0, "null_center": 0.0, "calibration_note": None,
+        }}
+    return {"iPTMnet": {
+        "table": df_payload(block["table"]),
+        "n_kinases_tested": block["n_kinases_tested"],
+        "note": block.get("note"),
+        "null_slopes_by_signature": block.get("null_slopes_by_signature", {}),
+        "kinase_regression_detail": block.get("kinase_regression_detail", {}),
+        "ranking_values_sample": block.get("ranking_values_sample", []),
+        "y_mean": block.get("y_mean", 0.0),
+        "n_sites": block.get("n_sites", 0),
+        "metric": block.get("metric", ""),
+        "lambda_used": block.get("lambda_used", 1.0),
+        "null_center": block.get("null_center", 0.0),
+        "calibration_note": block.get("calibration_note"),
+    }}
+
+
+def _serialize_ptm_ora_tables(tables: dict) -> dict:
+    """JSON-safe view of run_kinase_substrate_ora's 'tables' dict. Mirrors
+    _serialize_proteomics_ora_tables' shape (same underlying engine,
+    tx._run_ora_for_sets)."""
+    payload = {}
+    for key, block in tables.items():
+        payload[key] = {
+            "table": df_payload(block["table"]),
+            "n_terms_tested": block.get("n_terms_tested", 0),
+            "n_terms_excluded_min_size": block.get("n_terms_excluded_min_size", 0),
+            "n_terms_no_overlap": block.get("n_terms_no_overlap", 0),
+            "universe_size": block.get("universe_size", 0),
+            "note": block.get("note"),
+        }
+    return payload
+
+
+def _job_run_ptm(job_id: str, session: dict) -> dict:
+    """Runs kinase activity (A1) then kinase substrate ORA (A2) in one job -
+    same reasoning as _job_run_transcriptomics_regulon_both: a single
+    progress bar, and both analyses share the same iPTMnet universe fetch so
+    running them together costs almost nothing extra once A1 has paid for
+    the fetch."""
+    update_job(job_id, message="Starting kinase activity inference...")
+    resolved_sites_df = session["proteomics"]["resolved_sites_df"]
+    if resolved_sites_df is None:
+        raise ValueError("No resolved phosphosite table available.")
+    config = session["proteomics"]["ptm_config"]
+    if config is None:
+        raise ValueError("Configure the analysis first.")
+
+    taxon_id = session["proteomics"]["taxon_id"]
+    taxon_name = session["proteomics"].get("taxon_name", "")
+
+    def _progress_activity(step, total, label):
+        update_job(job_id, progress=0.5 * step / max(total, 1), message=label)
+
+    activity_block = proteomics_ptm_engine.run_kinase_activity(
+        resolved_sites_df, taxon_id, taxon_name=taxon_name,
+        metric=config["metric"], min_kinase_sites=config["min_kinase_sites"],
+        min_score=config.get("min_score"), n_permutations=config["n_permutations"],
+        seed=config["seed"], progress_callback=_progress_activity, verbose=False,
+    )
+    session["proteomics"]["ptm_activity_results"] = activity_block
+
+    update_job(job_id, progress=0.5, message="Starting kinase substrate enrichment...")
+    ora_result = proteomics_ptm_engine.run_kinase_substrate_ora(
+        resolved_sites_df, taxon_id, taxon_name=taxon_name,
+        padj_cutoff=config["padj_cutoff"], lfc_cutoff=config["lfc_cutoff"],
+        min_term_size=config["min_term_size"], max_term_size=config.get("max_term_size"),
+        min_score=config.get("min_score"), verbose=False,
+    )
+    session["proteomics"]["ptm_ora_results"] = ora_result
+
+    update_job(job_id, progress=1.0, message="Done")
+    return {
+        "activity": {"tables": _serialize_ptm_activity_block(activity_block)},
+        "ora": {"tables": _serialize_ptm_ora_tables(ora_result["tables"]), "universe_size": ora_result["universe_size"],
+               "caveat": ora_result.get("caveat")},
     }
 
 
@@ -2171,7 +2800,7 @@ def _job_run_annotation(job_id: str, session: dict) -> dict:
     return payload
 
 
-def _transcriptomics_network_param_bounds(config: dict) -> dict:
+def _network_param_bounds(config: dict, module: str = "transcriptomics") -> dict:
     """Validate + clamp the network config. Mirrors _netprop_param_bounds's
     idiom (a bad value falls back to the default rather than erroring), and
     doubles as the reproducibility record shown on the "Parameters used" pane -
@@ -2180,8 +2809,18 @@ def _transcriptomics_network_param_bounds(config: dict) -> dict:
     Choice-set parameters are REJECTED to the default rather than clamped: a
     hostile n_permutations of 10**9 must become 500, never "the largest allowed
     value", which would still be a denial-of-service.
+
+    module: "transcriptomics" (default) or "proteomics" - selects the
+    identifier-space-specific bits (DEG cutoff defaults, the enrichment-
+    database allow-list, whether MSigDB collections apply at all). Everything
+    else - confidence/permutations/FDR/weighting/metric/module-size/cap - is
+    identical by construction, since both tiles run the SAME
+    Genomics_network engine underneath. See _job_run_network, its counterpart.
     """
     txnet = transcriptomics_network_engine
+    pnet = proteomics_network_engine
+    is_proteomics = module == "proteomics"
+    engine = proteomics_engine if is_proteomics else transcriptomics_engine
 
     def _choice(value, choices, default):
         try:
@@ -2205,7 +2844,7 @@ def _transcriptomics_network_param_bounds(config: dict) -> dict:
         return v if v >= minimum else default
 
     direction = str(config.get("direction") or "all")
-    if direction not in transcriptomics_engine.DIRECTIONS:
+    if direction not in engine.DIRECTIONS:
         direction = "all"
     weighting = str(config.get("weighting") or txnet.NETWORK_SEED_WEIGHT_DEFAULT)
     if weighting not in txnet.NETWORK_SEED_WEIGHTINGS:
@@ -2213,14 +2852,35 @@ def _transcriptomics_network_param_bounds(config: dict) -> dict:
     metric = str(config.get("metric") or transcriptomics_engine.GSEA_RANKING_METRIC_DEFAULT)
     if metric not in transcriptomics_engine.GSEA_RANKING_METRICS:
         metric = transcriptomics_engine.GSEA_RANKING_METRIC_DEFAULT
-    database = str(config.get("enrichment_database") or txnet.NETWORK_ENRICHMENT_DATABASE_DEFAULT)
-    if database not in txnet.NETWORK_ENRICHMENT_DATABASES:
-        database = txnet.NETWORK_ENRICHMENT_DATABASE_DEFAULT
 
-    msigdb_collections = list(dict.fromkeys(
-        k for k in (config.get("msigdb_collections") or [])
-        if k in transcriptomics_engine.MSIGDB_COLLECTIONS
+    if is_proteomics:
+        db_choices = pnet.PPI_ENRICHMENT_DATABASES
+        db_default = pnet.PPI_ENRICHMENT_DATABASE_DEFAULT
+    else:
+        db_choices = txnet.NETWORK_ENRICHMENT_DATABASES
+        db_default = txnet.NETWORK_ENRICHMENT_DATABASE_DEFAULT
+    # A run can label modules against several databases at once (each one's
+    # namespaces/collections join ONE shared best-of-N-namespaces correction
+    # pool - see enrich_modules_by_symbol/enrich_modules_by_accession's own
+    # docstrings) - same dedup-and-whitelist idiom msigdb_collections below
+    # already uses. Falls back to [db_default] only when the request named
+    # NOTHING valid; an empty selection must never silently become "GO
+    # anyway" at the CONFIGURE step without the caller knowing - the two
+    # /network/configure routes reject an empty list outright instead.
+    enrichment_databases = list(dict.fromkeys(
+        d for d in (config.get("enrichment_databases") or []) if d in db_choices
     ))
+
+    # MSigDB is Transcriptomics-only - build_string_id_index's identifier
+    # bridge is symbol-space, which is what MSigDB's gene sets need; Proteomics
+    # never offers it (see Proteomics_network.py's module docstring), so its
+    # collections list is always empty regardless of what the client sends.
+    msigdb_collections = []
+    if not is_proteomics:
+        msigdb_collections = list(dict.fromkeys(
+            k for k in (config.get("msigdb_collections") or [])
+            if k in transcriptomics_engine.MSIGDB_COLLECTIONS
+        ))
 
     return {
         "confidence": _choice(config.get("confidence"), genomics_net.CONFIDENCE_CHOICES,
@@ -2228,10 +2888,8 @@ def _transcriptomics_network_param_bounds(config: dict) -> dict:
         "n_permutations": _choice(config.get("n_permutations"), txnet.NETWORK_N_PERMUTATIONS_CHOICES,
                                   txnet.NETWORK_N_PERMUTATIONS_DEFAULT),
         "fdr_alpha": _float(config.get("fdr_alpha"), 0.0, 1.0, genomics_net.DEFAULT_FDR_ALPHA),
-        "padj_cutoff": _float(config.get("padj_cutoff"), 0.0, 1.0,
-                              transcriptomics_engine.PADJ_CUTOFF_DEFAULT),
-        "lfc_cutoff": _float(config.get("lfc_cutoff"), -1e-9, 1e6,
-                             transcriptomics_engine.LFC_CUTOFF_DEFAULT),
+        "padj_cutoff": _float(config.get("padj_cutoff"), 0.0, 1.0, engine.PADJ_CUTOFF_DEFAULT),
+        "lfc_cutoff": _float(config.get("lfc_cutoff"), -1e-9, 1e6, engine.LFC_CUTOFF_DEFAULT),
         "min_module_size": _int_min(config.get("min_module_size"), 2,
                                     genomics_net.DEFAULT_MIN_MODULE_SIZE),
         "max_hits_for_modules": _int_min(config.get("max_hits_for_modules"), 50,
@@ -2239,7 +2897,7 @@ def _transcriptomics_network_param_bounds(config: dict) -> dict:
         "direction": direction,
         "weighting": weighting,
         "metric": metric,
-        "enrichment_database": database,
+        "enrichment_databases": enrichment_databases,
         "msigdb_collections": msigdb_collections,
         "include_iea": bool(config.get("include_iea", True)),
         "module_detection": bool(config.get("module_detection", True)),
@@ -2252,35 +2910,62 @@ def _transcriptomics_network_param_bounds(config: dict) -> dict:
     }
 
 
-def _job_run_transcriptomics_network(job_id: str, session: dict) -> dict:
-    """Run the Transcriptomics Network / Module Detection analysis."""
-    resolved_df = session["transcriptomics"]["resolved_df"]
-    config = session["transcriptomics"]["network_config"]
+def _transcriptomics_network_param_bounds(config: dict) -> dict:
+    return _network_param_bounds(config, "transcriptomics")
+
+
+def _job_run_network(job_id: str, session: dict, module: str = "transcriptomics") -> dict:
+    """Run Network / Module Detection for either tile. The two differ only in
+    which orchestrator hooks apply (run_network_analysis vs.
+    Proteomics_network.run_ppi_network_analysis, which itself just calls
+    run_network_analysis with accession-space hooks - see that module) and
+    which session sub-dict is read/written; the parameter bounding, the
+    _graph strip, the edge-list build and the response payload shape are
+    identical by construction, so a recruited protein / module / hit table
+    looks the same in the client regardless of tile."""
+    is_proteomics = module == "proteomics"
+    state = session[module]
+    resolved_df = state["resolved_df"]
+    config = state["network_config"]
     if resolved_df is None:
-        raise ValueError("No resolved differential-expression table available.")
+        raise ValueError("No resolved data table available.")
     if not config:
         raise ValueError("Network analysis is not configured.")
 
-    params = _transcriptomics_network_param_bounds(config)
-    taxon_id = str(session["transcriptomics"].get("taxon_id") or "")
-    taxon_name = str(session["transcriptomics"].get("taxon_name") or "")
+    params = _network_param_bounds(config, module)
+    taxon_id = str(state.get("taxon_id") or "")
+    taxon_name = str(state.get("taxon_name") or "")
 
     def _progress(frac, label):
         update_job(job_id, progress=float(frac), message=str(label))
 
-    result = transcriptomics_network_engine.run_network_analysis(
-        resolved_df, taxon_id, taxon_name=taxon_name,
-        confidence=params["confidence"],
-        padj_cutoff=params["padj_cutoff"], lfc_cutoff=params["lfc_cutoff"],
-        direction=params["direction"], weighting=params["weighting"], metric=params["metric"],
-        restart_prob=params["restart_prob"], n_permutations=params["n_permutations"],
-        fdr_alpha=params["fdr_alpha"], module_detection=params["module_detection"],
-        min_module_size=params["min_module_size"], mcl_inflation=params["mcl_inflation"],
-        max_hits_for_modules=params["max_hits_for_modules"],
-        enrichment_database=params["enrichment_database"],
-        msigdb_collections=params["msigdb_collections"], include_iea=params["include_iea"],
-        seed=params["seed_rng"], progress_callback=_progress,
-    )
+    if is_proteomics:
+        result = proteomics_network_engine.run_ppi_network_analysis(
+            resolved_df, taxon_id, taxon_name=taxon_name,
+            confidence=params["confidence"],
+            padj_cutoff=params["padj_cutoff"], lfc_cutoff=params["lfc_cutoff"],
+            direction=params["direction"], weighting=params["weighting"], metric=params["metric"],
+            restart_prob=params["restart_prob"], n_permutations=params["n_permutations"],
+            fdr_alpha=params["fdr_alpha"], module_detection=params["module_detection"],
+            min_module_size=params["min_module_size"], mcl_inflation=params["mcl_inflation"],
+            max_hits_for_modules=params["max_hits_for_modules"],
+            enrichment_databases=params["enrichment_databases"], include_iea=params["include_iea"],
+            seed=params["seed_rng"], progress_callback=_progress,
+        )
+    else:
+        result = transcriptomics_network_engine.run_network_analysis(
+            resolved_df, taxon_id, taxon_name=taxon_name,
+            confidence=params["confidence"],
+            padj_cutoff=params["padj_cutoff"], lfc_cutoff=params["lfc_cutoff"],
+            direction=params["direction"], weighting=params["weighting"], metric=params["metric"],
+            restart_prob=params["restart_prob"], n_permutations=params["n_permutations"],
+            fdr_alpha=params["fdr_alpha"], module_detection=params["module_detection"],
+            min_module_size=params["min_module_size"], mcl_inflation=params["mcl_inflation"],
+            max_hits_for_modules=params["max_hits_for_modules"],
+            enrichment_databases=params["enrichment_databases"],
+            msigdb_collections=params["msigdb_collections"], include_iea=params["include_iea"],
+            seed=params["seed_rng"], progress_callback=_progress,
+        )
 
     # The graph is a ~50-100 MB in-process object; it must never reach the
     # session or the JSON response. Pop it here, use it for the edge list, drop it.
@@ -2296,7 +2981,7 @@ def _job_run_transcriptomics_network(job_id: str, session: dict) -> dict:
 
     # Keep the raw DataFrames in the session for CSV download; serialize copies
     # for the client (same split the ORA/GSEA/regulon workers use).
-    session["transcriptomics"]["network_results"] = result
+    state["network_results"] = result
 
     payload = {
         "taxon_id": result["taxon_id"],
@@ -2321,14 +3006,33 @@ def _job_run_transcriptomics_network(job_id: str, session: dict) -> dict:
             "caveat": mods["caveat"],
             "selection_caveat": mods["selection_caveat"],
             "cap_info": mods["cap_info"],
+            # "namespace"/"table" describe the WINNER ("best"), same shape the
+            # client already reads today; "candidates" additionally carries
+            # every OTHER tested namespace/database's own (also capped)
+            # table, so the results screen can offer a per-module database
+            # selector rather than only ever showing whichever one won. Same
+            # head(50) cap discipline as the winner - a handful of small
+            # tables per module (at most one per requested database's
+            # namespace/collection), not a new round trip per switch.
             "enrichment": {
-                mid: ({"namespace": e["namespace"],
-                       "table": df_payload(e["block"]["table"].head(50))} if e else None)
+                mid: ({
+                    "namespace": e["best"]["namespace"],
+                    "table": df_payload(e["best"]["block"]["table"].head(50)),
+                    "candidates": {
+                        key: ({"table": df_payload(c["block"]["table"].head(50))} if c else None)
+                        for key, c in e["candidates"].items()
+                    },
+                } if e else None)
                 for mid, e in mods["enrichment"].items()
             },
         }
     update_job(job_id, progress=1.0, message="Done")
     return payload
+
+
+def _job_run_transcriptomics_network(job_id: str, session: dict) -> dict:
+    """Run the Transcriptomics Network / Module Detection analysis."""
+    return _job_run_network(job_id, session, "transcriptomics")
 
 
 def _netprop_subnetwork_edges(graph: dict, string_ids: list, max_nodes: int = 400,
@@ -2406,6 +3110,39 @@ def serve_asset(filename: str):
     if not os.path.isfile(asset_path):
         raise HTTPException(status_code=404, detail="Asset not found.")
     return FileResponse(asset_path, headers={"Cache-Control": "no-cache"})
+
+
+INFO_DIR = os.path.join(BASE_DIR, "info")
+
+
+@app.get("/api/info")
+def list_info_docs():
+    """Every module README under info/, for the public "Information" page: {filename, title} pairs, title = the
+    file's own first line, in the order the files sort (groups Multi-omics' six together, etc.)."""
+    if not os.path.isdir(INFO_DIR):
+        return {"docs": []}
+    docs = []
+    for name in sorted(os.listdir(INFO_DIR)):
+        if not name.startswith("README-") or not name.endswith(".txt"):
+            continue
+        path = os.path.join(INFO_DIR, name)
+        with open(path, "r", encoding="utf-8") as fh:
+            title = fh.readline().strip() or name
+        docs.append({"filename": name, "title": title})
+    return {"docs": docs}
+
+
+@app.get("/api/info/{filename}")
+def get_info_doc(filename: str):
+    safe_name = os.path.basename(filename)
+    if not safe_name.startswith("README-") or not safe_name.endswith(".txt"):
+        raise HTTPException(status_code=404, detail="Unknown document.")
+    path = os.path.join(INFO_DIR, safe_name)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Unknown document.")
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    return {"filename": safe_name, "text": text}
 
 
 @app.get("/api/jobs/{job_id}")
@@ -3852,6 +4589,28 @@ def _require_consistent_proteomics_taxon(session: dict) -> None:
         )
 
 
+def _require_consistent_proteomics_ptm_taxon(session: dict) -> None:
+    """PTM analogue of _require_consistent_proteomics_taxon, reading
+    ptm_meta (the SEPARATE site-level resolve's own record) instead of meta
+    (the protein-level pipeline's) - see _fresh_proteomics_state's comment
+    for why the two resolves are independent."""
+    px = session.get("proteomics") or {}
+    ptm_meta = px.get("ptm_meta") or {}
+    resolved_taxon = str(ptm_meta.get("taxon") or "").strip()
+    current_taxon = str(px.get("taxon_id") or "").strip()
+    if not resolved_taxon or not current_taxon:
+        return
+    if resolved_taxon != current_taxon:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Organism mismatch: the resolved phosphosite table was built for taxon "
+                f"{resolved_taxon}, but the current organism is taxon {current_taxon}. "
+                f"Re-resolve your sites for the current organism before running an analysis."
+            ),
+        )
+
+
 @app.post("/api/proteomics/ora/custom-db-upload")
 async def proteomics_custom_db_upload(
     file: UploadFile = File(...),
@@ -4127,6 +4886,939 @@ def proteomics_quant_download(key: str, x_session_id: Optional[str] = Header(def
         raise HTTPException(status_code=400, detail=f"Unknown result table: {key!r}")
     safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
     return df_to_csv_response(block["table"], f"proteomics_quant_{safe_name}.csv")
+
+
+# ---------------------------------------------------------------------------
+# Proteomics — PPI Network / Module Detection
+# (shares the retriever + session keys resolved_df / taxon_id / taxon_name with
+# ORA and Quantitative Enrichment; defines no retrieval endpoints of its own.
+# See _network_param_bounds / _job_run_network above, and Proteomics_network.py's
+# module docstring for why this tile can use Reactome when Transcriptomics'
+# own Network tile cannot.)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/proteomics/network/configure")
+def proteomics_network_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["proteomics"]["resolved_df"] is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No resolved protein table available. Complete retrieval first.")
+    _require_consistent_proteomics_taxon(session)
+
+    taxon_id = str(session["proteomics"].get("taxon_id") or "").strip()
+    if not taxon_id:
+        raise HTTPException(status_code=400, detail="Select an organism first.")
+    # STRING covers ~12,500 species, far fewer than the UniProt taxonomy the
+    # proteomics organism selector searches. Refuse fast and by name here
+    # rather than after a long download.
+    try:
+        in_string = genomics_net.is_taxon_in_string(taxon_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach STRING to check organism coverage: {exc}")
+    if not in_string:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"STRING has no protein-interaction network for taxon {taxon_id} "
+                    f"({session['proteomics'].get('taxon_name') or 'this organism'}). "
+                    f"PPI Network / Module Detection needs one. GO/Reactome/Complex Portal-based "
+                    f"analyses (Over-Representation Analysis, Quantitative Enrichment) still work "
+                    f"for this organism."))
+
+    config = _network_param_bounds(payload or {}, "proteomics")
+    if config["module_detection"] and not config["enrichment_databases"]:
+        raise HTTPException(status_code=400, detail="Select at least one database to label modules with.")
+    session["proteomics"]["network_config"] = config
+    session["proteomics"]["network_results"] = None
+    return {"config": config}
+
+
+@app.post("/api/proteomics/network/run")
+def proteomics_network_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["proteomics"]["network_config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_run_network, session, "proteomics")
+    return {"job_id": job_id}
+
+
+@app.get("/api/proteomics/network/download")
+def proteomics_network_download(which: str = "hits", key: str = "", db: str = "",
+                                x_session_id: Optional[str] = Header(default=None)):
+    """CSV export. `which` selects the table; `key` names the module for
+    which="enrichment". `db` optionally names which tested namespace/
+    database's own candidate to export (the exact keys under that module's
+    "candidates" in the run's JSON payload, e.g. "biological_process" or
+    "Reactome") - omitted downloads the WINNING ("best") one, same as
+    before multi-database selection existed. Mirrors
+    transcriptomics_network_download exactly - see that function's
+    docstring."""
+    session = session_dep(x_session_id)
+    results = session["proteomics"]["network_results"]
+    if not results:
+        raise HTTPException(status_code=400, detail="No network results available.")
+
+    if which == "hits":
+        return df_to_csv_response(results["propagation"]["table"],
+                                  "proteomics_network_hits.csv")
+    if which == "mapping":
+        return df_to_csv_response(results["mapping"]["table"],
+                                  "proteomics_network_protein_mapping.csv")
+    if which == "modules":
+        if not results.get("modules"):
+            raise HTTPException(status_code=400, detail="This run did not include module detection.")
+        return df_to_csv_response(results["modules"]["table"],
+                                  "proteomics_network_modules.csv")
+    if which == "enrichment":
+        if not results.get("modules"):
+            raise HTTPException(status_code=400, detail="This run did not include module detection.")
+        entry = results["modules"]["enrichment"].get(key)
+        if entry is None:
+            raise HTTPException(status_code=400, detail=f"No enrichment for module {key!r}.")
+        if db:
+            candidate = entry["candidates"].get(db)
+            if candidate is None:
+                raise HTTPException(status_code=400, detail=f"No {db!r} result for module {key!r}.")
+            block = candidate["block"]
+        else:
+            block = entry["best"]["block"]
+        safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
+        return df_to_csv_response(block["table"],
+                                  f"proteomics_network_enrichment_{safe_name}.csv")
+
+    raise HTTPException(status_code=400, detail=f"Unknown table: {which!r}")
+
+
+# ---------------------------------------------------------------------------
+# Proteomics — PTM / Phosphosite Enrichment
+# (a SEPARATE site-level upload/resolve path from ORA/Quant/Network above -
+# see _fresh_proteomics_state's comment. Shares the organism selector
+# (taxon_id/taxon_name) but nothing else.)
+# ---------------------------------------------------------------------------
+
+PROTEOMICS_PTM_EXAMPLE_FILENAME = "example_proteomics_phosphosites.csv"
+
+
+@app.post("/api/proteomics/ptm/upload")
+async def proteomics_ptm_upload(
+    file: UploadFile = File(...),
+    x_session_id: Optional[str] = Header(default=None),
+):
+    session = session_dep(x_session_id)
+    raw_bytes = await file.read()
+    try:
+        sites_df = proteomics_ptm_retriever.load_site_table_from_bytes(raw_bytes)
+        column_mapping = proteomics_ptm_retriever.detect_columns(sites_df)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Only the PTM-specific fields reset here (NOT session["proteomics"] as a
+    # whole, unlike proteomics_upload's protein-level reset) - a new
+    # phosphosite file must not silently discard a user's already-completed,
+    # independent ORA/Quant/Network results, which use a completely
+    # different session sub-state (resolved_df, not resolved_sites_df).
+    session["proteomics"]["ptm_sites_df"] = sites_df
+    session["proteomics"]["ptm_column_mapping"] = column_mapping
+    session["proteomics"]["resolved_sites_df"] = None
+    session["proteomics"]["ptm_meta"] = None
+    session["proteomics"]["ptm_config"] = None
+    session["proteomics"]["ptm_activity_results"] = None
+    session["proteomics"]["ptm_ora_results"] = None
+
+    return {
+        "n_rows": len(sites_df),
+        "columns": list(sites_df.columns),
+        "column_mapping": column_mapping,
+        "preview": df_payload(sites_df.head(200)),
+    }
+
+
+@app.post("/api/proteomics/ptm/resolve")
+def proteomics_ptm_resolve(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["proteomics"]["ptm_sites_df"] is None:
+        raise HTTPException(status_code=400, detail="Upload a phosphosite differential-abundance table first.")
+    taxon_id = str(payload.get("taxon_id") or "").strip()
+    if not taxon_id:
+        raise HTTPException(status_code=400, detail="Select an organism before resolving identifiers.")
+    taxon_name = str(payload.get("taxon_name") or "").strip()
+
+    job_id = submit_job(_job_resolve_ptm_sites, session, taxon_id, taxon_name)
+    return {"job_id": job_id}
+
+
+@app.get("/api/proteomics/ptm/download/resolved.csv")
+def proteomics_ptm_download_resolved(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    resolved_sites_df = session["proteomics"]["resolved_sites_df"]
+    if resolved_sites_df is None:
+        raise HTTPException(status_code=400, detail="No resolved phosphosite table available.")
+    return df_to_csv_response(resolved_sites_df, "proteomics_ptm_resolved.csv")
+
+
+@app.get("/api/proteomics/ptm/example")
+def proteomics_ptm_example():
+    path = os.path.join(BASE_DIR, "Data3", PROTEOMICS_PTM_EXAMPLE_FILENAME)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Example file not found.")
+    return FileResponse(path, media_type="text/csv", filename=PROTEOMICS_PTM_EXAMPLE_FILENAME)
+
+
+@app.post("/api/proteomics/ptm/configure")
+def proteomics_ptm_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["proteomics"]["resolved_sites_df"] is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No resolved phosphosite table available. Complete retrieval first.")
+    _require_consistent_proteomics_ptm_taxon(session)
+
+    try:
+        padj_cutoff = float(payload.get("padj_cutoff", proteomics_engine.PADJ_CUTOFF_DEFAULT))
+        lfc_cutoff = float(payload.get("lfc_cutoff", proteomics_engine.LFC_CUTOFF_DEFAULT))
+        min_term_size = int(payload.get("min_term_size", proteomics_ptm_engine.MIN_TERM_SIZE_DEFAULT))
+        min_kinase_sites = int(payload.get("min_kinase_sites", proteomics_ptm_engine.MIN_KINASE_SITES_DEFAULT))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Thresholds must be numeric.")
+
+    metric = str(payload.get("metric") or proteomics_ptm_engine.KINASE_ACTIVITY_METRIC_DEFAULT)
+    if metric not in transcriptomics_engine.GSEA_RANKING_METRICS:
+        raise HTTPException(status_code=400, detail=f"Unknown ranking metric: {metric!r}")
+
+    n_permutations = payload.get("n_permutations", proteomics_ptm_engine.PTM_N_PERMUTATIONS_DEFAULT)
+    try:
+        n_permutations = int(n_permutations)
+    except (TypeError, ValueError):
+        n_permutations = proteomics_ptm_engine.PTM_N_PERMUTATIONS_DEFAULT
+    if n_permutations not in proteomics_ptm_engine.PTM_N_PERMUTATIONS_CHOICES:
+        n_permutations = proteomics_ptm_engine.PTM_N_PERMUTATIONS_DEFAULT
+
+    min_score_raw = payload.get("min_score")
+    min_score = None
+    if min_score_raw not in (None, ""):
+        try:
+            min_score = float(min_score_raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Minimum confidence score must be numeric.")
+
+    _MISSING = object()
+    max_term_size_raw = payload.get("max_term_size", _MISSING)
+    if max_term_size_raw is _MISSING or max_term_size_raw in (None, ""):
+        max_term_size = proteomics_ptm_engine.MAX_TERM_SIZE_DEFAULT
+    else:
+        try:
+            max_term_size = int(max_term_size_raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Max term size must be numeric.")
+
+    config = {
+        "padj_cutoff": padj_cutoff, "lfc_cutoff": lfc_cutoff,
+        "min_term_size": min_term_size, "max_term_size": max_term_size,
+        "min_kinase_sites": min_kinase_sites, "metric": metric,
+        "n_permutations": n_permutations, "seed": proteomics_ptm_engine.PTM_SEED_DEFAULT,
+        "min_score": min_score,
+    }
+    session["proteomics"]["ptm_config"] = config
+    session["proteomics"]["ptm_activity_results"] = None
+    session["proteomics"]["ptm_ora_results"] = None
+    return {"config": config}
+
+
+@app.post("/api/proteomics/ptm/run")
+def proteomics_ptm_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["proteomics"]["ptm_config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_run_ptm, session)
+    return {"job_id": job_id}
+
+
+@app.get("/api/proteomics/ptm/download")
+def proteomics_ptm_download(which: str = "activity", key: str = "",
+                            x_session_id: Optional[str] = Header(default=None)):
+    """CSV export. which='activity' downloads the kinase activity table;
+    which='ora' downloads one direction's kinase-substrate-ORA table (key
+    names it, e.g. 'Kinase substrates (up)')."""
+    session = session_dep(x_session_id)
+    if which == "activity":
+        results = session["proteomics"]["ptm_activity_results"]
+        if not results or results.get("table") is None:
+            raise HTTPException(status_code=400, detail="No kinase activity results available.")
+        return df_to_csv_response(results["table"], "proteomics_ptm_kinase_activity.csv")
+    if which == "ora":
+        results = session["proteomics"]["ptm_ora_results"]
+        if not results:
+            raise HTTPException(status_code=400, detail="No kinase substrate enrichment results available.")
+        block = results["tables"].get(key)
+        if block is None:
+            raise HTTPException(status_code=400, detail=f"Unknown result table: {key!r}")
+        safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
+        return df_to_csv_response(block["table"], f"proteomics_ptm_ora_{safe_name}.csv")
+    raise HTTPException(status_code=400, detail=f"Unknown table: {which!r}")
+
+
+# ---------------------------------------------------------------------------
+# Metabolomics — Over-Representation Analysis, Chemical Class Enrichment,
+# Lipid Class / Structural Enrichment, Quantitative Enrichment.
+#
+# FOUR separate tiles (matching the app's "one tile per analysis" convention
+# used by every other module), TWO upload paths:
+#   - a plain compound-name LIST, shared by the first three tiles (they
+#     differ only in which database(s) they test the list against);
+#   - a CONCENTRATION TABLE for Quantitative Enrichment, whose statistics
+#     Omiscera computes itself - see Metabolomics_module.compute_compound_
+#     statistics. This is a deliberate correction: an earlier version of
+#     this module wrongly asked for a user-supplied log2FC/pvalue/padj, an
+#     RNA-seq/proteomics differential-expression convention that does not
+#     match what a metabolomics researcher actually uploads (MetaboAnalyst
+#     takes a compound list or a concentration table, never pre-computed
+#     statistics for the latter).
+# Identifier handling differs from every other omics module either way: the
+# upload is compound NAMES, which a two-step resolve turns into a single
+# internal compound key - see Metabolomics_module's docstring on identifier
+# bridging, and _resolve_and_match_compound_names.
+# ---------------------------------------------------------------------------
+
+METABOLOMICS_LIST_EXAMPLE_FILENAME = "example_metabolomics_list.csv"
+METABOLOMICS_QUANT_EXAMPLE_FILENAME = "example_metabolomics_concentrations.csv"
+METABOLOMICS_PATHWAY_DATABASES = ["KEGG", "Reactome", "SMPDB", "PathBank"]
+
+
+def _load_metabolomics_list_upload(raw_bytes: bytes) -> pd.DataFrame:
+    """Parse an uploaded compound-NAME list (ORA / Chemical Class / Lipid
+    Class). Required: Name. Optional: any identifier column the retriever/
+    crosswalk understand. NO statistics columns - a list has no
+    significance concept at all (every compound IS the test set; the
+    universe is the database's own reference set - see
+    Metabolomics_module.run_ora's own docstring). Column matching is
+    case/space-insensitive, matching the other modules' mappers.
+    """
+    try:
+        text = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw_bytes.decode("latin1")
+    separator = "\t" if ("\t" in text.split("\n")[0]) else ","
+    df = pd.read_csv(io.StringIO(text), sep=separator, dtype=str).fillna("")
+
+    canonical = {
+        "name": "Name", "compound": "Name", "compoundname": "Name", "metabolite": "Name",
+        "keggid": "KEGG ID", "kegg": "KEGG ID",
+        "pubchemid": "PubChem ID", "pubchem": "PubChem ID", "cid": "PubChem ID",
+        "inchikey": "InChIKey", "smiles": "SMILES", "formula": "Formula",
+        "hmdbid": "HMDB ID", "hmdb": "HMDB ID",
+        "chebiid": "ChEBI ID", "chebi": "ChEBI ID",
+        "lipidmapsid": "LIPID MAPS ID", "lmid": "LIPID MAPS ID", "lipidmaps": "LIPID MAPS ID",
+    }
+    rename = {}
+    for column in df.columns:
+        key = re.sub(r"[\s_\-]+", "", str(column)).lower()
+        if key in canonical:
+            rename[column] = canonical[key]
+    df = df.rename(columns=rename)
+
+    if "Name" not in df.columns:
+        raise ValueError(
+            "Input table is missing the required 'Name' column. This tile takes a plain "
+            "list of compound names - no statistics columns are needed."
+        )
+    df = df[df["Name"].astype(str).str.strip() != ""].reset_index(drop=True)
+    if df.empty:
+        raise ValueError("Input table has no rows with a compound Name.")
+    return df
+
+
+@app.post("/api/metabolomics/list/upload")
+async def metabolomics_list_upload(
+    file: UploadFile = File(...),
+    x_session_id: Optional[str] = Header(default=None),
+):
+    session = session_dep(x_session_id)
+    raw_bytes = await file.read()
+    try:
+        input_df = _load_metabolomics_list_upload(raw_bytes)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # A new list upload resets the list path and every tile built on it, but
+    # leaves the concentration path (Quantitative Enrichment) untouched -
+    # they are independent uploads, same discipline as PTM's site-level
+    # upload not resetting the protein-level path.
+    mx = session["metabolomics"]
+    mx["list_df"] = input_df
+    id_columns = [c for c in ("KEGG ID", "PubChem ID", "InChIKey", "HMDB ID",
+                              "ChEBI ID", "LIPID MAPS ID", "SMILES", "Formula")
+                  if c in input_df.columns]
+    mx["list_column_mapping"] = {"identifier_columns": id_columns}
+    mx["list_resolved_df"] = None
+    mx["list_matched_df"] = None
+    mx["list_meta"] = None
+    mx["ora_config"] = None
+    mx["ora_results"] = None
+    mx["chemclass_config"] = None
+    mx["chemclass_results"] = None
+    mx["lipidclass_config"] = None
+    mx["lipidclass_results"] = None
+    return {
+        "n_rows": len(input_df),
+        "columns": list(input_df.columns),
+        "identifier_columns": id_columns,
+        "preview": df_payload(input_df.head(200)),
+    }
+
+
+@app.get("/api/metabolomics/list/example")
+def metabolomics_list_example():
+    path = os.path.join(BASE_DIR, "Data3", METABOLOMICS_LIST_EXAMPLE_FILENAME)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Example file not found.")
+    return FileResponse(path, media_type="text/csv", filename=METABOLOMICS_LIST_EXAMPLE_FILENAME)
+
+
+@app.post("/api/metabolomics/list/resolve")
+def metabolomics_list_resolve(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["metabolomics"]["list_df"] is None:
+        raise HTTPException(status_code=400, detail="Upload a compound list first.")
+    taxon_id = str(payload.get("taxon_id", "")).strip()
+    taxon_name = str(payload.get("taxon_name", "")).strip()
+    job_id = submit_job(_job_resolve_metabolites_list, session, taxon_id, taxon_name)
+    return {"job_id": job_id}
+
+
+@app.get("/api/metabolomics/list/download/resolved.csv")
+def metabolomics_list_download_resolved(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    matched_df = session["metabolomics"]["list_matched_df"]
+    if matched_df is None:
+        raise HTTPException(status_code=400, detail="No resolved compound list available.")
+    return df_to_csv_response(matched_df, "metabolomics_list_resolved_compounds.csv")
+
+
+@app.post("/api/metabolomics/list/background-upload")
+async def metabolomics_list_background_upload(
+    file: UploadFile = File(...),
+    x_session_id: Optional[str] = Header(default=None),
+):
+    """Optional background compound list for the three list-input tiles:
+    narrows a database's reference universe to "compounds that could
+    plausibly have been detected" (e.g. an LC-MS panel) rather than every
+    compound the database has ever annotated."""
+    session = session_dep(x_session_id)
+    raw_bytes = await file.read()
+    try:
+        bg_df = _load_metabolomics_list_upload(raw_bytes)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    job_id = submit_job(_job_resolve_background_compounds, session, bg_df)
+    return {"job_id": job_id}
+
+
+# KEGG organism for Metabolomics.
+#
+# By default it is DERIVED from the organism the user chose (the same shared
+# resolver Transcriptomics and Proteomics use - resolve-organism below reports
+# what that derivation gives). The user can instead pick a KEGG organism
+# explicitly from KEGG's own list, exactly like the organism box in Metabolic
+# Connection (/api/contexts/search?database=KEGG); the choice travels in the run
+# config (kegg_organism_code) and is validated here. That replaces the
+# confirm-a-candidate mechanism the gene modules use: there is no gene-ID
+# mapping in Metabolomics that a separately-chosen organism could diverge from
+# (the bug of commit 27ce033), because the organism only selects pathway maps.
+@app.post("/api/metabolomics/kegg/resolve-organism")
+def metabolomics_kegg_resolve_organism(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    return _kegg_resolve_organism_for(session, "metabolomics")
+
+
+_KEGG_ORGANISM_CODE_RE = re.compile(r"[a-z][a-z0-9]{1,7}")
+
+
+def _validate_kegg_organism(code) -> dict:
+    """{organism_code, organism_name, n_maps} for a KEGG organism code the user
+    picked, or HTTP 400 saying why it cannot be used. A code with no pathway maps
+    is rejected rather than accepted and silently returning an empty KEGG table."""
+    code = str(code or "").strip().lower()
+    if not _KEGG_ORGANISM_CODE_RE.fullmatch(code):
+        raise HTTPException(status_code=400, detail=f"{code!r} is not a KEGG organism code (e.g. hsa, mmu, sce).")
+    index = metabolomics_engine.build_kegg_organism_pathway_index(code)
+    if not index.get("names"):
+        raise HTTPException(status_code=400, detail=index.get("caveat") or
+                            f"KEGG lists no pathway maps for organism '{code}'.")
+    name = ""
+    try:
+        found = dc.search_contexts("KEGG", code, limit=5, allow_online=True, verbose=False)
+        if found is not None and not found.empty:
+            exact = found[found["context_id"].astype(str).str.lower() == code]
+            if not exact.empty:
+                name = str(exact.iloc[0].get("context_name") or "")
+    except Exception:
+        name = ""
+    return {"organism_code": code, "organism_name": name or code, "n_maps": len(index["names"])}
+
+
+@app.post("/api/metabolomics/kegg/check-organism")
+def metabolomics_kegg_check_organism(payload: dict):
+    return _validate_kegg_organism(payload.get("organism_code"))
+
+
+def _kegg_config_fields(payload: dict, databases: "list[str]") -> dict:
+    """The explicit KEGG organism, validated, for a run whose databases include
+    KEGG; otherwise empty (KEGG's organism is then derived, or unused)."""
+    code = str(payload.get("kegg_organism_code") or "").strip()
+    if not code or "KEGG" not in databases:
+        return {"kegg_organism_code": "", "kegg_organism_name": ""}
+    org = _validate_kegg_organism(code)
+    return {"kegg_organism_code": org["organism_code"], "kegg_organism_name": org["organism_name"]}
+
+
+@app.post("/api/metabolomics/list/background-remove")
+def metabolomics_list_background_remove(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    session["metabolomics"]["background_compounds"] = None
+    session["metabolomics"]["background_meta"] = None
+    return {"ok": True}
+
+
+def _metabolomics_max_term_size(payload: dict, default):
+    """Blank/absent -> `default`; otherwise a positive int. The default is
+    tile-specific: see _list_tile_config."""
+    raw = payload.get("max_term_size")
+    if raw in (None, "", 0):
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Maximum term size must be a whole number.")
+    return value if value > 0 else default
+
+
+def _list_tile_config(payload: dict, databases: "list[str]") -> dict:
+    """Shared parameter validation for the three list-input tiles.
+    `databases` is FIXED per call site: the ORA route validates a
+    user-chosen subset of the 4 pathway databases; Chemical Class / Lipid
+    Class each test exactly their own one database, so there is nothing to
+    choose there.
+
+    max_term_size defaults to NO LIMIT for the two class tiles and to the
+    shared 500 for pathway ORA. The 500 cap is a gene-set convention (a term
+    holding a large share of the genome says little); a class taxonomy is
+    different - the main-class level users actually want (e.g.
+    Glycerophosphocholines, thousands of members in LIPID MAPS) sits far above
+    500, so the cap silently emptied exactly the lipid result the tile exists
+    for. Fisher's test is exact at any term size; the user can still set one."""
+    is_class_tile = list(databases) in (["Chemical Class"], ["Lipid Class"])
+    return {
+        "databases": databases,
+        "min_term_size": max(1, int(payload.get("min_term_size", genomics_ora.MIN_TERM_SIZE))),
+        "max_term_size": _metabolomics_max_term_size(
+            payload, None if is_class_tile else genomics_ora.MAX_TERM_SIZE_DEFAULT),
+        "chemical_class_level": (payload.get("chemical_class_level")
+                                 if payload.get("chemical_class_level") in metabolomics_engine.CLASS_LEVELS
+                                 else "sub_class"),
+        "lipid_class_level": (payload.get("lipid_class_level")
+                              if payload.get("lipid_class_level") in metabolomics_engine.LIPID_CLASS_LEVELS
+                              else "lm_main_class"),
+        "pathbank_primary_only": bool(payload.get("pathbank_primary_only", True)),
+        "use_background": bool(payload.get("use_background", False)),
+        **_kegg_config_fields(payload, databases),
+    }
+
+
+@app.post("/api/metabolomics/ora/configure")
+def metabolomics_ora_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["metabolomics"]["list_matched_df"] is None:
+        raise HTTPException(status_code=400, detail="Resolve the compound list first.")
+    requested = payload.get("databases") or METABOLOMICS_PATHWAY_DATABASES
+    databases = [d for d in requested if d in METABOLOMICS_PATHWAY_DATABASES]
+    if not databases:
+        raise HTTPException(
+            status_code=400,
+            detail="Select at least one database from: " + ", ".join(METABOLOMICS_PATHWAY_DATABASES),
+        )
+    config = _list_tile_config(payload, databases)
+    session["metabolomics"]["ora_config"] = config
+    session["metabolomics"]["ora_results"] = None
+    return {"config": config}
+
+
+@app.post("/api/metabolomics/ora/run")
+def metabolomics_ora_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["metabolomics"]["ora_config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_run_metabolomics_ora, session)
+    return {"job_id": job_id}
+
+
+@app.get("/api/metabolomics/ora/download")
+def metabolomics_ora_download(key: str, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    results = session["metabolomics"]["ora_results"]
+    if not results:
+        raise HTTPException(status_code=400, detail="No ORA results available.")
+    block = results["tables"].get(key)
+    if block is None:
+        raise HTTPException(status_code=400, detail=f"Unknown result table: {key!r}")
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
+    return df_to_csv_response(block["table"], f"metabolomics_ora_{safe_name}.csv")
+
+
+@app.post("/api/metabolomics/chemclass/configure")
+def metabolomics_chemclass_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["metabolomics"]["list_matched_df"] is None:
+        raise HTTPException(status_code=400, detail="Resolve the compound list first.")
+    config = _list_tile_config(payload, ["Chemical Class"])
+    session["metabolomics"]["chemclass_config"] = config
+    session["metabolomics"]["chemclass_results"] = None
+    return {"config": config}
+
+
+@app.post("/api/metabolomics/chemclass/run")
+def metabolomics_chemclass_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["metabolomics"]["chemclass_config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_run_metabolomics_chemclass, session)
+    return {"job_id": job_id}
+
+
+@app.get("/api/metabolomics/chemclass/download")
+def metabolomics_chemclass_download(key: str, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    results = session["metabolomics"]["chemclass_results"]
+    if not results:
+        raise HTTPException(status_code=400, detail="No Chemical Class results available.")
+    block = results["tables"].get(key)
+    if block is None:
+        raise HTTPException(status_code=400, detail=f"Unknown result table: {key!r}")
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
+    return df_to_csv_response(block["table"], f"metabolomics_chemclass_{safe_name}.csv")
+
+
+@app.post("/api/metabolomics/lipidclass/configure")
+def metabolomics_lipidclass_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["metabolomics"]["list_matched_df"] is None:
+        raise HTTPException(status_code=400, detail="Resolve the compound list first.")
+    config = _list_tile_config(payload, ["Lipid Class"])
+    session["metabolomics"]["lipidclass_config"] = config
+    session["metabolomics"]["lipidclass_results"] = None
+    return {"config": config}
+
+
+@app.post("/api/metabolomics/lipidclass/run")
+def metabolomics_lipidclass_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["metabolomics"]["lipidclass_config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_run_metabolomics_lipidclass, session)
+    return {"job_id": job_id}
+
+
+@app.get("/api/metabolomics/lipidclass/download")
+def metabolomics_lipidclass_download(key: str, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    results = session["metabolomics"]["lipidclass_results"]
+    if not results:
+        raise HTTPException(status_code=400, detail="No Lipid Class results available.")
+    block = results["tables"].get(key)
+    if block is None:
+        raise HTTPException(status_code=400, detail=f"Unknown result table: {key!r}")
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
+    return df_to_csv_response(block["table"], f"metabolomics_lipidclass_{safe_name}.csv")
+
+
+# --- Quantitative Enrichment (concentration table) --------------------------
+
+@app.post("/api/metabolomics/quant/upload")
+async def metabolomics_quant_upload(
+    file: UploadFile = File(...),
+    orientation: str = "auto",
+    group_column: Optional[str] = None,
+    x_session_id: Optional[str] = Header(default=None),
+):
+    """orientation/group_column are the user's explicit overrides of the
+    parser's auto-detection (the UI re-uploads the same file with them
+    when the detected layout is wrong) - auto-detection on an ambiguous
+    file is exactly where a silent wrong guess would be worst."""
+    session = session_dep(x_session_id)
+    raw_bytes = await file.read()
+    if orientation not in ("auto", "standard", "transposed"):
+        raise HTTPException(status_code=400, detail=f"Unknown orientation: {orientation!r}")
+    try:
+        values_df, groups, meta = metabolomics_engine.parse_concentration_table(
+            raw_bytes, orientation=orientation, group_column=group_column or None)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Resets only the concentration path - the list path (if any) belongs
+    # to different tiles and must not be disturbed by this upload.
+    mx = session["metabolomics"]
+    mx["conc_values_df"] = values_df
+    mx["conc_groups"] = groups
+    mx["conc_meta"] = meta
+    mx["conc_resolved_df"] = None
+    mx["conc_matched_df"] = None
+    mx["quant_stats_df"] = None
+    mx["quant_stats_meta"] = None
+    mx["quant_config"] = None
+    mx["quant_results"] = None
+    mx["topology_stats_df"] = None
+    mx["topology_stats_meta"] = None
+    mx["topology_config"] = None
+    mx["topology_results"] = None
+    return {
+        "n_samples": meta["n_samples"], "n_compounds": meta["n_compounds"],
+        "orientation": meta["orientation"], "group_column": meta["group_column"],
+        "group_levels": meta["group_levels"], "group_counts": meta["group_counts"],
+        "candidate_group_columns": meta["candidate_group_columns"],
+        "n_repeated_names": meta.get("n_repeated_names", 0),
+        "n_empty_dropped": meta.get("n_empty_dropped", 0),
+        "n_unnamed_dropped": meta.get("n_unnamed_dropped", 0),
+        "preview": df_payload(values_df.reset_index().rename(columns={"index": "Sample"}).head(10)),
+    }
+
+
+@app.get("/api/metabolomics/quant/example")
+def metabolomics_quant_example():
+    path = os.path.join(BASE_DIR, "Data3", METABOLOMICS_QUANT_EXAMPLE_FILENAME)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Example file not found.")
+    return FileResponse(path, media_type="text/csv", filename=METABOLOMICS_QUANT_EXAMPLE_FILENAME)
+
+
+@app.post("/api/metabolomics/quant/resolve")
+def metabolomics_quant_resolve(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["metabolomics"]["conc_values_df"] is None:
+        raise HTTPException(status_code=400, detail="Upload a concentration table first.")
+    taxon_id = str(payload.get("taxon_id", "")).strip()
+    taxon_name = str(payload.get("taxon_name", "")).strip()
+    job_id = submit_job(_job_resolve_metabolites_conc, session, taxon_id, taxon_name)
+    return {"job_id": job_id}
+
+
+@app.get("/api/metabolomics/quant/download/resolved.csv")
+def metabolomics_quant_download_resolved(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    matched_df = session["metabolomics"]["conc_matched_df"]
+    if matched_df is None:
+        raise HTTPException(status_code=400, detail="No resolved compound table available.")
+    return df_to_csv_response(matched_df, "metabolomics_quant_resolved_compounds.csv")
+
+
+@app.post("/api/metabolomics/quant/configure")
+def metabolomics_quant_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    """Computes the per-compound statistics (compute_compound_statistics)
+    AND stores the enrichment-analysis config in one call: the two-group
+    contrast is itself part of "how to score this run", not a separate
+    step, and doing both here lets validation errors (too few samples in a
+    group, an unknown group name) surface synchronously rather than only
+    after a background job starts."""
+    session = session_dep(x_session_id)
+    mx = session["metabolomics"]
+    if mx["conc_matched_df"] is None:
+        raise HTTPException(status_code=400, detail="Resolve the concentration table first.")
+    values_df, groups = mx["conc_values_df"], mx["conc_groups"]
+
+    group_a = str(payload.get("group_a", "")).strip()
+    group_b = str(payload.get("group_b", "")).strip()
+    if not group_a or not group_b:
+        raise HTTPException(status_code=400, detail="Select two groups to compare.")
+    if group_a == group_b:
+        raise HTTPException(status_code=400, detail="The two groups must be different.")
+    log_transform = bool(payload.get("log_transform", True))
+    min_per_group = max(2, int(payload.get("min_per_group", 3)))
+    try:
+        stats_df, stats_meta = metabolomics_engine.compute_compound_statistics(
+            values_df, groups, group_a, group_b,
+            log_transform=log_transform, min_per_group=min_per_group,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if stats_df.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="No compound had enough samples in both groups to test. "
+                   "Lower the minimum samples per group or check your group selection.",
+        )
+
+    requested = payload.get("databases") or metabolomics_engine.METABOLOMICS_ORA_DATABASES
+    databases = [d for d in requested if d in metabolomics_engine.METABOLOMICS_ORA_DATABASES]
+    if not databases:
+        raise HTTPException(
+            status_code=400,
+            detail="Select at least one database from: "
+                   + ", ".join(metabolomics_engine.METABOLOMICS_ORA_DATABASES),
+        )
+    metric = payload.get("metric", metabolomics_engine.QUANT_METRIC_DEFAULT)
+    if metric not in metabolomics_engine.QUANT_METRICS:
+        metric = metabolomics_engine.QUANT_METRIC_DEFAULT
+
+    config = {
+        "databases": databases,
+        "metric": metric,
+        "min_term_size": max(1, int(payload.get("min_term_size", genomics_ora.MIN_TERM_SIZE))),
+        "max_term_size": _metabolomics_max_term_size(payload, genomics_ora.MAX_TERM_SIZE_DEFAULT),
+        "chemical_class_level": (payload.get("chemical_class_level")
+                                 if payload.get("chemical_class_level") in metabolomics_engine.CLASS_LEVELS
+                                 else "sub_class"),
+        "lipid_class_level": (payload.get("lipid_class_level")
+                              if payload.get("lipid_class_level") in metabolomics_engine.LIPID_CLASS_LEVELS
+                              else "lm_main_class"),
+        "pathbank_primary_only": bool(payload.get("pathbank_primary_only", True)),
+        "use_background": bool(payload.get("use_background", False)),
+        **_kegg_config_fields(payload, databases),
+    }
+    mx["quant_stats_df"] = stats_df
+    mx["quant_stats_meta"] = stats_meta
+    mx["quant_config"] = config
+    mx["quant_results"] = None
+    return {
+        "config": config,
+        "stats_meta": stats_meta,
+        "stats_preview": df_payload(stats_df.sort_values("pvalue").head(50)),
+    }
+
+
+@app.post("/api/metabolomics/quant/run")
+def metabolomics_quant_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["metabolomics"]["quant_config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_run_metabolomics_quant, session)
+    return {"job_id": job_id}
+
+
+@app.get("/api/metabolomics/quant/download")
+def metabolomics_quant_download(key: str, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    results = session["metabolomics"]["quant_results"]
+    if not results:
+        raise HTTPException(status_code=400, detail="No quantitative enrichment results available.")
+    block = results["tables"].get(key)
+    if block is None:
+        raise HTTPException(status_code=400, detail=f"Unknown result table: {key!r}")
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
+    return df_to_csv_response(block["table"], f"metabolomics_quant_{safe_name}.csv")
+
+
+@app.get("/api/metabolomics/quant/download/statistics.csv")
+def metabolomics_quant_download_statistics(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    stats_df = session["metabolomics"]["quant_stats_df"]
+    if stats_df is None:
+        raise HTTPException(status_code=400, detail="No statistics available - configure the analysis first.")
+    return df_to_csv_response(stats_df, "metabolomics_quant_statistics.csv")
+
+
+# --- Pathway Topology Analysis (KEGG only; list OR concentration input) -----
+#
+# Unlike the four tiles above, this one has no upload/resolve route of its
+# own: its module screen lets the user pick "list" or "concentration table"
+# and then drives the EXISTING /list/upload+/list/resolve or /quant/upload+
+# /quant/resolve routes unchanged (see _fresh_metabolomics_state's own
+# comment). Only configure/run/download are new here.
+
+@app.post("/api/metabolomics/topology/configure")
+def metabolomics_topology_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    mx = session["metabolomics"]
+    input_mode = payload.get("input_mode")
+    if input_mode not in ("list", "conc"):
+        raise HTTPException(status_code=400, detail="input_mode must be 'list' or 'conc'.")
+
+    if input_mode == "list":
+        if mx["list_matched_df"] is None:
+            raise HTTPException(status_code=400, detail="Resolve the compound list first.")
+        metric = metabolomics_engine.QUANT_METRIC_DEFAULT
+    else:
+        if mx["conc_matched_df"] is None:
+            raise HTTPException(status_code=400, detail="Resolve the concentration table first.")
+        values_df, groups = mx["conc_values_df"], mx["conc_groups"]
+        group_a = str(payload.get("group_a", "")).strip()
+        group_b = str(payload.get("group_b", "")).strip()
+        if not group_a or not group_b:
+            raise HTTPException(status_code=400, detail="Select two groups to compare.")
+        if group_a == group_b:
+            raise HTTPException(status_code=400, detail="The two groups must be different.")
+        log_transform = bool(payload.get("log_transform", True))
+        min_per_group = max(2, int(payload.get("min_per_group", 3)))
+        try:
+            stats_df, stats_meta = metabolomics_engine.compute_compound_statistics(
+                values_df, groups, group_a, group_b,
+                log_transform=log_transform, min_per_group=min_per_group,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if stats_df.empty:
+            raise HTTPException(
+                status_code=400,
+                detail="No compound had enough samples in both groups to test. "
+                       "Lower the minimum samples per group or check your group selection.",
+            )
+        metric = payload.get("metric", metabolomics_engine.QUANT_METRIC_DEFAULT)
+        if metric not in metabolomics_engine.QUANT_METRICS:
+            metric = metabolomics_engine.QUANT_METRIC_DEFAULT
+        mx["topology_stats_df"] = stats_df
+        mx["topology_stats_meta"] = stats_meta
+
+    measure = payload.get("measure", metabolomics_engine.PATHWAY_TOPOLOGY_MEASURE_DEFAULT)
+    if measure not in metabolomics_engine.PATHWAY_TOPOLOGY_MEASURES:
+        measure = metabolomics_engine.PATHWAY_TOPOLOGY_MEASURE_DEFAULT
+
+    config = {
+        "input_mode": input_mode,
+        "metric": metric,
+        "measure": measure,
+        "min_term_size": max(1, int(payload.get("min_term_size", genomics_ora.MIN_TERM_SIZE))),
+        "max_term_size": _metabolomics_max_term_size(payload, genomics_ora.MAX_TERM_SIZE_DEFAULT),
+        "use_background": bool(payload.get("use_background", False)),
+        # Topology always tests KEGG, so its organism is always validated
+        # when a code is given - unlike _kegg_config_fields' conditional
+        # check for the multi-database tiles above.
+        **_kegg_config_fields(payload, ["KEGG"]),
+    }
+    mx["topology_config"] = config
+    mx["topology_results"] = None
+    response = {"config": config}
+    if input_mode == "conc":
+        response["stats_meta"] = mx["topology_stats_meta"]
+        response["stats_preview"] = df_payload(mx["topology_stats_df"].sort_values("pvalue").head(50))
+    return response
+
+
+@app.post("/api/metabolomics/topology/run")
+def metabolomics_topology_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if session["metabolomics"]["topology_config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_run_metabolomics_topology, session)
+    return {"job_id": job_id}
+
+
+@app.get("/api/metabolomics/topology/download")
+def metabolomics_topology_download(key: str, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    results = session["metabolomics"]["topology_results"]
+    if not results:
+        raise HTTPException(status_code=400, detail="No pathway topology results available.")
+    block = results["tables"].get(key)
+    if block is None:
+        raise HTTPException(status_code=400, detail=f"Unknown result table: {key!r}")
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
+    return df_to_csv_response(block["table"], f"metabolomics_topology_{safe_name}.csv")
+
+
+@app.get("/api/metabolomics/topology/download/statistics.csv")
+def metabolomics_topology_download_statistics(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    stats_df = session["metabolomics"]["topology_stats_df"]
+    if stats_df is None:
+        raise HTTPException(status_code=400, detail="No statistics available - configure the analysis first.")
+    return df_to_csv_response(stats_df, "metabolomics_topology_statistics.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -4431,7 +6123,9 @@ def transcriptomics_network_configure(payload: dict, x_session_id: Optional[str]
                     f"this organism."))
 
     config = _transcriptomics_network_param_bounds(payload or {})
-    if config["enrichment_database"] == "MSigDB" and not config["msigdb_collections"]:
+    if config["module_detection"] and not config["enrichment_databases"]:
+        raise HTTPException(status_code=400, detail="Select at least one database to label modules with.")
+    if "MSigDB" in config["enrichment_databases"] and not config["msigdb_collections"]:
         raise HTTPException(
             status_code=400,
             detail="Select at least one MSigDB collection to label modules with, or choose GO instead.")
@@ -4451,13 +6145,17 @@ def transcriptomics_network_run(x_session_id: Optional[str] = Header(default=Non
 
 
 @app.get("/api/transcriptomics/network/download")
-def transcriptomics_network_download(which: str = "hits", key: str = "",
+def transcriptomics_network_download(which: str = "hits", key: str = "", db: str = "",
                                      x_session_id: Optional[str] = Header(default=None)):
     """CSV export. `which` selects the table; `key` names the module for
-    which="enrichment". Both are query params (module ids and table names are
-    not URL-path-safe), matching the ORA/GSEA/regulon download convention.
-    The FULL, uncapped tables are served here - the client only ever receives a
-    truncated copy for rendering."""
+    which="enrichment". `db` optionally names which tested namespace/
+    database's own candidate to export (the exact keys under that module's
+    "candidates" in the run's JSON payload, e.g. "biological_process" or
+    "MSigDB: Hallmark") - omitted downloads the WINNING ("best") one, same
+    as before multi-database selection existed. Query params (module ids and
+    table names are not URL-path-safe), matching the ORA/GSEA/regulon
+    download convention. The FULL, uncapped tables are served here - the
+    client only ever receives a truncated copy for rendering."""
     session = session_dep(x_session_id)
     results = session["transcriptomics"]["network_results"]
     if not results:
@@ -4480,8 +6178,15 @@ def transcriptomics_network_download(which: str = "hits", key: str = "",
         entry = results["modules"]["enrichment"].get(key)
         if entry is None:
             raise HTTPException(status_code=400, detail=f"No enrichment for module {key!r}.")
+        if db:
+            candidate = entry["candidates"].get(db)
+            if candidate is None:
+                raise HTTPException(status_code=400, detail=f"No {db!r} result for module {key!r}.")
+            block = candidate["block"]
+        else:
+            block = entry["best"]["block"]
         safe_name = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
-        return df_to_csv_response(entry["block"]["table"],
+        return df_to_csv_response(block["table"],
                                   f"transcriptomics_network_enrichment_{safe_name}.csv")
 
     raise HTTPException(status_code=400, detail=f"Unknown table: {which!r}")
@@ -4684,6 +6389,1877 @@ ORA_GO_NAMESPACE_LABELS = {
     "cellular_component": "Cellular Component",
 }
 
+
+# ---------------------------------------------------------------------------
+# Multi-omics - Joint Pathway Enrichment
+#
+# Its own session sub-dict (session["multiomics"]) and its own routes. It never
+# reads another tile's session state: every omics is uploaded and resolved
+# HERE, through that omics' own existing resolver (Multiomics_module_retriever;
+# Metabolomics through the same _resolve_and_match_compound_names helper the
+# Metabolomics tiles use). Nothing below edits an existing function - it only
+# CALLS the shared helpers (_kegg_resolve_organism_for, _kegg_confirmed_code,
+# _load_metabolomics_list_upload, ...).
+# ---------------------------------------------------------------------------
+
+MULTIOMICS_EXAMPLE_BY_OMICS = {
+    "genomics": "example_multiomics_genes.csv",
+    "transcriptomics": "example_transcriptomics_de_full.csv",
+    "proteomics": "example_proteomics_de_full.csv",
+    "metabolomics": "example_metabolomics_list.csv",
+}
+
+
+def _fresh_multiomics_input() -> dict:
+    return {
+        "df": None, "kind": None, "identifier_type": None, "column_mapping": None,
+        "n_duplicates_removed": 0, "resolved_df": None, "matched_df": None, "meta": None,
+    }
+
+
+def _fresh_multiomics_state() -> dict:
+    """Single source of truth for the 'multiomics' session sub-dict shape.
+
+    One upload/resolve slot per omics type, entirely separate from
+    session["ora"] / ["transcriptomics"] / ["proteomics"] / ["metabolomics"]:
+    the user chose a dedicated upload here, so a re-run of another tile can
+    never silently change what Multi-omics sees. ONE organism for the whole run
+    (taxon_id/taxon_name) and ONE KEGG organism confirmation - the KEGG
+    organism is resolved once per run, never once per omics.
+    """
+    return {
+        "selected_omics": [],
+        "taxon_id": "", "taxon_name": "",
+        "kegg_organism_confirmation": None,
+        "inputs": {o: _fresh_multiomics_input() for o in multiomics_retriever.OMICS_TYPES},
+        "joint_config": None, "joint_results": None,
+        "mapping": _fresh_multiomics_mapping(),
+        "correlation": _fresh_multiomics_correlation(),
+        "network": _fresh_multiomics_network(),
+        "mofa": _fresh_multiomics_mofa(),
+        "diablo": _fresh_multiomics_diablo(),
+    }
+
+
+def _fresh_multiomics_correlation() -> dict:
+    """Correlation-based Integration's own slot: the matrices uploaded (samples x features), the gene symbols their
+    features resolved to, the sample alignment, the config and the last result. Separate from Joint and Mapping."""
+    return {"selected": [], "taxon_id": "", "taxon_name": "", "uploads": {}, "resolved": {}, "aligned": None,
+            "config": None, "results": None}
+
+
+def _fresh_multiomics_mapping() -> dict:
+    """Cross-omics Pathway Mapping's own slot: its config (the DE cutoffs), the pickers
+    already built per database, and the last mapped pathway (kept for the CSV download)."""
+    return {"config": None, "pickers": {}, "results": None}
+
+
+def _multiomics_clear_results(mx: dict) -> None:
+    """Drop every analysis built on the current uploads / resolution (Joint and Mapping)."""
+    mx["joint_config"] = None
+    mx["joint_results"] = None
+    mx["mapping"] = _fresh_multiomics_mapping()
+    mx["network"] = _fresh_multiomics_network()
+
+
+def _multiomics_state(session: dict) -> dict:
+    return session["multiomics"]
+
+
+@app.post("/api/multiomics/select")
+def multiomics_select(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    """Choose which omics to combine (2-4). Re-choosing keeps the uploads of any
+    omics that stays selected, and drops the joint config/results (they described
+    a different combination)."""
+    session = session_dep(x_session_id)
+    requested = payload.get("omics_types") or []
+    chosen = [o for o in multiomics_retriever.OMICS_TYPES if o in requested]
+    if len(chosen) < 2:
+        raise HTTPException(status_code=400, detail="Select at least two omics to combine.")
+    previous = session["multiomics"]
+    fresh = _fresh_multiomics_state()
+    fresh["selected_omics"] = chosen
+    for o in chosen:
+        fresh["inputs"][o] = previous["inputs"][o]
+    fresh["taxon_id"], fresh["taxon_name"] = previous["taxon_id"], previous["taxon_name"]
+    fresh["correlation"] = previous["correlation"]   # a different method's state: choosing omics for Joint must not wipe it
+    fresh["mofa"] = previous["mofa"]                 # MOFA reads the Correlation matrices, so it keeps its own result as well
+    fresh["diablo"] = previous["diablo"]             # DIABLO reads them too, and keeps its own result the same way
+    session["multiomics"] = fresh
+    return {"selected": chosen}
+
+
+@app.get("/api/multiomics/example")
+def multiomics_example(omics_type: str = "genomics"):
+    fname = MULTIOMICS_EXAMPLE_BY_OMICS.get(str(omics_type).strip().lower())
+    if not fname:
+        raise HTTPException(status_code=404, detail="Unknown omics type.")
+    path = os.path.join(BASE_DIR, "Data3", fname)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Example file not found.")
+    return FileResponse(path, filename=fname, media_type="text/csv")
+
+
+@app.post("/api/multiomics/kegg/resolve-organism")
+def multiomics_kegg_resolve_organism(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    return _kegg_resolve_organism_for(session, "multiomics")
+
+
+@app.post("/api/multiomics/kegg/confirm-organism")
+def multiomics_kegg_confirm_organism(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    return _kegg_confirm_organism_for(session, "multiomics", payload)
+
+
+@app.post("/api/multiomics/resolve")
+def multiomics_resolve(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    mx = _multiomics_state(session)
+    if not mx["selected_omics"]:
+        raise HTTPException(status_code=400, detail="Choose the omics to combine first.")
+    missing = [multiomics_engine.OMICS_LABELS[o] for o in mx["selected_omics"] if mx["inputs"][o]["df"] is None]
+    if missing:
+        raise HTTPException(status_code=400, detail="Upload a file for: " + ", ".join(missing) + ".")
+    taxon_id = str(payload.get("taxon_id") or "").strip()
+    if not taxon_id:
+        raise HTTPException(status_code=400, detail="Select an organism before resolving identifiers.")
+    taxon_name = str(payload.get("taxon_name") or "").strip()
+    job_id = submit_job(_job_resolve_multiomics, session, taxon_id, taxon_name)
+    return {"job_id": job_id}
+
+
+@app.post("/api/multiomics/joint/configure")
+def multiomics_joint_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    mx = _multiomics_state(session)
+    selected = mx["selected_omics"]
+    if not selected or any(mx["inputs"][o]["resolved_df"] is None for o in selected):
+        raise HTTPException(status_code=400, detail="Resolve every selected omics' identifiers first.")
+    requested = payload.get("databases") or list(multiomics_engine.JOINT_DATABASES)
+    databases = [d for d in multiomics_engine.JOINT_DATABASES if d in requested]
+    if not databases:
+        raise HTTPException(status_code=400, detail="Select KEGG and/or Reactome.")
+    method = payload.get("method") or multiomics_engine.COMBINE_METHOD_DEFAULT
+    if method not in multiomics_engine.COMBINE_METHODS:
+        raise HTTPException(status_code=400, detail="Unknown combination method.")
+    try:
+        min_ts = max(1, int(payload.get("min_term_size", multiomics_engine.MIN_TERM_SIZE_DEFAULT)))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Minimum term size must be a whole number.")
+    max_ts = _metabolomics_max_term_size(payload, multiomics_engine.MAX_TERM_SIZE_DEFAULT)
+    if max_ts and max_ts < min_ts:
+        raise HTTPException(status_code=400, detail="Maximum term size must be at least the minimum.")
+    cutoffs = _multiomics_parse_cutoffs(payload, selected)
+    config = {"databases": databases, "method": method, "min_term_size": min_ts,
+              "max_term_size": max_ts, "de_cutoffs": cutoffs}
+    mx["joint_config"] = config
+    mx["joint_results"] = None
+    return {"config": config}
+
+
+@app.post("/api/multiomics/joint/run")
+def multiomics_joint_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if _multiomics_state(session)["joint_config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_run_multiomics_joint, session)
+    return {"job_id": job_id}
+
+
+@app.get("/api/multiomics/joint/download")
+def multiomics_joint_download(database: str, table: str = "combined",
+                              x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    results = _multiomics_state(session)["joint_results"]
+    if not results or database not in results["blocks"]:
+        raise HTTPException(status_code=400, detail="No joint result available for that database.")
+    block = results["blocks"][database]
+    df = block["partial_table"] if table == "partial" else block["table"]
+    return df_to_csv_response(df, f"multiomics_joint_{database}_{'partial' if table == 'partial' else 'combined'}.csv")
+
+
+@app.post("/api/multiomics/{omics_type}/upload")
+async def multiomics_upload(omics_type: str, file: UploadFile = File(...),
+                            x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    mx = _multiomics_state(session)
+    if omics_type not in mx["selected_omics"]:
+        raise HTTPException(status_code=400, detail=f"'{omics_type}' is not one of the selected omics.")
+    raw_bytes = await file.read()
+    try:
+        if omics_type == "metabolomics":
+            df = _load_metabolomics_list_upload(raw_bytes)
+            id_columns = [c for c in ("KEGG ID", "PubChem ID", "InChIKey", "HMDB ID", "ChEBI ID",
+                                      "LIPID MAPS ID", "SMILES", "Formula") if c in df.columns]
+            parsed = {"df": df, "kind": "list", "identifier_type": None,
+                      "column_mapping": {"identifier_columns": id_columns}, "n_duplicates_removed": 0}
+        else:
+            parsed = multiomics_retriever.parse_upload(omics_type, raw_bytes)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    entry = _fresh_multiomics_input()
+    entry.update({k: parsed[k] for k in ("df", "kind", "identifier_type", "column_mapping", "n_duplicates_removed")})
+    mx["inputs"][omics_type] = entry
+    _multiomics_clear_results(mx)
+    df = parsed["df"]
+    return {
+        "omics_type": omics_type, "kind": parsed["kind"], "n_rows": len(df), "columns": list(df.columns),
+        "identifier_type": parsed["identifier_type"], "column_mapping": parsed["column_mapping"],
+        "n_duplicates_removed": parsed["n_duplicates_removed"], "preview": df_payload(df.head(50)),
+    }
+
+
+def _multiomics_resolve_summary(omics_type: str, entry: dict) -> dict:
+    """Small JSON-safe description of one omics' resolved table."""
+    resolved, meta = entry["resolved_df"], entry["meta"] or {}
+    summary = {"label": multiomics_engine.OMICS_LABELS[omics_type], "kind": entry["kind"],
+               "n_input_rows": int(meta.get("n_input_rows", len(entry["df"]))), "meta": meta}
+    if omics_type == "metabolomics":
+        matched = entry["matched_df"]
+        summary["n_usable"] = int((matched["compound_key"].astype(str).str.strip() != "").sum())
+    elif omics_type == "genomics":
+        summary["n_usable"] = len(multiomics_retriever.usable_genomics_rows(resolved))
+    elif omics_type == "transcriptomics":
+        summary["n_usable"] = int((resolved["gene_symbol"].astype(str).str.strip() != "").sum())
+    else:
+        summary["n_usable"] = int((resolved["accession"].astype(str).str.strip() != "").sum())
+    return summary
+
+
+def _job_resolve_multiomics(job_id: str, session: dict, taxon_id: str, taxon_name: str) -> dict:
+    """Resolve every selected omics with that omics' OWN resolver. Everything is
+    committed together, on success only (same discipline as _job_resolve_de): a
+    failure part-way leaves the previous organism and tables untouched."""
+    mx = _multiomics_state(session)
+    selected = list(mx["selected_omics"])
+    staged: dict = {}
+    for i, omics_type in enumerate(selected):
+        start, span = i / len(selected), 1.0 / len(selected)
+        label = multiomics_engine.OMICS_LABELS[omics_type]
+        update_job(job_id, progress=start, message=f"Resolving {label} identifiers...")
+        entry = mx["inputs"][omics_type]
+        if omics_type == "metabolomics":
+            resolved_df, matched_df, meta = _resolve_and_match_compound_names(
+                job_id, entry["df"], progress_start=start, progress_span=span)
+            staged[omics_type] = {"resolved_df": resolved_df, "matched_df": matched_df, "meta": meta}
+        else:
+            def _progress(current, total, text, _s=start, _p=span, _l=label):
+                update_job(job_id, progress=_s + _p * (current / max(total, 1)), message=f"{_l}: {text}")
+            out = multiomics_retriever.resolve_upload(
+                omics_type, entry["df"], taxon_id, identifier_type=entry["identifier_type"],
+                progress_callback=_progress)
+            staged[omics_type] = {"resolved_df": out["resolved_df"], "matched_df": None, "meta": out["meta"]}
+    for omics_type, got in staged.items():
+        mx["inputs"][omics_type].update(got)
+    mx["taxon_id"], mx["taxon_name"] = taxon_id, taxon_name
+    mx["kegg_organism_confirmation"] = None
+    _multiomics_clear_results(mx)
+    update_job(job_id, progress=1.0, message="Done")
+    return {"omics": {o: _multiomics_resolve_summary(o, mx["inputs"][o]) for o in selected},
+            "taxon_id": taxon_id, "taxon_name": taxon_name}
+
+
+def _serialize_multiomics_results(results: dict) -> dict:
+    """JSON-safe view of the joint run; the DataFrames stay in session state."""
+    blocks = {}
+    for database, block in results["blocks"].items():
+        blocks[database] = {
+            "table": df_payload(block["table"]), "partial_table": df_payload(block["partial_table"]),
+            "per_omics": block["per_omics"], "omics_combined": block["omics_combined"],
+            "omics_excluded": block["omics_excluded"], "n_terms_combined": block["n_terms_combined"],
+            "n_terms_partial": block["n_terms_partial"], "n_terms_no_overlap": block["n_terms_no_overlap"],
+            "note": block["note"], "caveat": block["caveat"], "method": block["method"],
+            "columns": block["columns"], "correlation": block.get("correlation"),
+        }
+    return {"blocks": blocks, "summary": results["summary"]}
+
+
+def _multiomics_resolve_kegg(session: dict, mx: dict, databases, job_id: "str | None" = None) -> tuple:
+    """The KEGG organism is resolved ONCE and the same code goes into every omics'
+    KEGG builder (commit 27ce033 was two paths resolving it separately). Returns
+    (code, name, note, caveat); a non-empty note means no organism could be used."""
+    kegg_code, kegg_name, kegg_note, kegg_caveat = "", "", None, None
+    if "KEGG" in databases:
+        if job_id:
+            update_job(job_id, progress=0.02, message="Resolving the KEGG organism...")
+        kegg_org = transcriptomics_engine.resolve_kegg_organism_code(
+            mx["taxon_id"], mx["taxon_name"], verbose=False,
+            confirmed_organism_code=_kegg_confirmed_code(session, "multiomics"))
+        kegg_note, kegg_caveat = kegg_org.get("note"), kegg_org.get("caveat")
+        if not kegg_note:
+            kegg_code, kegg_name = kegg_org["organism_code"], kegg_org.get("organism_name", "")
+    return kegg_code, kegg_name, kegg_note, kegg_caveat
+
+
+def _multiomics_prepare_omics(mx: dict, selected: list, de_cutoffs: dict, kegg_code: str,
+                              job_id: "str | None" = None, assign_kegg_ids: bool = True) -> tuple:
+    """Per-omics selection (once, shared by every database): the hit set each omics
+    contributes. Used by Joint Pathway Enrichment and by Cross-omics Pathway Mapping,
+    so both tiles mean the same thing by "hit". Returns (prep, omics_summary)."""
+    prep: dict = {}
+    omics_summary: dict = {}
+    for o in selected:
+        entry = mx["inputs"][o]
+        resolved = entry["resolved_df"]
+        if o == "genomics":
+            table = resolved
+            if kegg_code and assign_kegg_ids:
+                if job_id:
+                    update_job(job_id, progress=0.05, message="Assigning KEGG gene IDs to the Genomics list...")
+                table = multiomics_retriever.assign_genomics_kegg_ids(resolved, kegg_code)
+            usable = multiomics_retriever.usable_genomics_rows(table)
+            prep[o] = {"final_df": usable}
+            omics_summary[o] = {"n_uploaded": len(resolved), "n_in_list": len(usable),
+                                "n_left_out": len(resolved) - len(usable)}
+        elif o in multiomics_retriever.DE_OMICS:
+            cut = de_cutoffs[o]
+            select = (multiomics_retriever.select_transcriptomics if o == "transcriptomics"
+                      else multiomics_retriever.select_proteomics)
+            sel = select(resolved, cut["padj"], cut["lfc"])
+            prep[o] = sel
+            omics_summary[o] = {"n_tested": sel["n_tested"], "n_in_list": sel["n_significant"],
+                                "padj_cutoff": cut["padj"], "lfc_cutoff": cut["lfc"]}
+        else:
+            matched = entry["matched_df"]
+            prep[o] = {"matched_df": matched, "crosswalk": metabolomics_engine.build_compound_crosswalk(verbose=False)}
+            omics_summary[o] = {"n_uploaded": len(matched),
+                                "n_in_list": int((matched["compound_key"].astype(str).str.strip() != "").sum())}
+        omics_summary[o]["label"] = multiomics_engine.OMICS_LABELS[o]
+    return prep, omics_summary
+
+
+def _multiomics_database_inputs(mx: dict, selected: list, prep: dict, database: str, kegg_code: str,
+                                kegg_name: str, kegg_note: "str | None", kegg_caveat: "str | None") -> dict:
+    """One database's per-omics {term_map, list_set, universe_set, ...}, each built by that
+    omics' OWN universe builder with the ONE shared KEGG organism code."""
+    taxon_id, taxon_name = mx["taxon_id"], mx["taxon_name"]
+    inputs: dict = {}
+    for o in selected:
+        if database == "KEGG" and kegg_note:
+            inputs[o] = multiomics_engine._empty_input(kegg_note, kegg_caveat)
+            continue
+        if o == "genomics":
+            inputs[o] = multiomics_engine.build_genomics_input(
+                prep[o]["final_df"], database, taxon_id, taxon_name, kegg_code)
+        elif o == "transcriptomics":
+            inputs[o] = multiomics_engine.build_transcriptomics_input(
+                prep[o]["universe_df"], prep[o]["significant"], database, taxon_name, kegg_code)
+        elif o == "proteomics":
+            inputs[o] = multiomics_engine.build_proteomics_input(
+                mx["inputs"][o]["resolved_df"], prep[o]["significant"], database,
+                taxon_id, taxon_name, kegg_code)
+        else:
+            inputs[o] = multiomics_engine.build_metabolomics_input(
+                prep[o]["matched_df"], prep[o]["crosswalk"], database, taxon_id, taxon_name,
+                kegg_code, kegg_name)
+    return inputs
+
+
+def _job_run_multiomics_joint(job_id: str, session: dict) -> dict:
+    update_job(job_id, message="Starting joint pathway enrichment...")
+    mx = _multiomics_state(session)
+    config = mx["joint_config"]
+    if config is None:
+        raise ValueError("Configure the analysis first.")
+    selected = list(mx["selected_omics"])
+    taxon_id, taxon_name = mx["taxon_id"], mx["taxon_name"]
+    databases = config["databases"]
+
+    kegg_code, kegg_name, kegg_note, kegg_caveat = _multiomics_resolve_kegg(session, mx, databases, job_id)
+    prep, omics_summary = _multiomics_prepare_omics(mx, selected, config["de_cutoffs"], kegg_code, job_id)
+
+    blocks: dict = {}
+    for d_index, database in enumerate(databases):
+        update_job(job_id, progress=0.1 + 0.85 * d_index / len(databases),
+                   message=f"Building {database} pathway sets for each omics...")
+        inputs = _multiomics_database_inputs(mx, selected, prep, database, kegg_code, kegg_name,
+                                             kegg_note, kegg_caveat)
+        update_job(job_id, progress=0.1 + 0.85 * (d_index + 0.6) / len(databases),
+                   message=f"Combining {database} p-values across omics...")
+        block = multiomics_engine.run_joint_pathway_enrichment(
+            inputs, database, config["method"], config["min_term_size"], config["max_term_size"])
+        caveats = [c for c in (block.get("caveat"), kegg_caveat if database == "KEGG" else None,
+                               multiomics_engine.joint_caveat(config["method"])) if c]
+        block["caveat"] = " ".join(dict.fromkeys(caveats))
+        blocks[database] = block
+
+    results = {"blocks": blocks, "summary": {
+        "omics": selected, "omics_summary": omics_summary, "taxon_id": taxon_id, "taxon_name": taxon_name,
+        "kegg_organism_code": kegg_code, "kegg_organism_name": kegg_name,
+        "method": config["method"],
+        "method_label": multiomics_engine.COMBINE_METHOD_LABELS[config["method"]],
+    }}
+    mx["joint_results"] = results
+    update_job(job_id, progress=1.0, message="Done")
+    return _serialize_multiomics_results(results)
+
+
+# ---------------------------------------------------------------------------
+# Multi-omics - Cross-omics Pathway Mapping (descriptive; see Multiomics_mapping).
+# Shares the uploads / resolution / organism / hit rule of Joint Pathway
+# Enrichment (same Multi-omics session sub-dict), keeps its own config and
+# results under session["multiomics"]["mapping"].
+# ---------------------------------------------------------------------------
+
+_MAPPING_PATHWAY_ID_RE = {"KEGG": re.compile(r"^[a-z]{2,5}\d{5}$"), "Reactome": re.compile(r"^R-[A-Z]{3}-\d+$")}
+
+
+def _multiomics_parse_cutoffs(payload: dict, selected: list) -> dict:
+    """padj / |log2FC| cutoffs for the differential-expression omics among `selected`."""
+    cutoffs = {}
+    raw_cutoffs = payload.get("de_cutoffs") or {}
+    for o in multiomics_retriever.DE_OMICS:
+        if o not in selected:
+            continue
+        raw = raw_cutoffs.get(o) or {}
+        try:
+            padj = float(raw.get("padj", multiomics_retriever.PADJ_CUTOFF_DEFAULT))
+            lfc = abs(float(raw.get("lfc", multiomics_retriever.LFC_CUTOFF_DEFAULT)))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="padj and log2FC cutoffs must be numbers.")
+        if not (0 < padj <= 1):
+            raise HTTPException(status_code=400, detail="The padj cutoff must be above 0 and at most 1.")
+        cutoffs[o] = {"padj": padj, "lfc": lfc}
+    return cutoffs
+
+
+@app.post("/api/multiomics/mapping/configure")
+def multiomics_mapping_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    mx = _multiomics_state(session)
+    selected = mx["selected_omics"]
+    if not selected or any(mx["inputs"][o]["resolved_df"] is None for o in selected):
+        raise HTTPException(status_code=400, detail="Resolve every selected omics' identifiers first.")
+    mx["mapping"] = _fresh_multiomics_mapping()
+    mx["mapping"]["config"] = {"de_cutoffs": _multiomics_parse_cutoffs(payload, selected)}
+    return {"config": mx["mapping"]["config"]}
+
+
+def _multiomics_mapping_database(payload: dict) -> str:
+    database = str(payload.get("database") or "")
+    if database not in multiomics_mapping.MAP_DATABASES:
+        raise HTTPException(status_code=400, detail="Choose KEGG or Reactome.")
+    return database
+
+
+@app.post("/api/multiomics/mapping/pathways")
+def multiomics_mapping_pathways(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    mx = _multiomics_state(session)
+    if mx["mapping"]["config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the mapping first.")
+    database = _multiomics_mapping_database(payload)
+    job_id = submit_job(_job_multiomics_mapping_pathways, session, database)
+    return {"job_id": job_id}
+
+
+def _multiomics_build_picker(session: dict, database: str, job_id: "str | None" = None) -> dict:
+    """The pathway picker: every pathway at least one omics hit, ranked by how many omics hit it. Built from the same
+    per-omics sets the joint test uses (coverage, no statistics). The rows are kept in the session so an overview
+    pathway can show its sub-pathways with the same hit counts without building this twice."""
+    mx = _multiomics_state(session)
+    cfg = mx["mapping"]["config"]
+    if cfg is None:
+        raise ValueError("Configure the mapping first.")
+    selected = list(mx["selected_omics"])
+    kegg_code, kegg_name, kegg_note, kegg_caveat = _multiomics_resolve_kegg(session, mx, [database], job_id)
+    prep, omics_summary = _multiomics_prepare_omics(mx, selected, cfg["de_cutoffs"], kegg_code, job_id,
+                                                    assign_kegg_ids=(database == "KEGG"))
+    if job_id:
+        update_job(job_id, progress=0.3, message=f"Building {database} pathway sets for each omics...")
+    inputs = _multiomics_database_inputs(mx, selected, prep, database, kegg_code, kegg_name, kegg_note, kegg_caveat)
+    joint = (mx["joint_results"] or {}).get("blocks", {}).get(database)
+    joint_fdr = {}
+    if joint is not None and len(joint["table"]):
+        joint_fdr = dict(zip(joint["table"]["Term ID"].astype(str), joint["table"]["Combined FDR"]))
+    rows = multiomics_mapping.build_pathway_picker(inputs, selected, joint_fdr)
+    notes = [o_in["note"] for o_in in inputs.values() if o_in.get("note")]
+    mx["mapping"]["pickers"][database] = {"kegg_code": kegg_code, "rows": rows}
+    return {"database": database, "rows": rows, "n_pathways": len(rows), "omics": selected,
+            "omics_summary": omics_summary, "kegg_organism_code": kegg_code, "kegg_organism_name": kegg_name,
+            "note": " ".join(dict.fromkeys(notes)) or None, "caveat": kegg_caveat if database == "KEGG" else None,
+            "has_joint_fdr": bool(joint_fdr)}
+
+
+def _job_multiomics_mapping_pathways(job_id: str, session: dict, database: str) -> dict:
+    update_job(job_id, message=f"Listing {database} pathways hit by your omics...")
+    built = _multiomics_build_picker(session, database, job_id)
+    columns = multiomics_mapping.picker_columns(built["omics"])
+    out = {k: v for k, v in built.items() if k != "rows"}
+    out["table"] = df_payload(pd.DataFrame(built["rows"], columns=columns))
+    update_job(job_id, progress=1.0, message="Done")
+    return out
+
+
+@app.post("/api/multiomics/mapping/run")
+def multiomics_mapping_run(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    mx = _multiomics_state(session)
+    if mx["mapping"]["config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the mapping first.")
+    database = _multiomics_mapping_database(payload)
+    pathway_id = str(payload.get("pathway_id") or "").strip()
+    if not _MAPPING_PATHWAY_ID_RE[database].match(pathway_id):
+        raise HTTPException(status_code=400, detail=f"'{pathway_id}' is not a valid {database} pathway ID.")
+    job_id = submit_job(_job_run_multiomics_mapping, session, database, pathway_id,
+                        str(payload.get("pathway_name") or ""))
+    return {"job_id": job_id}
+
+
+def _serialize_map_node(n: dict, selected: list) -> dict:
+    """JSON view of one mapped box. Only the omics that touched it carry a status (a global map has ~5,000 boxes and
+    most are touched by nobody - four 'absent' dicts each would triple the payload); a polyline and a group's
+    components travel with it."""
+    out = {"id": n["id"], "kind": n["kind"], "label": n["label"], "x": n["x"], "y": n["y"], "w": n["w"], "h": n["h"],
+           "status": {o: n["status"][o] for o in selected if n["status"][o]["state"] != "absent"}}
+    if "path" in n:
+        out["path"] = n["path"]
+    if "components" in n:
+        out["components"] = n["components"]
+    if "cls" in n:
+        out["cls"] = n["cls"]
+    return out
+
+
+def _job_run_multiomics_mapping(job_id: str, session: dict, database: str, pathway_id: str,
+                                pathway_name: str = "") -> dict:
+    update_job(job_id, message="Starting pathway mapping...")
+    mx = _multiomics_state(session)
+    cfg = mx["mapping"]["config"]
+    if cfg is None:
+        raise ValueError("Configure the mapping first.")
+    selected = list(mx["selected_omics"])
+    # The KEGG organism is needed by KEGG itself and, as an identifier bridge, by Reactome.
+    kegg_code, kegg_name, kegg_note, kegg_caveat = _multiomics_resolve_kegg(session, mx, ["KEGG"], job_id)
+    if database == "KEGG" and kegg_note:
+        raise ValueError(kegg_note)
+
+    update_job(job_id, progress=0.1, message=f"Fetching the {database} pathway structure...")
+    fetched = multiomics_retriever.fetch_pathway_structure(database, pathway_id)
+    result = {"database": database, "pathway_id": pathway_id, "pathway_name": pathway_name,
+              "status": fetched["status"], "note": fetched.get("note"),
+              "restricted_to": fetched.get("restricted_to"), "omics": selected,
+              "nodes": [], "reactions": [], "summary": None, "members": None, "links": None,
+              "interactions": None, "relations": [], "decor_lines": [], "line_graphics": False, "classes": [],
+              "subpathways": None, "caveat": multiomics_mapping.MAP_CAVEAT}
+    if fetched["status"] == "overview":
+        # Reactome draws this pathway only as links to its sub-pathways: nothing to put a hit on. List them, with the
+        # same hit counts the picker shows, so one click reaches a real diagram.
+        result["pathway_name"] = fetched["structure"].get("title") or pathway_name
+        picker = mx["mapping"]["pickers"].get(database)
+        if not picker or "rows" not in picker:
+            update_job(job_id, progress=0.3, message="Counting your hits per sub-pathway...")
+            picker = {"rows": _multiomics_build_picker(session, database, job_id)["rows"]}
+        rows = multiomics_mapping.overview_rows(fetched["subpathways"], picker["rows"], selected)
+        result["subpathways"] = df_payload(pd.DataFrame(rows, columns=multiomics_mapping.picker_columns(selected)))
+    if fetched["status"] != "ok":
+        mx["mapping"]["results"] = None
+        update_job(job_id, progress=1.0, message="Done")
+        return result
+    structure = fetched["structure"]
+    result["pathway_name"] = structure.get("title") or pathway_name
+
+    update_job(job_id, progress=0.35, message="Matching your omics to the pathway's members...")
+    prep, _ = _multiomics_prepare_omics(mx, selected, cfg["de_cutoffs"], kegg_code, job_id,
+                                        assign_kegg_ids=(database == "KEGG"))
+    gene_map = genomics_ora.build_kegg_gene_map(kegg_code) if kegg_code else None
+    features: dict = {}
+    for o in selected:
+        if o == "genomics":
+            features[o] = multiomics_mapping.gene_features_genomics(prep[o]["final_df"], gene_map)
+        elif o == "transcriptomics":
+            features[o] = multiomics_mapping.gene_features_de(o, prep[o]["universe_df"], prep[o]["significant"], gene_map)
+        elif o == "proteomics":
+            resolved = mx["inputs"][o]["resolved_df"]
+            universe_df = resolved[resolved["accession"].astype(str).str.strip() != ""]
+            features[o] = multiomics_mapping.gene_features_de(o, universe_df, prep[o]["significant"], gene_map)
+        else:
+            features[o] = multiomics_mapping.compound_features(prep[o]["matched_df"])
+    if database == "KEGG":
+        try:
+            multiomics_mapping.relabel_kegg_compounds(structure, metabolomics_engine.build_kegg_compound_name_index())
+        except Exception:
+            pass  # labels stay as KEGG C-numbers; the mapping itself does not depend on them
+    skeletons = {}
+    if database == "Reactome" and "metabolomics" in selected:
+        update_job(job_id, progress=0.6, message="Bridging Reactome's ChEBI IDs to your compounds...")
+        skeletons = multiomics_retriever.fetch_chebi_skeletons(multiomics_mapping.structure_chebi_ids(structure))
+    mapped = multiomics_mapping.map_omics_to_structure(structure, features, database, skeletons)
+    classes = []
+    if structure.get("line_graphics") and database == "KEGG":
+        # KEGG paints each line of a global map in its pathway CLASS's colour; name the colours from KEGG's own classification
+        update_job(job_id, progress=0.8, message="Naming the pathway classes of the map...")
+        map_to_class = multiomics_retriever.fetch_pathway_classes()
+        universe = genomics_ora.build_kegg_universe(kegg_code)
+        gene_to_maps: dict = {}
+        for pid, info in (universe.get("pathways") or {}).items():
+            for gene in info["genes"]:
+                gene_to_maps.setdefault(gene, set()).add(pid[-5:])
+        color_class = multiomics_mapping.assign_color_classes(mapped, gene_to_maps, map_to_class)
+        for n in mapped:
+            if n["kind"] == "gene" and n.get("color"):
+                n["cls"] = color_class.get(n["color"], multiomics_mapping.OTHER_CLASS)
+            elif n["kind"] == "link" and n.get("pathway") in map_to_class:
+                n["cls"] = map_to_class[n["pathway"]]
+        classes = multiomics_mapping.class_legend(mapped, color_class)
+    links = multiomics_mapping.reaction_links(structure, mapped, selected)
+    members = multiomics_mapping.member_rows(mapped, selected)
+    interactions = multiomics_mapping.interaction_links(structure, mapped, selected)
+    members_df = pd.DataFrame(members, columns=multiomics_mapping.MEMBER_COLUMNS)
+    links_df = pd.DataFrame(links, columns=multiomics_mapping.LINK_COLUMNS)
+    interactions_df = pd.DataFrame(interactions, columns=multiomics_mapping.INTERACTION_COLUMNS)
+
+    result["nodes"] = [_serialize_map_node(n, selected) for n in mapped]
+    result["reactions"] = structure["reactions"]
+    result["relations"] = structure.get("relations") or []
+    result["classes"] = classes
+    result["decor_lines"] = structure.get("decor_lines") or []
+    result["line_graphics"] = bool(structure.get("line_graphics"))
+    result["summary"] = multiomics_mapping.summarize_mapping(mapped, links, selected, interactions)
+    result["members"], result["links"] = df_payload(members_df), df_payload(links_df)
+    result["interactions"] = df_payload(interactions_df)
+    notes = []
+    if database == "Reactome" and "transcriptomics" in selected and not kegg_code:
+        notes.append("No KEGG organism was resolved, so Transcriptomics genes could only be matched to Reactome "
+                     "entities by gene symbol (less precise than through UniProt).")
+    if "metabolomics" in selected and database == "Reactome":
+        notes.append("Metabolomics compounds are matched to Reactome chemicals by ChEBI ID, or - where Reactome cites a "
+                     "different protonation state of the same compound - by InChIKey skeleton (each match says which).")
+    result["note"] = " ".join(notes) or None
+    mx["mapping"]["results"] = {"database": database, "pathway_id": pathway_id, "members_df": members_df,
+                                "links_df": links_df, "interactions_df": interactions_df}
+    update_job(job_id, progress=1.0, message="Done")
+    return result
+
+
+@app.get("/api/multiomics/mapping/download")
+def multiomics_mapping_download(table: str = "members", x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    res = _multiomics_state(session)["mapping"]["results"]
+    if not res:
+        raise HTTPException(status_code=400, detail="No pathway mapping available.")
+    table = table if table in ("links", "interactions") else "members"
+    df = res[f"{table}_df"]
+    return df_to_csv_response(df, f"multiomics_mapping_{res['pathway_id']}_{table}.csv")
+
+
+# ---------------------------------------------------------------------------
+# Multi-omics - Correlation-based Integration (see Multiomics_correlation for the statistics)
+#
+# Inputs are SAMPLE x FEATURE matrices (the same samples in every file), uploaded here for Transcriptomics, Proteomics
+# and Metabolomics; Genomics (a gene list) cannot take part. State: session["multiomics"]["correlation"].
+# ---------------------------------------------------------------------------
+
+MULTIOMICS_CORR_EXAMPLES = {
+    "transcriptomics": "example_corr_transcriptomics.csv",
+    "proteomics": "example_corr_proteomics.csv",
+    "metabolomics": "example_corr_metabolomics.csv",
+}
+_CORR_PAIR_COLUMNS = ["Feature A", "Feature B", "Omics A", "Omics B", "rho", "p-value", "FDR", "n"]
+_CORR_GENE_COLUMNS = ["Gene", "rho", "p-value", "FDR", "n", "Transcript id(s)", "Protein id(s)"]
+
+
+def _corr_state(session: dict) -> dict:
+    return session["multiomics"]["correlation"]
+
+
+def _corr_clear_downstream(cs: dict) -> None:
+    """Drop what was built on the current uploads / resolution (the alignment and the result)."""
+    cs["aligned"] = None
+    cs["results"] = None
+
+
+@app.post("/api/multiomics/correlation/select")
+def multiomics_correlation_select(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    cs = _corr_state(session)
+    requested = payload.get("omics_types") or []
+    if "genomics" in requested:
+        raise HTTPException(status_code=400, detail="Genomics is a gene list, not a quantitative table: it cannot be "
+                                                    "correlated across samples. Choose Transcriptomics, Proteomics and / or Metabolomics.")
+    chosen = [o for o in multiomics_correlation.OMICS_ORDER if o in requested]
+    if len(chosen) < 2:
+        raise HTTPException(status_code=400, detail="Select at least two omics to correlate.")
+    cs["selected"] = chosen
+    cs["uploads"] = {o: v for o, v in cs["uploads"].items() if o in chosen}
+    cs["resolved"] = {o: v for o, v in cs["resolved"].items() if o in chosen}
+    _corr_clear_downstream(cs)
+    return {"selected": chosen}
+
+
+@app.get("/api/multiomics/correlation/example")
+def multiomics_correlation_example(omics_type: str = "transcriptomics"):
+    fname = MULTIOMICS_CORR_EXAMPLES.get(str(omics_type).strip().lower())
+    if not fname:
+        raise HTTPException(status_code=404, detail="Unknown omics type.")
+    path = os.path.join(BASE_DIR, "Data3", fname)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Example file not found.")
+    return FileResponse(path, filename=fname, media_type="text/csv")
+
+
+@app.post("/api/multiomics/correlation/{omics_type}/upload")
+async def multiomics_correlation_upload(omics_type: str, file: UploadFile = File(...), orientation: str = Form("auto"),
+                                        x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    cs = _corr_state(session)
+    if omics_type not in cs["selected"]:
+        raise HTTPException(status_code=400, detail=f"'{omics_type}' is not one of the selected omics.")
+    raw_bytes = await file.read()
+    try:
+        parsed = multiomics_correlation.parse_matrix(raw_bytes, orientation=orientation)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    cs["uploads"][omics_type] = {"df": parsed["df"], "meta": parsed["meta"], "filename": getattr(file, "filename", "")}
+    cs["resolved"].pop(omics_type, None)
+    _corr_clear_downstream(cs)
+    meta = parsed["meta"]
+    return {"omics_type": omics_type, "n_samples": meta["n_samples"], "n_features": meta["n_features"],
+            "orientation": meta["orientation"], "orientation_reason": meta["orientation_reason"],
+            "set_aside_columns": meta["set_aside_columns"], "first_samples": meta["first_samples"],
+            "n_repeated_feature_ids": meta["n_repeated_feature_ids"], "n_empty_dropped": meta["n_empty_dropped"],
+            "first_features": [str(c) for c in parsed["df"].columns[:5]]}
+
+
+def _job_correlation_resolve(job_id: str, session: dict, taxon_id: str, taxon_name: str, case_insensitive: bool) -> dict:
+    """Give the transcript / protein features their gene symbols (each omics' own mapping step), then keep only the
+    samples every file has. Committed together, on success only."""
+    cs = _corr_state(session)
+    selected = list(cs["selected"])
+    staged: dict = {}
+    for i, o in enumerate(selected):
+        start, span = i / len(selected), 1.0 / len(selected)
+        label = multiomics_correlation.OMICS_LABELS[o]
+        update_job(job_id, progress=start, message=f"Resolving {label} identifiers...")
+        df = cs["uploads"][o]["df"]
+        if o == "metabolomics":
+            # nothing here needs a compound's database ids: features are correlated by name as written
+            staged[o] = {"gene_of": {}, "n_features": int(df.shape[1]), "n_mapped": None, "n_unmapped": None, "identifier_type": None}
+        else:
+            def _progress(current, total, text, _s=start, _p=span, _l=label):
+                update_job(job_id, progress=_s + _p * (current / max(total, 1)), message=f"{_l}: {text}")
+            # a repeated id was renamed "X (2)" on upload; it is resolved by its original id "X"
+            original = cs["uploads"][o]["meta"].get("original_ids") or {}
+            ids = [str(c) for c in df.columns]
+            res = multiomics_retriever.resolve_matrix_features(o, list(dict.fromkeys(original.get(c, c) for c in ids)), taxon_id,
+                                                               progress_callback=_progress)
+            gene_of = {c: res["gene_of"][original.get(c, c)] for c in ids if original.get(c, c) in res["gene_of"]}
+            extra = {k: {c: res[k][original.get(c, c)] for c in ids if original.get(c, c) in res[k]}
+                     for k in ("entrez_of", "acc_of") if k in res}
+            staged[o] = {**res, **extra, "gene_of": gene_of, "n_features": len(ids), "n_mapped": len(gene_of),
+                         "n_unmapped": len(ids) - len(gene_of)}
+    update_job(job_id, progress=0.95, message="Matching the samples across the files...")
+    mats = {}
+    for o in selected:
+        m = cs["uploads"][o]["df"].copy()
+        m.attrs["alt_samples"] = cs["uploads"][o]["meta"]["alt_samples"]
+        mats[o] = m
+    aligned = multiomics_correlation.align_samples(mats, case_insensitive=case_insensitive)
+    cs["resolved"] = staged
+    cs["aligned"] = {"samples": aligned["samples"], "mats": aligned["mats"], "report": aligned["report"],
+                     "warnings": aligned["warnings"], "case_insensitive": case_insensitive}
+    cs["taxon_id"], cs["taxon_name"] = taxon_id, taxon_name
+    cs["results"] = None
+    update_job(job_id, progress=1.0, message="Done")
+    return _corr_alignment_payload(cs)
+
+
+def _corr_alignment_payload(cs: dict) -> dict:
+    al = cs["aligned"]
+    omics = {}
+    for o in cs["selected"]:
+        up, rs = cs["uploads"][o], cs["resolved"].get(o) or {}
+        omics[o] = {"label": multiomics_correlation.OMICS_LABELS[o], "n_samples": al["report"][o]["n_samples"],
+                    "n_used": al["report"][o]["n_used"], "dropped": al["report"][o]["dropped"],
+                    "n_features": up["meta"]["n_features"], "orientation": up["meta"]["orientation"],
+                    "n_mapped": rs.get("n_mapped"), "n_unmapped": rs.get("n_unmapped"),
+                    "identifier_type": rs.get("identifier_type")}
+    return {"omics": omics, "samples": al["samples"], "n_shared": len(al["samples"]), "warnings": al["warnings"]}
+
+
+@app.post("/api/multiomics/correlation/resolve")
+def multiomics_correlation_resolve(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    cs = _corr_state(session)
+    if len(cs["selected"]) < 2:
+        raise HTTPException(status_code=400, detail="Choose the omics to correlate first.")
+    missing = [multiomics_correlation.OMICS_LABELS[o] for o in cs["selected"] if o not in cs["uploads"]]
+    if missing:
+        raise HTTPException(status_code=400, detail="Upload a table for: " + ", ".join(missing) + ".")
+    taxon_id = str(payload.get("taxon_id") or "").strip()
+    if not taxon_id:
+        raise HTTPException(status_code=400, detail="Select an organism before resolving identifiers.")
+    job_id = submit_job(_job_correlation_resolve, session, taxon_id, str(payload.get("taxon_name") or "").strip(),
+                        bool(payload.get("case_insensitive")))
+    return {"job_id": job_id}
+
+
+@app.post("/api/multiomics/correlation/configure")
+def multiomics_correlation_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    cs = _corr_state(session)
+    if cs["aligned"] is None:
+        raise HTTPException(status_code=400, detail="Resolve the identifiers and match the samples first.")
+    cfg = dict(multiomics_correlation.CONFIG_DEFAULTS)
+    method = payload.get("method", cfg["method"])
+    if method not in multiomics_correlation.METHODS:
+        raise HTTPException(status_code=400, detail="Unknown correlation method.")
+    cfg["method"] = method
+    cfg["log2"] = bool(payload.get("log2", False))
+
+    def _num(key, cast, lo, hi, label):
+        try:
+            v = cast(payload.get(key, cfg[key]))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{label} must be a number.")
+        if not (lo <= v <= hi):
+            raise HTTPException(status_code=400, detail=f"{label} must be between {lo} and {hi}.")
+        return v
+
+    cfg["top_variance"] = _num("top_variance", int, 50, 5000, "The number of top-variance features")
+    cfg["fdr"] = _num("fdr", float, 1e-12, 1.0, "The FDR cutoff")
+    cfg["rho_cut"] = _num("rho_cut", float, 0.0, 0.999, "The |rho| cutoff")
+    cfg["min_samples"] = _num("min_samples", int, multiomics_correlation.MIN_SAMPLES, 1000, "The minimum number of samples per pair")
+    cfg["heat_k"] = _num("heat_k", int, 5, 80, "The heatmap size")
+    cfg["net_k"] = _num("net_k", int, 5, 150, "The number of network edges")
+    if len(cs["aligned"]["samples"]) < cfg["min_samples"]:
+        raise HTTPException(status_code=400, detail=f"Only {len(cs['aligned']['samples'])} samples are shared; the minimum per pair "
+                                                    f"you set is {cfg['min_samples']}.")
+    cs["config"] = cfg
+    cs["results"] = None
+    return {"config": cfg}
+
+
+def _corr_rows_df(rows: list, columns: list) -> pd.DataFrame:
+    return pd.DataFrame([{c: r[c] for c in columns} for r in rows], columns=columns)
+
+
+def _job_correlation_run(job_id: str, session: dict) -> dict:
+    cs = _corr_state(session)
+    cfg = cs["config"]
+    if cfg is None or cs["aligned"] is None:
+        raise ValueError("Configure the analysis first.")
+    update_job(job_id, progress=0.05, message="Cleaning the matrices...")
+    clean, feature_notes = {}, {}
+    for o in cs["selected"]:
+        clean[o], feature_notes[o] = multiomics_correlation.prepare_matrix(
+            cs["aligned"]["mats"][o], log2=cfg["log2"], max_missing=multiomics_correlation.MAX_MISSING_FRACTION, top_variance=None)
+        if clean[o].shape[1] < 2:
+            raise ValueError(f"{multiomics_correlation.OMICS_LABELS[o]}: fewer than two usable features remain.")
+    gene_of = {o: (cs["resolved"].get(o) or {}).get("gene_of", {}) for o in cs["selected"]}
+    update_job(job_id, progress=0.15, message="Correlating every pair of features (this is the slow step)...")
+    res = multiomics_correlation.run_correlation(
+        clean, gene_of, cfg,
+        progress=lambda f, text: update_job(job_id, progress=0.15 + 0.7 * f, message=f"Correlating every pair of features - {text}"))
+    update_job(job_id, progress=0.9, message="Preparing the tables...")
+    tables: dict = {}
+    out = {"config": res["config"], "samples": res["samples"], "omics": res["omics"], "notes": res["notes"],
+           "warnings": cs["aligned"]["warnings"], "alignment": _corr_alignment_payload(cs), "network": res["network"],
+           "feature_report": {o: {**feature_notes[o], **res["feature_report"][o]} for o in res["omics"]}, "blocks": {}, "concordance": None}
+    for key, blk in res["blocks"].items():
+        df = _corr_rows_df(blk["rows"], _CORR_PAIR_COLUMNS)
+        tables[key] = pd.concat([df, pd.DataFrame({"Feature A id": [r["a_id"] for r in blk["rows"]], "Feature B id": [r["b_id"] for r in blk["rows"]]})], axis=1)
+        out["blocks"][key] = {k: blk[k] for k in ("omics_a", "omics_b", "n_a", "n_b", "n_tests", "n_sig_fdr", "n_reported",
+                                                  "truncated", "expected_false", "n_too_few_samples", "heat")}
+        out["blocks"][key]["table"] = df_payload(df)
+        out["blocks"][key]["ids"] = [[r["a_id"], r["b_id"]] for r in blk["rows"]]
+    conc_mats = None
+    if res["concordance"] is not None:
+        c = res["concordance"]
+        conc_mats = c.pop("_matrices")
+        df = _corr_rows_df(c["rows"], _CORR_GENE_COLUMNS)
+        tables["concordance"] = df
+        out["concordance"] = {k: v for k, v in c.items() if k != "rows"}
+        out["concordance"]["table"] = df_payload(df)
+    cs["results"] = {"payload": out, "mats": clean, "conc_mats": conc_mats, "tables": tables, "labels": res["labels"]}
+    update_job(job_id, progress=1.0, message="Done")
+    return out
+
+
+@app.post("/api/multiomics/correlation/run")
+def multiomics_correlation_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    cs = _corr_state(session)
+    if cs["config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_correlation_run, session)
+    return {"job_id": job_id}
+
+
+@app.get("/api/multiomics/correlation/scatter")
+def multiomics_correlation_scatter(kind: str = "pair", block: str = "", a: str = "", b: str = "", gene: str = "",
+                                   x_session_id: Optional[str] = Header(default=None)):
+    """One pair's values per sample, for the scatter plot, with the correlation recomputed for the label."""
+    session = session_dep(x_session_id)
+    res = _corr_state(session)["results"]
+    if not res:
+        raise HTTPException(status_code=400, detail="No correlation result available.")
+    cfg = res["payload"]["config"]
+    try:
+        if kind == "gene":
+            if res["conc_mats"] is None:
+                raise KeyError("no concordance")
+            Tg, Pg = res["conc_mats"]
+            vec = multiomics_correlation.pair_vectors(Tg, gene, Pg, gene)
+            labels = {"x_label": "Transcript " + gene, "y_label": "Protein " + gene}
+        else:
+            oa, _, ob = block.partition("|")
+            vec = multiomics_correlation.pair_vectors(res["mats"][oa], a, res["mats"][ob], b)
+            def _name(o, f):
+                # the gene symbol a protein / transcript resolved to, with its own id when they differ
+                lab = (res.get("labels") or {}).get(o, {}).get(f, f)
+                return f"{multiomics_correlation.OMICS_LABELS[o]}: {lab}" + (f" ({f})" if lab != f else "")
+            labels = {"x_label": _name(oa, a), "y_label": _name(ob, b)}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown feature for this result.")
+    x = np.array([np.nan if v is None else v for v in vec["x"]])
+    y = np.array([np.nan if v is None else v for v in vec["y"]])
+    r, n = multiomics_correlation.paired_correlation(x[:, None], y[:, None], cfg["method"], 3)
+    p = multiomics_correlation.pvalues_from_r(r, n)
+    return {**vec, **labels, "method": cfg["method"],
+            "rho": None if not np.isfinite(r[0]) else float(r[0]), "p": None if not np.isfinite(p[0]) else float(p[0]), "n": int(n[0])}
+
+
+@app.get("/api/multiomics/correlation/download")
+def multiomics_correlation_download(table: str = "concordance", x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    res = _corr_state(session)["results"]
+    if not res or table not in res["tables"]:
+        raise HTTPException(status_code=400, detail="No such result table.")
+    return df_to_csv_response(res["tables"][table], f"multiomics_correlation_{table.replace('|', '_')}.csv")
+
+
+# ---------------------------------------------------------------------------
+# Multi-omics - Network-based Integration (see Multiomics_network)
+#
+# Shares the uploads / resolution / organism of the other Multi-omics tiles (the same session sub-dict, like Cross-omics
+# Pathway Mapping); keeps its own config and results under session["multiomics"]["network"]. Two networks from one run:
+# the STRING gene / protein network (seeds of every omics, equal weight per omics) and the Reactome pathway-overlap network.
+# ---------------------------------------------------------------------------
+
+def _fresh_multiomics_network() -> dict:
+    return {"config": None, "results": None}
+
+
+def _network_int(payload: dict, key: str, default: int, lo: int, hi: int, label: str) -> int:
+    raw = payload.get(key, default)
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{label} must be a whole number.")
+    if not (lo <= v <= hi):
+        raise HTTPException(status_code=400, detail=f"{label} must be between {lo} and {hi}.")
+    return v
+
+
+def _network_float(payload: dict, key: str, default: float, lo: float, hi: float, label: str) -> float:
+    raw = payload.get(key, default)
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{label} must be a number.")
+    if not (lo < v <= hi):
+        raise HTTPException(status_code=400, detail=f"{label} must be above {lo} and at most {hi}.")
+    return v
+
+
+@app.post("/api/multiomics/network/configure")
+def multiomics_network_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    mx = _multiomics_state(session)
+    selected = mx["selected_omics"]
+    if len(selected) < 2 or any(mx["inputs"][o]["resolved_df"] is None for o in selected):
+        raise HTTPException(status_code=400, detail="Choose at least two omics and resolve every selected omics' identifiers first.")
+    taxon_id = str(mx["taxon_id"] or "").strip()
+    if not taxon_id:
+        raise HTTPException(status_code=400, detail="Select an organism first.")
+    try:
+        in_string = genomics_net.is_taxon_in_string(taxon_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach STRING to check organism coverage: {exc}")
+    if not in_string:
+        raise HTTPException(status_code=400, detail=(
+            f"STRING has no protein-interaction network for taxon {taxon_id} ({mx['taxon_name'] or 'this organism'}), and "
+            "Network-based Integration needs one. Joint Pathway Enrichment and Cross-omics Pathway Mapping still work for this organism."))
+    payload = payload or {}
+    confidence = _network_int(payload, "confidence", genomics_net.DEFAULT_CONFIDENCE, 0, 1000, "The STRING confidence cutoff")
+    if confidence not in genomics_net.CONFIDENCE_CHOICES:
+        raise HTTPException(status_code=400, detail=f"The STRING confidence cutoff must be one of {list(genomics_net.CONFIDENCE_CHOICES)}.")
+    n_perm = _network_int(payload, "n_permutations", multiomics_network.CONFIG_DEFAULTS["n_permutations"], 1, 10**7, "The number of permutations")
+    if n_perm not in transcriptomics_network_engine.NETWORK_N_PERMUTATIONS_CHOICES:
+        raise HTTPException(status_code=400, detail=f"The number of permutations must be one of {list(transcriptomics_network_engine.NETWORK_N_PERMUTATIONS_CHOICES)}.")
+    module_db = str(payload.get("module_database") or multiomics_network.CONFIG_DEFAULTS["module_database"])
+    if module_db not in proteomics_network_engine.PPI_ENRICHMENT_DATABASES:
+        raise HTTPException(status_code=400, detail=f"Label modules with one of {list(proteomics_network_engine.PPI_ENRICHMENT_DATABASES)}.")
+    cfg = {
+        "confidence": confidence, "restart_prob": genomics_net.DEFAULT_RESTART_PROB, "n_permutations": n_perm,
+        "fdr_alpha": _network_float(payload, "fdr_alpha", genomics_net.DEFAULT_FDR_ALPHA, 0.0, 1.0, "The significance threshold"),
+        "mcl_inflation": genomics_net.DEFAULT_MCL_INFLATION,
+        "min_module_size": _network_int(payload, "min_module_size", genomics_net.DEFAULT_MIN_MODULE_SIZE, 2, 1000, "The minimum module size"),
+        "max_hits_for_modules": _network_int(payload, "max_hits_for_modules", transcriptomics_network_engine.DEFAULT_MAX_HITS_FOR_MODULES, 50, 20000, "The maximum number of hits clustered"),
+        "module_database": module_db, "include_iea": bool(payload.get("include_iea", True)),
+        "max_reactions": _network_int(payload, "max_reactions", multiomics_network.CONFIG_DEFAULTS["max_reactions"], 5, 1000, "The reaction limit for a metabolite"),
+        "max_reaction_proteins": _network_int(payload, "max_reaction_proteins", multiomics_network.CONFIG_DEFAULTS["max_reaction_proteins"], 2, 500, "The protein limit for a reaction"),
+        "pathway_merge_jaccard": _network_float(payload, "pathway_merge_jaccard", multiomics_network.CONFIG_DEFAULTS["pathway_merge_jaccard"], 0.29, 1.0, "The merge threshold for similar pathways"),
+        "pathway_top_n": _network_int(payload, "pathway_top_n", multiomics_network.CONFIG_DEFAULTS["pathway_top_n"], 5, 100, "The number of pathways in the pathway network"),
+        "pathway_min_jaccard": _network_float(payload, "pathway_min_jaccard", multiomics_network.CONFIG_DEFAULTS["pathway_min_jaccard"], 0.0, 1.0, "The overlap threshold"),
+        "seed": 42, "de_cutoffs": _multiomics_parse_cutoffs(payload, selected),
+    }
+    mx["network"] = {"config": cfg, "results": None}
+    return {"config": cfg}
+
+
+@app.post("/api/multiomics/network/run")
+def multiomics_network_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    if _multiomics_state(session)["network"]["config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_multiomics_network, session)
+    return {"job_id": job_id}
+
+
+def _job_multiomics_network(job_id: str, session: dict) -> dict:
+    mx = _multiomics_state(session)
+    cfg = mx["network"]["config"]
+    if cfg is None:
+        raise ValueError("Configure the analysis first.")
+    selected = list(mx["selected_omics"])
+    taxon_id, taxon_name = mx["taxon_id"], mx["taxon_name"]
+    inputs: dict = {}
+    for o in selected:
+        entry = mx["inputs"][o]
+        if o == "genomics":
+            inputs[o] = {"final_df": multiomics_retriever.usable_genomics_rows(entry["resolved_df"])}
+        elif o in multiomics_retriever.DE_OMICS:
+            inputs[o] = {"resolved_df": entry["resolved_df"]}
+        else:
+            inputs[o] = {"features": multiomics_mapping.compound_features(entry["matched_df"])}
+    enzyme_maps = None
+    if "metabolomics" in selected:
+        update_job(job_id, progress=0.01, message="Reading Reactome's reaction files (metabolite -> proteins)...")
+        enzyme_maps = multiomics_retriever.fetch_reactome_reaction_maps(taxon_id, taxon_name)
+
+    def _progress(frac, label):
+        update_job(job_id, progress=0.02 + 0.80 * float(frac), message=str(label))
+
+    result = multiomics_network.run_string_network(
+        inputs, taxon_id, taxon_name, cfg, enzyme_maps=enzyme_maps,
+        skeleton_provider=multiomics_retriever.fetch_chebi_skeletons_cached, progress_callback=_progress)
+    graph = result.pop("_graph", None)
+    hit_ids = result.pop("_hit_ids", [])
+    result.pop("_per_omics", None)
+    result.pop("_seed_omics", None)
+    edges = []
+    if graph is not None and hit_ids:
+        ranked = result["propagation"]["table"].sort_values(by="Propagated score", ascending=False, kind="stable")["STRING ID"].tolist()
+        edges = _netprop_subnetwork_edges(graph, hit_ids, rank_by=ranked)
+
+    update_job(job_id, progress=0.85, message="Building the Reactome pathway-overlap network...")
+    pathway = {"nodes": [], "edges": [], "groups": [], "omics": [], "note": None}
+    try:
+        prep, _ = _multiomics_prepare_omics(mx, selected, cfg["de_cutoffs"], "", job_id, assign_kegg_ids=False)
+        pinputs = _multiomics_database_inputs(mx, selected, prep, "Reactome", "", "", None, None)
+        block = multiomics_engine.run_joint_pathway_enrichment(
+            pinputs, "Reactome", "brown", multiomics_engine.MIN_TERM_SIZE_DEFAULT, multiomics_engine.MAX_TERM_SIZE_DEFAULT)
+        pathway = multiomics_network.pathway_overlap_network(block, pinputs, cfg["pathway_top_n"], cfg["pathway_min_jaccard"],
+                                                             merge_jaccard=cfg["pathway_merge_jaccard"])
+        pathway["method_note"] = block.get("note")
+    except Exception as exc:
+        pathway["note"] = f"The pathway-overlap network could not be built: {exc}"
+
+    metab_df = pd.DataFrame(result["metabolites"]) if result.get("metabolites") else None
+    omics_df = pd.DataFrame(result["omics"])
+    nodes_df = pd.DataFrame([{"Term ID": n["id"], "Pathway": n["name"], "Group": n["group"], "Combined p-value": n["combined_p"],
+                              "Combined FDR": n["combined_fdr"], "Hit members": n["n_hit_members"],
+                              "Similar pathways merged into this one": "; ".join(f"{m['name']} ({m['id']})" for m in n["merged"]),
+                              **{f"{multiomics_engine.OMICS_LABELS[o]} hits": n["hits"].get(o) for o in pathway["omics"]}}
+                             for n in pathway["nodes"]])
+    edges_df = pd.DataFrame([{"Pathway A": e["a"], "Pathway B": e["b"], "Jaccard": e["jaccard"], "Shared hit members": e["shared"]}
+                             for e in pathway["edges"]])
+    mx["network"]["results"] = {"string": result, "pathway": pathway, "tables": {
+        "hits": result["propagation"]["table"], "modules": result["modules"]["table"] if result["modules"] else None,
+        "metabolites": metab_df, "omics": omics_df, "pathway_nodes": nodes_df, "pathway_edges": edges_df}}
+
+    mods = result["modules"]
+    payload = {
+        "taxon_id": result["taxon_id"], "taxon_name": result["taxon_name"], "parameters": result["parameters"],
+        "omics": result["omics"], "omics_used": result["omics_used"], "seeds": result["seeds"],
+        "metabolites": df_payload(metab_df) if metab_df is not None else None,
+        "propagation": {**{k: v for k, v in result["propagation"].items() if k != "table"},
+                        "table": df_payload(result["propagation"]["table"].head(2000)), "edges": edges},
+        "modules": None, "caveats": result["caveats"], "pathway_network": pathway,
+    }
+    if mods:
+        payload["modules"] = {
+            "table": df_payload(mods["table"]), "membership": mods["membership"], "universe_size": mods["universe_size"],
+            "caveat": mods["caveat"], "selection_caveat": mods["selection_caveat"], "cap_info": mods["cap_info"], "omics": mods["omics"],
+            "enrichment": {
+                mid: ({"namespace": e["best"]["namespace"], "table": df_payload(e["best"]["block"]["table"].head(50)),
+                       "candidates": {key: ({"table": df_payload(c["block"]["table"].head(50))} if c else None)
+                                      for key, c in e["candidates"].items()}} if e else None)
+                for mid, e in mods["enrichment"].items()},
+        }
+    update_job(job_id, progress=1.0, message="Done")
+    return payload
+
+
+@app.get("/api/multiomics/network/download")
+def multiomics_network_download(which: str = "hits", key: str = "", db: str = "",
+                                x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    results = _multiomics_state(session)["network"]["results"]
+    if not results:
+        raise HTTPException(status_code=400, detail="No network results available.")
+    tables = results["tables"]
+    names = {"hits": "hits", "modules": "modules", "metabolites": "metabolite_enzymes", "omics": "omics_seeds",
+             "pathway_nodes": "pathway_network_nodes", "pathway_edges": "pathway_network_edges"}
+    if which in names:
+        df = tables.get(which)
+        if df is None:
+            raise HTTPException(status_code=400, detail=f"This run has no {which} table.")
+        return df_to_csv_response(df, f"multiomics_network_{names[which]}.csv")
+    if which == "enrichment":
+        mods = results["string"].get("modules")
+        if not mods:
+            raise HTTPException(status_code=400, detail="This run did not include module detection.")
+        entry = mods["enrichment"].get(key)
+        if entry is None:
+            raise HTTPException(status_code=400, detail=f"No enrichment for module {key!r}.")
+        if db:
+            candidate = entry["candidates"].get(db)
+            if candidate is None:
+                raise HTTPException(status_code=400, detail=f"No {db!r} result for module {key!r}.")
+            block = candidate["block"]
+        else:
+            block = entry["best"]["block"]
+        safe = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower()
+        return df_to_csv_response(block["table"], f"multiomics_network_enrichment_{safe}.csv")
+    raise HTTPException(status_code=400, detail=f"Unknown table: {which!r}")
+
+
+# ---------------------------------------------------------------------------
+# Multi-omics - MOFA / Factor-based Integration (see Multiomics_mofa)
+#
+# Shares the matrices of Correlation-based Integration (uploaded, resolved to gene symbols and matched on their samples there); keeps its own
+# config and results under session["multiomics"]["mofa"]. A MOFA result is tied to the exact aligned data it was fitted on (a fingerprint): if
+# the Correlation uploads change, the result is dropped, never shown against different data.
+# ---------------------------------------------------------------------------
+
+def _fresh_multiomics_mofa() -> dict:
+    return {"config": None, "results": None, "sheet": None, "enrich": {}, "metab_match": None, "inputs": {}}
+
+
+def _mofa_state(session: dict) -> dict:
+    return session["multiomics"]["mofa"]
+
+
+def _mofa_fingerprint(cs: dict) -> "str | None":
+    al = cs.get("aligned")
+    if not al:
+        return None
+    parts = [",".join(al["samples"])]
+    for o in sorted(al["mats"]):
+        m = al["mats"][o]
+        parts.append(f"{o}:{m.shape[0]}x{m.shape[1]}:{float(np.nansum(m.to_numpy(dtype=float))):.6f}:{hash(tuple(map(str, m.columns))) & 0xffffffff}")
+    return "|".join(parts)
+
+
+def _mofa_checked(session: dict) -> dict:
+    """The MOFA state, with any config / result / enrichment dropped when the Correlation data they were built on has changed."""
+    ms = _mofa_state(session)
+    fp = _mofa_fingerprint(_corr_state(session))
+    if ms.get("fingerprint") != fp:
+        ms.update({"config": None, "results": None, "enrich": {}, "metab_match": None, "inputs": {}, "fingerprint": fp})
+        if fp is None:
+            ms["sheet"] = None
+    return ms
+
+
+def _mofa_group_options(session: dict) -> dict:
+    """The sample-group sources on offer: a label column found in a matrix upload (Group, Condition ...) or a column of the sample sheet."""
+    cs = _corr_state(session)
+    ms = _mofa_state(session)
+    samples = list((cs.get("aligned") or {}).get("samples") or [])
+    opts = []
+    for o in cs["selected"]:
+        gc = (cs["uploads"].get(o) or {}).get("meta", {}).get("group_columns") or {}
+        for col, mp in gc.items():
+            opts.append({"key": f"{o}:{col}", "label": f"{multiomics_correlation.OMICS_LABELS[o]} file, column '{col}'", "mapping": mp})
+    for col, mp in ((ms.get("sheet") or {}).get("columns") or {}).items():
+        opts.append({"key": f"sheet:{col}", "label": f"Sample sheet, column '{col}'", "mapping": mp})
+    out = []
+    for op in opts:
+        vals = [op["mapping"].get(s) for s in samples]
+        n_have = sum(1 for v in vals if v)
+        out.append({"key": op["key"], "label": op["label"], "n_samples": n_have, "groups": sorted({v for v in vals if v})})
+    return {"options": out, "mappings": {op["key"]: op["mapping"] for op in opts}}
+
+
+MULTIOMICS_MOFA_EXAMPLES = {"transcriptomics": "example_mofa_transcriptomics.csv", "proteomics": "example_mofa_proteomics.csv",
+                            "metabolomics": "example_mofa_metabolomics.csv"}
+
+
+@app.get("/api/multiomics/mofa/example")
+def multiomics_mofa_example(omics_type: str = "transcriptomics"):
+    """The synthetic 36-sample example tables (the Correlation examples have only 12 samples, too few for MOFA)."""
+    fname = MULTIOMICS_MOFA_EXAMPLES.get(str(omics_type).strip().lower())
+    if not fname:
+        raise HTTPException(status_code=404, detail="Unknown omics type.")
+    path = os.path.join(BASE_DIR, "Data3", fname)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Example file not found.")
+    return FileResponse(path, filename=fname, media_type="text/csv")
+
+
+@app.get("/api/multiomics/mofa/options")
+def multiomics_mofa_options(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    cs = _corr_state(session)
+    ms = _mofa_checked(session)
+    go = _mofa_group_options(session)
+    return {"ready": cs["aligned"] is not None, "samples": list((cs["aligned"] or {}).get("samples") or []),
+            "omics": list(cs["selected"]), "group_options": go["options"], "sheet": ({"filename": ms["sheet"]["filename"], "n_matched": ms["sheet"]["n_matched"]} if ms.get("sheet") else None),
+            "defaults": multiomics_mofa.CONFIG_DEFAULTS, "min_samples": multiomics_mofa.MIN_SAMPLES, "warn_samples": multiomics_mofa.WARN_SAMPLES}
+
+
+@app.post("/api/multiomics/mofa/groups")
+async def multiomics_mofa_groups(file: UploadFile = File(...), x_session_id: Optional[str] = Header(default=None)):
+    """A small sample sheet: the first column is the sample id, every other column is a candidate group label (Group, Batch, Sex ...)."""
+    session = session_dep(x_session_id)
+    cs = _corr_state(session)
+    if cs["aligned"] is None:
+        raise HTTPException(status_code=400, detail="Upload and match the omics tables first (the sample sheet is matched to their samples).")
+    raw = await file.read()
+    try:
+        df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", dtype=str)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read the sample sheet: {exc}")
+    if df.shape[1] < 2 or df.shape[0] < 2:
+        raise HTTPException(status_code=400, detail="The sample sheet needs a sample-id column and at least one label column.")
+    df.columns = [str(c).strip() for c in df.columns]
+    ids = df.iloc[:, 0].astype(str).str.strip()
+    samples = set(cs["aligned"]["samples"])
+    matched = [s for s in ids if s in samples]
+    if len(matched) < 2:
+        raise HTTPException(status_code=400, detail=f"Only {len(matched)} of the sheet's sample ids are among the {len(samples)} samples of your tables "
+                                                    f"(it must repeat the SAME ids; the first column is read as the sample id).")
+    columns = {}
+    for col in df.columns[1:]:
+        vals = df[col].astype(str).str.strip()
+        mp = {s: v for s, v in zip(ids, vals) if s in samples and v not in ("", "nan")}
+        distinct = set(mp.values())
+        if 2 <= len(distinct) <= max(2, len(mp) // 2):
+            columns[col] = mp
+    if not columns:
+        raise HTTPException(status_code=400, detail="No column of the sample sheet looks like a group label (text with a few repeated values).")
+    ms = _mofa_checked(session)
+    ms["sheet"] = {"filename": getattr(file, "filename", ""), "columns": columns, "n_matched": len(set(matched))}
+    ms["results"] = None
+    ms["enrich"] = {}
+    return {"filename": ms["sheet"]["filename"], "n_matched": len(set(matched)), "n_samples": len(samples), "columns": list(columns),
+            "group_options": _mofa_group_options(session)["options"]}
+
+
+@app.post("/api/multiomics/mofa/configure")
+def multiomics_mofa_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    cs = _corr_state(session)
+    if cs["aligned"] is None:
+        raise HTTPException(status_code=400, detail="Upload, resolve and match the omics tables first.")
+    n = len(cs["aligned"]["samples"])
+    if n < multiomics_mofa.MIN_SAMPLES:
+        raise HTTPException(status_code=400, detail=f"MOFA needs at least {multiomics_mofa.MIN_SAMPLES} samples shared by every table; {n} were matched.")
+    payload = payload or {}
+    d = multiomics_mofa.CONFIG_DEFAULTS
+    cfg = dict(d)
+    cfg["factors"] = _network_int(payload, "factors", d["factors"], 2, multiomics_mofa.MAX_FACTORS, "The number of factors")
+    cfg["convergence"] = str(payload.get("convergence", d["convergence"]))
+    if cfg["convergence"] not in multiomics_mofa.CONVERGENCE_MODES:
+        raise HTTPException(status_code=400, detail=f"The convergence mode must be one of {list(multiomics_mofa.CONVERGENCE_MODES)}.")
+    cfg["top_variance"] = _network_int(payload, "top_variance", d["top_variance"], 50, 5000, "The number of most variable features")
+    cfg["n_refits"] = _network_int(payload, "n_refits", d["n_refits"], 0, 5, "The number of stability refits")
+    cfg["min_r2"] = _network_float(payload, "min_r2", d["min_r2"], 0.0, 20.0, "The minimum variance explained")
+    cfg["stability_cut"] = _network_float(payload, "stability_cut", d["stability_cut"], 0.0, 1.0, "The stability cut-off")
+    cfg["log2"] = bool(payload.get("log2", d["log2"]))
+    cfg["scale_views"] = bool(payload.get("scale_views", d["scale_views"]))
+    group_key = str(payload.get("group_column") or "")
+    if group_key:
+        keys = {o["key"] for o in _mofa_group_options(session)["options"]}
+        if group_key not in keys:
+            raise HTTPException(status_code=400, detail="That sample-group column is not available (upload the sample sheet first, or choose one of the listed columns).")
+    cfg["group_column"] = group_key
+    cfg["seed"] = 42
+    ms = _mofa_checked(session)
+    ms["config"], ms["results"], ms["enrich"] = cfg, None, {}
+    return {"config": cfg, "n_samples": n}
+
+
+@app.post("/api/multiomics/mofa/run")
+def multiomics_mofa_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    ms = _mofa_checked(session)
+    if ms["config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_mofa_run, session)
+    return {"job_id": job_id}
+
+
+def _mofa_labels(cs: dict) -> dict:
+    """{omics: {feature id: display label}}: the gene symbol a transcript / protein resolved to, else the id as written."""
+    out = {}
+    for o in cs["selected"]:
+        gene_of = (cs["resolved"].get(o) or {}).get("gene_of") or {}
+        out[o] = {str(c): (gene_of.get(c) or str(c)) for c in cs["aligned"]["mats"][o].columns}
+    return out
+
+
+def _job_mofa_run(job_id: str, session: dict) -> dict:
+    cs = _corr_state(session)
+    ms = _mofa_checked(session)
+    cfg = ms["config"]
+    if cfg is None or cs["aligned"] is None:
+        raise ValueError("Configure the analysis first.")
+    gm = _mofa_group_options(session)
+    groups = gm["mappings"].get(cfg["group_column"]) if cfg["group_column"] else None
+    labels = _mofa_labels(cs)
+    res = multiomics_mofa.run_mofa(cs["aligned"]["mats"], cfg, groups=groups, labels=labels,
+                                   progress=lambda f, text: update_job(job_id, progress=float(f), message=str(text)))
+    K = res["factors"].shape[1]
+    names = res["factors"].columns.tolist()
+    top = {}
+    for o in res["omics"]:
+        wdf = res["weights"][o]
+        top[o] = {}
+        for fn in names:
+            col = wdf[fn].to_numpy()
+            order = np.argsort(-np.abs(col))[:25]
+            top[o][fn] = [{"feature": wdf["Feature"].iloc[i], "label": wdf["Label"].iloc[i], "weight": float(col[i])} for i in order]
+    r2 = res["r2"]
+    payload = {
+        "config": res["config"], "samples": res["samples"], "omics": res["omics"], "warnings": res["warnings"],
+        "omics_labels": {o: multiomics_correlation.OMICS_LABELS[o] for o in res["omics"]},
+        "reports": res["reports"], "n_factors": K, "n_factors_requested": int(res["config"]["factors"]),
+        "converged": bool(res["fit"]["converged"]), "n_iterations": res["fit"]["n_iterations"],
+        "r2": {"omics": [multiomics_correlation.OMICS_LABELS[o] for o in res["omics"]], "factors": names, "values": [[float(v) for v in r2.loc[multiomics_correlation.OMICS_LABELS[o]]] for o in res["omics"]]},
+        "r2_total": res["r2_total"], "stability": res["stability"],
+        "factor_values": {"samples": res["samples"], "names": names, "values": [[float(v) for v in row] for row in res["factors"].to_numpy()]},
+        "group_column": cfg["group_column"], "groups": ({s: groups.get(s, "") for s in res["samples"]} if groups else None),
+        "group_tests": res["group_tests"], "top_weights": top,
+        "n_features": {o: int(res["views"][o].shape[1]) for o in res["omics"]},
+    }
+    tables = {"factors": res["factors"].reset_index().rename(columns={"index": "Sample"}),
+              "r2": r2.reset_index().rename(columns={"index": "Omics"}),
+              "stability": pd.DataFrame(res["stability"]["per_factor"]).rename(columns={"factor": "Factor", "stability": "Stability (median |r| over refits)", "min": "Worst refit", "unstable": "Flagged unstable"}),
+              "groups": pd.DataFrame(res["group_tests"]["rows"]) if res["group_tests"]["rows"] else pd.DataFrame(columns=["Factor", "Test", "p-value", "FDR", "Effect"])}
+    for o in res["omics"]:
+        tables[f"weights:{o}"] = res["weights"][o]
+    ms["results"] = {"payload": payload, "tables": tables, "views": res["views"], "fit": res["fit"], "labels": labels}
+    update_job(job_id, progress=1.0, message="Done")
+    return payload
+
+
+class _MofaEnrichmentUnavailable(Exception):
+    pass
+
+
+def _mofa_enrichment_inputs(session: dict, omics: str, job_id: "str | None" = None) -> tuple:
+    """(feature keys in the pathway database's own id space, Reactome term_map) for one omics' features, built with the omics' OWN universe
+    builders - the ones Joint Pathway Enrichment calls."""
+    cs, ms = _corr_state(session), _mofa_state(session)
+    taxon_id, taxon_name = str(cs.get("taxon_id") or ""), str(cs.get("taxon_name") or "")
+    feats = [str(c) for c in ms["results"]["views"][omics].columns]
+    res = cs["resolved"].get(omics) or {}
+    if omics == "transcriptomics":
+        gene_of, entrez_of = res.get("gene_of") or {}, res.get("entrez_of") or {}
+        rows = [{"gene_symbol": gene_of[f], "entrez_id": entrez_of[f]} for f in feats if f in gene_of and f in entrez_of]
+        if not rows:
+            raise _MofaEnrichmentUnavailable("None of the transcripts resolved to an Entrez Gene ID, which Reactome's gene sets are keyed by.")
+        universe_df = pd.DataFrame(rows).drop_duplicates("gene_symbol")
+        built = multiomics_engine.build_transcriptomics_input(universe_df, set(), "Reactome", taxon_name, "")
+        keys = [gene_of.get(f) for f in feats]
+    elif omics == "proteomics":
+        acc_of, gene_of = res.get("acc_of") or {}, res.get("gene_of") or {}
+        rows = [{"accession": acc_of[f], "gene_symbol": gene_of.get(f, "")} for f in feats if f in acc_of]
+        if not rows:
+            raise _MofaEnrichmentUnavailable("None of the proteins resolved to a UniProt accession.")
+        built = multiomics_engine.build_proteomics_input(pd.DataFrame(rows).drop_duplicates("accession"), set(), "Reactome", taxon_id, taxon_name, "")
+        keys = [acc_of.get(f) for f in feats]
+    else:
+        if ms.get("metab_match") is None:
+            if job_id:
+                update_job(job_id, progress=0.1, message="Matching the compound names (once)...")
+            names = pd.DataFrame({"Name": feats})
+            resolved_df, matched_df, meta = _resolve_and_match_compound_names(job_id or "", names, progress_start=0.1, progress_span=0.5)
+            ms["metab_match"] = {"matched": matched_df}
+        matched_df = ms["metab_match"]["matched"]
+        crosswalk = metabolomics_engine.build_compound_crosswalk(verbose=False)
+        built = multiomics_engine.build_metabolomics_input(matched_df, crosswalk, "Reactome", taxon_id, taxon_name, "", "")
+        name_to_key = {str(n): str(k) for n, k in zip(matched_df["Name"], matched_df["compound_key"]) if str(k).strip()}
+        keys = [name_to_key.get(f) for f in feats]
+    if built.get("note") or not built.get("term_map"):
+        raise _MofaEnrichmentUnavailable(built.get("note") or "No Reactome pathway could be matched to these features.")
+    return keys, built["term_map"]
+
+
+@app.post("/api/multiomics/mofa/enrich")
+def multiomics_mofa_enrich(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    ms = _mofa_checked(session)
+    if not ms["results"]:
+        raise HTTPException(status_code=400, detail="Run the MOFA analysis first.")
+    pl = ms["results"]["payload"]
+    payload = payload or {}
+    omics = str(payload.get("omics") or "")
+    if omics not in pl["omics"]:
+        raise HTTPException(status_code=400, detail="Choose one of the omics that took part.")
+    factor = str(payload.get("factor") or "")
+    if factor not in pl["factor_values"]["names"]:
+        raise HTTPException(status_code=400, detail="Unknown factor.")
+    mode = str(payload.get("mode") or "signed")
+    if mode not in ("signed", "absolute"):
+        raise HTTPException(status_code=400, detail="The mode must be 'signed' or 'absolute'.")
+    min_size = _network_int(payload, "min_size", 10, 3, 200, "The minimum pathway size")
+    max_size = _network_int(payload, "max_size", 500, min_size, 5000, "The maximum pathway size")
+    job_id = submit_job(_job_mofa_enrich, session, omics, factor, mode, min_size, max_size)
+    return {"job_id": job_id}
+
+
+def _job_mofa_enrich(job_id: str, session: dict, omics: str, factor: str, mode: str, min_size: int, max_size: int) -> dict:
+    ms = _mofa_state(session)
+    if not ms["results"]:
+        raise ValueError("Run the MOFA analysis first.")
+    wdf = ms["results"]["tables"][f"weights:{omics}"]
+    # the pathway sets depend on the omics only (not on the factor or the test), and building them can take minutes: built once per result
+    if omics not in ms["inputs"]:
+        update_job(job_id, progress=0.05, message=f"Building the Reactome pathway sets for {multiomics_correlation.OMICS_LABELS[omics]} (the first time only)...")
+        try:
+            ms["inputs"][omics] = _mofa_enrichment_inputs(session, omics, job_id)
+        except _MofaEnrichmentUnavailable as exc:
+            return {"omics": omics, "factor": factor, "mode": mode, "table": df_payload(pd.DataFrame()), "note": str(exc), "n_tested": 0}
+    keys, term_map = ms["inputs"][omics]
+    # the pathway test names its top members by the database key (an InChIKey, an accession): show the feature's own label instead
+    key_label = {k: lab for k, lab in zip(keys, wdf["Label"].astype(str)) if k}
+    w = wdf[factor].to_numpy(dtype=float)
+    w, keys = multiomics_mofa.collapse_by_key(w, keys)
+    update_job(job_id, progress=0.6, message="Testing the pathways...")
+    table = multiomics_mofa.weight_set_enrichment(w, keys, term_map, min_size, max_size, mode)
+    if not table.empty:
+        table["Top members"] = [", ".join(key_label.get(k.strip(), k.strip()) for k in str(s).split(", ")) for s in table["Top members"]]
+    key_name = f"{omics}:{factor}:{mode}"
+    ms["enrich"][key_name] = table
+    n_with_key = int(sum(1 for k in keys if k))
+    note = None
+    if table.empty:
+        note = (f"No Reactome pathway had between {min_size} and {max_size} of the {n_with_key} features that could be matched to it, "
+                "or too few features could be matched.")
+    update_job(job_id, progress=1.0, message="Done")
+    return {"omics": omics, "factor": factor, "mode": mode, "table": df_payload(table.head(200)), "note": note, "n_tested": int(len(table)),
+            "n_features_matched": n_with_key, "n_features": int(len(wdf))}
+
+
+@app.get("/api/multiomics/mofa/download")
+def multiomics_mofa_download(table: str = "factors", x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    ms = _mofa_checked(session)
+    if not ms["results"]:
+        raise HTTPException(status_code=400, detail="No MOFA result available.")
+    if table.startswith("enrichment:"):
+        key = table[len("enrichment:"):]
+        df = ms["enrich"].get(key)
+        if df is None:
+            raise HTTPException(status_code=400, detail="That enrichment has not been run.")
+        return df_to_csv_response(df, "multiomics_mofa_enrichment_" + re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower() + ".csv")
+    tables = ms["results"]["tables"]
+    if table not in tables:
+        raise HTTPException(status_code=400, detail="No such result table.")
+    return df_to_csv_response(tables[table], "multiomics_mofa_" + re.sub(r"[^A-Za-z0-9]+", "_", table).strip("_").lower() + ".csv")
+
+
+# ===========================================================================
+# Multi-omics - DIABLO / Multiblock Integration (see Multiomics_diablo)
+#
+# Shares the matrices of Correlation-based Integration (uploaded, resolved to gene symbols and matched on their samples there); keeps its own
+# config and results under session["multiomics"]["diablo"]. A DIABLO result is tied to the exact aligned data it was fitted on (a fingerprint,
+# the same idea as MOFA's): if the Correlation uploads change, the result is dropped, never shown against different data. Unlike MOFA, a sample
+# group is REQUIRED (DIABLO is supervised).
+# ---------------------------------------------------------------------------
+
+def _fresh_multiomics_diablo() -> dict:
+    return {"config": None, "sheet": None, "results": None, "enrich": {}, "metab_match": None, "inputs": {}}
+
+
+def _diablo_state(session: dict) -> dict:
+    return session["multiomics"]["diablo"]
+
+
+def _diablo_fingerprint(cs: dict) -> "str | None":
+    al = cs.get("aligned")
+    if not al:
+        return None
+    parts = [",".join(al["samples"])]
+    for o in sorted(al["mats"]):
+        m = al["mats"][o]
+        parts.append(f"{o}:{m.shape[0]}x{m.shape[1]}:{float(np.nansum(m.to_numpy(dtype=float))):.6f}:{hash(tuple(map(str, m.columns))) & 0xffffffff}")
+    return "|".join(parts)
+
+
+def _diablo_checked(session: dict) -> dict:
+    """The DIABLO state, with any config / result / enrichment dropped when the Correlation data they were built on has changed."""
+    ds = _diablo_state(session)
+    fp = _diablo_fingerprint(_corr_state(session))
+    if ds.get("fingerprint") != fp:
+        ds.update({"config": None, "results": None, "enrich": {}, "metab_match": None, "inputs": {}, "fingerprint": fp})
+        if fp is None:
+            ds["sheet"] = None
+    return ds
+
+
+def _diablo_group_options(session: dict) -> dict:
+    """The sample-group sources on offer: a label column found in a matrix upload (Group, Condition ...) or a column of the sample sheet.
+    Same idea as MOFA's own group-source list, written separately here (DIABLO REQUIRES a group, MOFA's is optional)."""
+    cs = _corr_state(session)
+    ds = _diablo_state(session)
+    samples = list((cs.get("aligned") or {}).get("samples") or [])
+    opts = []
+    for o in cs["selected"]:
+        gc = (cs["uploads"].get(o) or {}).get("meta", {}).get("group_columns") or {}
+        for col, mp in gc.items():
+            opts.append({"key": f"{o}:{col}", "label": f"{multiomics_correlation.OMICS_LABELS[o]} file, column '{col}'", "mapping": mp})
+    for col, mp in ((ds.get("sheet") or {}).get("columns") or {}).items():
+        opts.append({"key": f"sheet:{col}", "label": f"Sample sheet, column '{col}'", "mapping": mp})
+    out = []
+    for op in opts:
+        vals = [op["mapping"].get(s) for s in samples]
+        counts: dict = {}
+        for v in vals:
+            if v:
+                counts[v] = counts.get(v, 0) + 1
+        groups = sorted(g for g, n in counts.items() if n >= multiomics_diablo.MIN_SAMPLES_PER_GROUP)
+        out.append({"key": op["key"], "label": op["label"], "n_samples": sum(counts.get(g, 0) for g in groups), "groups": groups,
+                    "usable": len(groups) >= 2})
+    return {"options": out, "mappings": {op["key"]: op["mapping"] for op in opts}}
+
+
+@app.get("/api/multiomics/diablo/options")
+def multiomics_diablo_options(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    cs = _corr_state(session)
+    ds = _diablo_checked(session)
+    go = _diablo_group_options(session)
+    return {"ready": cs["aligned"] is not None, "samples": list((cs["aligned"] or {}).get("samples") or []),
+            "omics": list(cs["selected"]), "group_options": go["options"],
+            "sheet": ({"filename": ds["sheet"]["filename"], "n_matched": ds["sheet"]["n_matched"]} if ds.get("sheet") else None),
+            "defaults": multiomics_diablo.CONFIG_DEFAULTS, "min_samples_per_group": multiomics_diablo.MIN_SAMPLES_PER_GROUP,
+            "warn_samples_per_group": multiomics_diablo.WARN_SAMPLES_PER_GROUP, "max_components": multiomics_diablo.MAX_COMPONENTS,
+            "distances": list(multiomics_diablo.DISTANCES)}
+
+
+@app.post("/api/multiomics/diablo/groups")
+async def multiomics_diablo_groups(file: UploadFile = File(...), x_session_id: Optional[str] = Header(default=None)):
+    """A small sample sheet: the first column is the sample id, every other column is a candidate group label (Group, Batch, Sex ...).
+    Same convention as MOFA's sample sheet, kept as DIABLO's own route / state (never shared - a change here must not touch MOFA)."""
+    session = session_dep(x_session_id)
+    cs = _corr_state(session)
+    if cs["aligned"] is None:
+        raise HTTPException(status_code=400, detail="Upload and match the omics tables first (the sample sheet is matched to their samples).")
+    raw = await file.read()
+    try:
+        df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", dtype=str)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read the sample sheet: {exc}")
+    if df.shape[1] < 2 or df.shape[0] < 2:
+        raise HTTPException(status_code=400, detail="The sample sheet needs a sample-id column and at least one label column.")
+    df.columns = [str(c).strip() for c in df.columns]
+    ids = df.iloc[:, 0].astype(str).str.strip()
+    samples = set(cs["aligned"]["samples"])
+    matched = [s for s in ids if s in samples]
+    if len(matched) < 2:
+        raise HTTPException(status_code=400, detail=f"Only {len(matched)} of the sheet's sample ids are among the {len(samples)} samples of your tables "
+                                                    f"(it must repeat the SAME ids; the first column is read as the sample id).")
+    columns = {}
+    for col in df.columns[1:]:
+        vals = df[col].astype(str).str.strip()
+        mp = {s: v for s, v in zip(ids, vals) if s in samples and v not in ("", "nan")}
+        distinct = set(mp.values())
+        if 2 <= len(distinct) <= max(2, len(mp) // 2):
+            columns[col] = mp
+    if not columns:
+        raise HTTPException(status_code=400, detail="No column of the sample sheet looks like a group label (text with a few repeated values).")
+    ds = _diablo_checked(session)
+    ds["sheet"] = {"filename": getattr(file, "filename", ""), "columns": columns, "n_matched": len(set(matched))}
+    ds["results"] = None
+    ds["enrich"] = {}
+    return {"filename": ds["sheet"]["filename"], "n_matched": len(set(matched)), "n_samples": len(samples), "columns": list(columns),
+            "group_options": _diablo_group_options(session)["options"]}
+
+
+@app.post("/api/multiomics/diablo/configure")
+def multiomics_diablo_configure(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    cs = _corr_state(session)
+    if cs["aligned"] is None:
+        raise HTTPException(status_code=400, detail="Upload, resolve and match the omics tables first.")
+    payload = payload or {}
+    d = multiomics_diablo.CONFIG_DEFAULTS
+    cfg = dict(d)
+    group_key = str(payload.get("group_column") or "")
+    go = _diablo_group_options(session)
+    opt = next((o for o in go["options"] if o["key"] == group_key), None)
+    if not opt:
+        raise HTTPException(status_code=400, detail="Choose a sample-group column (DIABLO needs groups to classify): upload a sample sheet first, "
+                                                    "or choose one of the listed columns.")
+    if not opt["usable"]:
+        raise HTTPException(status_code=400, detail=f"'{opt['label']}' has fewer than two groups with at least {multiomics_diablo.MIN_SAMPLES_PER_GROUP} "
+                                                    "samples each; choose another column.")
+    cfg["group_column"] = group_key
+    cfg["top_variance"] = _network_int(payload, "top_variance", d["top_variance"], 50, 5000, "The number of most variable features")
+    cfg["log2"] = bool(payload.get("log2", d["log2"]))
+    cfg["design_value"] = _network_float(payload, "design_value", d["design_value"], 0.0, 1.0, "The design value between omics")
+    cfg["max_components"] = _network_int(payload, "max_components", d["max_components"], 1, multiomics_diablo.MAX_COMPONENTS, "The maximum number of components")
+    grid = payload.get("keepX_grid")
+    if grid is not None:
+        try:
+            grid = sorted({int(v) for v in grid})
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="'keepX_grid' must be a list of whole numbers.")
+        if not (1 <= len(grid) <= 8) or any(v < 2 or v > 500 for v in grid):
+            raise HTTPException(status_code=400, detail="The keepX grid must have 1 to 8 values, each between 2 and 500.")
+        cfg["keepX_grid"] = grid
+    cfg["n_folds"] = _network_int(payload, "n_folds", d["n_folds"], 2, 10, "The number of cross-validation folds")
+    cfg["n_repeats"] = _network_int(payload, "n_repeats", d["n_repeats"], 1, 50, "The number of cross-validation repeats")
+    distance = str(payload.get("distance", d["distance"]))
+    if distance not in multiomics_diablo.DISTANCES:
+        raise HTTPException(status_code=400, detail=f"'distance' must be one of {list(multiomics_diablo.DISTANCES)}.")
+    cfg["distance"] = distance
+    cfg["seed"] = 42
+    n = len(cs["aligned"]["samples"])
+    mapping = go["mappings"][group_key]
+    smallest_group = min(sum(1 for v in mapping.values() if v == g) for g in opt["groups"])
+    if cfg["n_folds"] > smallest_group:
+        raise HTTPException(status_code=400, detail=f"The smallest group has {smallest_group} samples, fewer than the {cfg['n_folds']} "
+                                                    "cross-validation folds asked for; choose fewer folds.")
+    ds = _diablo_checked(session)
+    ds["config"], ds["results"], ds["enrich"] = cfg, None, {}
+    return {"config": cfg, "n_samples": n, "groups": opt["groups"]}
+
+
+@app.post("/api/multiomics/diablo/run")
+def multiomics_diablo_run(x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    ds = _diablo_checked(session)
+    if ds["config"] is None:
+        raise HTTPException(status_code=400, detail="Configure the analysis first.")
+    job_id = submit_job(_job_diablo_run, session)
+    return {"job_id": job_id}
+
+
+def _diablo_labels(cs: dict) -> dict:
+    """{omics: {feature id: display label}}: the gene symbol a transcript / protein resolved to, else the id as written."""
+    out = {}
+    for o in cs["selected"]:
+        gene_of = (cs["resolved"].get(o) or {}).get("gene_of") or {}
+        out[o] = {str(c): (gene_of.get(c) or str(c)) for c in cs["aligned"]["mats"][o].columns}
+    return out
+
+
+def _job_diablo_run(job_id: str, session: dict) -> dict:
+    cs = _corr_state(session)
+    ds = _diablo_checked(session)
+    cfg = ds["config"]
+    if cfg is None or cs["aligned"] is None:
+        raise ValueError("Configure the analysis first.")
+    gm = _diablo_group_options(session)
+    mapping = gm["mappings"][cfg["group_column"]]
+    samples = cs["aligned"]["samples"]
+    groups = np.array([mapping.get(s, "") for s in samples], dtype=object)
+    labels = multiomics_diablo.check_groups(groups)
+    keep_mask = np.isin(groups, labels)
+    groups_used = groups[keep_mask]
+    mats_used = {o: cs["aligned"]["mats"][o].loc[[s for s, k in zip(samples, keep_mask) if k]] for o in cs["aligned"]["mats"]}
+    samples_used = [s for s, k in zip(samples, keep_mask) if k]
+    n_dropped = len(samples) - len(samples_used)
+
+    update_job(job_id, progress=0.03, message="Preparing the data...")
+    blocks, reports = multiomics_diablo.prepare_blocks(mats_used, cfg)
+
+    def progress_span(lo, hi):
+        return lambda f: update_job(job_id, progress=lo + (hi - lo) * max(0.0, min(1.0, f)))
+
+    update_job(job_id, progress=0.05, message="Choosing how many components to keep (cross-validated)...")
+    tc = multiomics_diablo.tune_components(blocks, groups_used, labels, cfg, progress=progress_span(0.05, 0.3))
+    ncomp = tc["chosen"]
+    update_job(job_id, progress=0.3, message=f"Choosing which features to keep per omics (cross-validated, {ncomp} component(s))...")
+    tk = multiomics_diablo.tune_keepX(blocks, groups_used, labels, cfg, ncomp, progress=progress_span(0.3, 0.75))
+    update_job(job_id, progress=0.78, message="Measuring the cross-validated error with the chosen settings...")
+    cv = multiomics_diablo.cv_ber(blocks, groups_used, labels, cfg, ncomp, tk["keepX"], cfg["n_folds"], cfg["n_repeats"], cfg["seed"], cfg["distance"],
+                                  progress=progress_span(0.78, 0.86))
+    update_job(job_id, progress=0.87, message="Checking the error against random group labels (permutation test)...")
+    perm = multiomics_diablo.permutation_test_ber(blocks, groups_used, labels, cfg, ncomp, tk["keepX"], cv["BER"], n_perm=20, seed=cfg["seed"],
+                                                  progress=progress_span(0.87, 0.97))
+    update_job(job_id, progress=0.98, message="Fitting the final model on every sample...")
+    fit = multiomics_diablo.fit_diablo(blocks, groups_used, labels, cfg, ncomp, keepX=tk["keepX"])
+    sel = multiomics_diablo.selected_features(fit)
+    ave_raw = multiomics_diablo.explained_variance(fit)
+    ave = {o: [None if (v != v) else v for v in vals] for o, vals in ave_raw.items()}   # NaN -> null: strict JSON has no NaN
+    labels_display = _diablo_labels(cs)
+
+    warnings = []
+    if n_dropped:
+        warnings.append(f"{n_dropped} sample(s) had no usable group label and were left out of this run.")
+    smallest = min(int((groups_used == g).sum()) for g in labels)
+    if smallest < multiomics_diablo.WARN_SAMPLES_PER_GROUP:
+        warnings.append(f"The smallest group has only {smallest} samples: below {multiomics_diablo.WARN_SAMPLES_PER_GROUP}, the cross-validated "
+                        "error and the selected features are both unstable - treat them as exploratory.")
+
+    names = [f"Component{i + 1}" for i in range(ncomp)]
+    top = {}
+    for o in fit["omics"]:
+        w = fit["loadings"][o]
+        top[o] = {}
+        for h, cname in enumerate(names):
+            col = w[:, h]
+            order = np.nonzero(col != 0)[0]
+            order = order[np.argsort(-np.abs(col[order]))]
+            top[o][cname] = [{"feature": fit["feature_names"][o][i], "label": labels_display.get(o, {}).get(str(fit["feature_names"][o][i]), str(fit["feature_names"][o][i])),
+                              "weight": float(col[i])} for i in order]
+    payload = {
+        "config": cfg, "samples": fit["samples"], "omics": fit["omics"], "warnings": warnings,
+        "omics_labels": {o: multiomics_correlation.OMICS_LABELS[o] for o in fit["omics"]},
+        "n_components_offered": cfg["max_components"], "n_components": ncomp, "component_search": tc["per_ncomp"],
+        "component_names": names, "keepX": tk["keepX"], "keepX_search": tk["per_component"],
+        "group_column": cfg["group_column"], "group_labels": labels, "groups": {s: str(g) for s, g in zip(fit["samples"], groups_used)},
+        "cv": {"BER": cv["BER"], "BER_sd": cv["BER_sd"], "ER": cv["ER"], "ER_sd": cv["ER_sd"], "per_repeat": cv["per_repeat"],
+              "n_folds": cfg["n_folds"], "n_repeats": cfg["n_repeats"], "distance": cfg["distance"]},
+        "permutation": {"p_value": perm["p_value"], "null_bers": perm["null_bers"], "n_perm": perm["n_perm"]},
+        "selected_features": sel, "n_selected": {o: len(sel[o]) for o in sel},
+        "n_features": {o: int(blocks[o].shape[1]) for o in blocks}, "n_features_in": {o: int(reports[o]["n_in"]) for o in reports},
+        "ave": ave, "top_weights": top,
+        "component_values": {o: fit["variates"][o].tolist() for o in fit["omics"]},
+        "design": fit["design"].tolist(),
+    }
+    tables = {
+        "component_search": pd.DataFrame(tc["per_ncomp"]).rename(columns={"ncomp": "Components", "BER": "Cross-validated error (BER)", "BER_sd": "+/- s.d."}),
+        "cv": pd.DataFrame([{"Metric": "Balanced error rate (BER)", "Value": cv["BER"], "+/- s.d.": cv["BER_sd"]},
+                           {"Metric": "Overall error rate", "Value": cv["ER"], "+/- s.d.": cv["ER_sd"]}]),
+    }
+    for o in fit["omics"]:
+        wdf = pd.DataFrame(fit["loadings"][o], columns=names)
+        wdf.insert(0, "Label", [labels_display.get(o, {}).get(str(c), str(c)) for c in fit["feature_names"][o]])
+        wdf.insert(0, "Feature", [str(c) for c in fit["feature_names"][o]])
+        tables[f"weights:{o}"] = wdf
+        tdf = pd.DataFrame(fit["variates"][o], index=fit["samples"], columns=names).reset_index().rename(columns={"index": "Sample"})
+        tables[f"components:{o}"] = tdf
+    ds["results"] = {"payload": payload, "tables": tables, "fit": fit, "blocks": blocks, "labels": labels_display}
+    update_job(job_id, progress=1.0, message="Done")
+    return payload
+
+
+class _DiabloEnrichmentUnavailable(Exception):
+    pass
+
+
+def _diablo_enrichment_inputs(session: dict, omics: str, job_id: "str | None" = None) -> tuple:
+    """(feature keys in the pathway database's own id space, Reactome term_map, background keys = every feature that
+    entered the model for this omics) - written separately from MOFA's own version (same idea, no shared code - a
+    change to one tile's enrichment inputs must not silently change the other's)."""
+    cs, ds = _corr_state(session), _diablo_state(session)
+    taxon_id, taxon_name = str(cs.get("taxon_id") or ""), str(cs.get("taxon_name") or "")
+    feats = [str(c) for c in ds["results"]["blocks"][omics].columns]
+    res = cs["resolved"].get(omics) or {}
+    if omics == "transcriptomics":
+        gene_of, entrez_of = res.get("gene_of") or {}, res.get("entrez_of") or {}
+        rows = [{"gene_symbol": gene_of[f], "entrez_id": entrez_of[f]} for f in feats if f in gene_of and f in entrez_of]
+        if not rows:
+            raise _DiabloEnrichmentUnavailable("None of the transcripts resolved to an Entrez Gene ID, which Reactome's gene sets are keyed by.")
+        universe_df = pd.DataFrame(rows).drop_duplicates("gene_symbol")
+        built = multiomics_engine.build_transcriptomics_input(universe_df, set(), "Reactome", taxon_name, "")
+        keys = [gene_of.get(f) for f in feats]
+    elif omics == "proteomics":
+        acc_of, gene_of = res.get("acc_of") or {}, res.get("gene_of") or {}
+        rows = [{"accession": acc_of[f], "gene_symbol": gene_of.get(f, "")} for f in feats if f in acc_of]
+        if not rows:
+            raise _DiabloEnrichmentUnavailable("None of the proteins resolved to a UniProt accession.")
+        built = multiomics_engine.build_proteomics_input(pd.DataFrame(rows).drop_duplicates("accession"), set(), "Reactome", taxon_id, taxon_name, "")
+        keys = [acc_of.get(f) for f in feats]
+    else:
+        if ds.get("metab_match") is None:
+            if job_id:
+                update_job(job_id, progress=0.1, message="Matching the compound names (once)...")
+            names = pd.DataFrame({"Name": feats})
+            resolved_df, matched_df, meta = _resolve_and_match_compound_names(job_id or "", names, progress_start=0.1, progress_span=0.5)
+            ds["metab_match"] = {"matched": matched_df}
+        matched_df = ds["metab_match"]["matched"]
+        crosswalk = metabolomics_engine.build_compound_crosswalk(verbose=False)
+        built = multiomics_engine.build_metabolomics_input(matched_df, crosswalk, "Reactome", taxon_id, taxon_name, "", "")
+        name_to_key = {str(n): str(k) for n, k in zip(matched_df["Name"], matched_df["compound_key"]) if str(k).strip()}
+        keys = [name_to_key.get(f) for f in feats]
+    if built.get("note") or not built.get("term_map"):
+        raise _DiabloEnrichmentUnavailable(built.get("note") or "No Reactome pathway could be matched to these features.")
+    return keys, built["term_map"], feats
+
+
+@app.post("/api/multiomics/diablo/enrich")
+def multiomics_diablo_enrich(payload: dict, x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    ds = _diablo_checked(session)
+    if not ds["results"]:
+        raise HTTPException(status_code=400, detail="Run the DIABLO analysis first.")
+    pl = ds["results"]["payload"]
+    payload = payload or {}
+    omics = str(payload.get("omics") or "")
+    if omics not in pl["omics"]:
+        raise HTTPException(status_code=400, detail="Choose one of the omics that took part.")
+    min_size = _network_int(payload, "min_size", 10, 3, 200, "The minimum pathway size")
+    max_size = _network_int(payload, "max_size", 500, min_size, 5000, "The maximum pathway size")
+    job_id = submit_job(_job_diablo_enrich, session, omics, min_size, max_size)
+    return {"job_id": job_id}
+
+
+def _job_diablo_enrich(job_id: str, session: dict, omics: str, min_size: int, max_size: int) -> dict:
+    ds = _diablo_state(session)
+    if not ds["results"]:
+        raise ValueError("Run the DIABLO analysis first.")
+    update_job(job_id, progress=0.05, message=f"Building the Reactome pathway sets for {multiomics_correlation.OMICS_LABELS[omics]}...")
+    try:
+        if omics not in ds["inputs"]:
+            ds["inputs"][omics] = _diablo_enrichment_inputs(session, omics, job_id)
+        keys, term_map, feats = ds["inputs"][omics]
+    except _DiabloEnrichmentUnavailable as exc:
+        return {"omics": omics, "table": df_payload(pd.DataFrame()), "note": str(exc), "n_tested": 0}
+    sel_feats = set(ds["results"]["payload"]["selected_features"][omics])
+    key_of = dict(zip(feats, keys))
+    selected_keys = {key_of[f] for f in sel_feats if key_of.get(f)}
+    background_keys = {k for k in keys if k}
+    update_job(job_id, progress=0.6, message="Testing the pathways...")
+    table = multiomics_diablo.selected_feature_enrichment(selected_keys, background_keys, term_map, min_size, max_size)
+    ds["enrich"][omics] = table
+    n_matched = len(selected_keys)
+    note = None
+    if table.empty:
+        note = (f"No Reactome pathway had between {min_size} and {max_size} of the {len(background_keys)} background features, "
+                f"or too few of the {len(sel_feats)} selected features could be matched (matched: {n_matched}).")
+    update_job(job_id, progress=1.0, message="Done")
+    return {"omics": omics, "table": df_payload(table.head(200)), "note": note, "n_tested": int(len(table)),
+            "n_selected_matched": n_matched, "n_selected": len(sel_feats)}
+
+
+@app.get("/api/multiomics/diablo/download")
+def multiomics_diablo_download(table: str = "cv", x_session_id: Optional[str] = Header(default=None)):
+    session = session_dep(x_session_id)
+    ds = _diablo_checked(session)
+    if not ds["results"]:
+        raise HTTPException(status_code=400, detail="No DIABLO result available.")
+    if table.startswith("enrichment:"):
+        key = table[len("enrichment:"):]
+        df = ds["enrich"].get(key)
+        if df is None:
+            raise HTTPException(status_code=400, detail="That enrichment has not been run.")
+        return df_to_csv_response(df, "multiomics_diablo_enrichment_" + re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").lower() + ".csv")
+    tables = ds["results"]["tables"]
+    if table not in tables:
+        raise HTTPException(status_code=400, detail="No such result table.")
+    return df_to_csv_response(tables[table], "multiomics_diablo_" + re.sub(r"[^A-Za-z0-9]+", "_", table).strip("_").lower() + ".csv")
 
 if __name__ == "__main__":
     import uvicorn

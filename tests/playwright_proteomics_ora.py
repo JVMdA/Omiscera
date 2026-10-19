@@ -49,7 +49,7 @@ with sync_playwright() as p:
     page.wait_for_timeout(200)
     check(page.evaluate("STATE.aaPage") == "proteomics", "clicking the tile navigated to the Proteomics grid")
 
-    print("=== ORA sub-tile enabled, other three disabled ===")
+    print("=== all four Proteomics sub-tiles enabled ===")
     ora_btn = page.locator("button.module-btn.proteomics", has_text="Over-Representation Analysis")
     check(ora_btn.count() >= 1 and not ora_btn.first.is_disabled(), "ORA sub-tile present and enabled")
     quant_btn = page.locator("button.module-btn.proteomics", has_text="Quantitative Enrichment")
@@ -57,7 +57,8 @@ with sync_playwright() as p:
           "Quantitative Enrichment sub-tile present and ENABLED (Milestone 2)")
     for name in ["PPI Network / Module Detection", "PTM / Phosphosite Enrichment"]:
         btn = page.locator("button.module-btn.proteomics", has_text=name)
-        check(btn.count() >= 1 and btn.first.is_disabled(), f"'{name}' correctly disabled (coming soon)")
+        check(btn.count() >= 1 and not btn.first.is_disabled(),
+              f"'{name}' present and ENABLED (see its own dedicated playwright test for full coverage)")
     ora_btn.first.click()
     page.wait_for_timeout(200)
     check(page.evaluate("STATE.aaPage") == "proteomics_module", "navigated to the upload/resolve screen")

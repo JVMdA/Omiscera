@@ -225,7 +225,7 @@ test_network_engine_core.py     58 checks. Characterization tests for the
                                 proteins - confirmed to NOT match what BH over
                                 all p-values (the pre-fix approach) would give.
 
-test_transcriptomics_network.py 44 checks. Unit tests for
+test_transcriptomics_network.py 53 checks. Unit tests for
                                 Transcriptomics_network.py, which had ZERO
                                 unit coverage of its own (the shared engine
                                 above is not retested here). The single
@@ -270,7 +270,22 @@ test_transcriptomics_network.py 44 checks. Unit tests for
                                 n_namespaces_compared, 1.0) exactly, with two
                                 sensitivity checks - a stand-in uncorrected
                                 wrapper, and a real production-code revert -
-                                both confirmed to go red).
+                                both confirmed to go red). PLUS (added
+                                alongside multi-database module labelling):
+                                enrich_modules_by_symbol's `database` param
+                                became `databases` (a list) - selecting GO +
+                                MSigDB at once now returns BOTH candidates
+                                under one module (`{"best", "candidates",
+                                "n_namespaces_compared"}`, not just the
+                                winner discarding the loser), with a fixture
+                                using a FILLER term per database (the same
+                                degenerate-universe trap FAKE_GO_SETS_TWO_NS
+                                already worked around - a lone real term IS
+                                the annotated universe, forcing p=1.0
+                                regardless of overlap) so MSigDB's tighter
+                                match genuinely outscores GO's looser one and
+                                deterministically wins "best" while GO's own
+                                candidate table stays independently usable.
 
 test_transcriptomics_client_state.py  49 checks. Generic, source-level
                                 invariants over static/app.js's Transcriptomics
@@ -696,6 +711,343 @@ live_e2e_proteomics_kegg_confirm.py
                                 _job_resolve_proteins resets it at write
                                 time.
 
+test_proteomics_network.py      35 checks. Proteomics_network.py, offline
+                                (fixture STRING graph, same pattern as
+                                test_transcriptomics_network.py). Covers what
+                                is UNIQUE to this module - the numerics
+                                themselves are already covered by
+                                test_network_engine_core.py and
+                                test_transcriptomics_network.py, which this
+                                module reuses unchanged via
+                                Transcriptomics_network.run_network_analysis's
+                                hook parameters (mapper/deg_selector/
+                                module_enricher/entity_noun). Fixture carries
+                                a PHI/PLO accession-collision pair (both
+                                proteins carry "ACC_DUP"; PHI is the
+                                higher-degree, correct winner - the
+                                accession-space analogue of the existing
+                                gene-symbol collision test) and a protein
+                                (P4) reachable ONLY via the gene-symbol
+                                fallback tier, never accession. Confirms
+                                build_accession_string_index resolves the
+                                collision deterministically and reports it;
+                                map_protein_table_to_string partitions rows
+                                into accession/gene_symbol tiers correctly
+                                and enforces the same <10% refusal gate as
+                                Transcriptomics, worded for proteins. THE
+                                HEADLINE TEST: enrich_modules_by_accession
+                                translates a GO term's accessions into
+                                STRING-ID space BEFORE testing, so a module
+                                containing PHI (which carries the colliding
+                                ACC_DUP) counts k=4 (one match per PROTEIN),
+                                not k=5 (one per accession) - a direct
+                                sensitivity check against accession-space
+                                double counting. A second test confirms a
+                                RECRUITED protein (no accession in the
+                                uploaded table at all) still keeps its
+                                module's Reactome label, because the
+                                universe is the graph, not the table -
+                                mirroring Transcriptomics' own recruited-gene
+                                test. Also exercises the Reactome-needs-
+                                taxon_name refusal, the Complex Portal path,
+                                an unsupported-database ValueError, and a
+                                full run_ppi_network_analysis end-to-end
+                                (24-protein synthetic graph, 12 seeds via
+                                pm.select_significant_proteins, confirming
+                                every seed score is strictly positive despite
+                                half being down-regulated, and that the
+                                returned payload carries the same _graph/
+                                _hit_ids keys run_network_analysis does, so
+                                the API layer needs no Proteomics-specific
+                                branch to strip them). PLUS (multi-database):
+                                enrich_modules_by_accession's `database` param
+                                became `databases` - GO + Complex Portal
+                                together returns candidates for BOTH (each
+                                fixture term carries a filler, same
+                                degenerate-universe fix as the Transcriptomics
+                                multi-database test), Complex Portal's tighter
+                                match deterministically wins while GO's own
+                                candidate table (still k=4, PHI's collision
+                                still resolved once) remains independently
+                                usable, not discarded for having lost.
+
+live_e2e_proteomics_network.py  31 checks. Real HTTP end-to-end test (no
+                                browser) for the new /api/proteomics/network/
+                                {configure,run,download} routes, mirroring
+                                live_e2e_transcriptomics_network.py's
+                                structure closely on purpose: the point is to
+                                prove the GENERALIZATION (API._network_param_
+                                bounds/_job_run_network, Transcriptomics_
+                                network.run_network_analysis's hook
+                                parameters) didn't silently narrow or break
+                                anything for the second module now depending
+                                on it. Runs the real pipeline against the
+                                bundled 3,500-protein human example: real
+                                UniProt ID Mapping resolve, real STRING
+                                download + 500-permutation propagation, real
+                                GO fetch for module labels. Confirms
+                                msigdb_collections is always [] regardless of
+                                what is sent (MSigDB is Transcriptomics-only);
+                                an out-of-range n_permutations (200) is
+                                rejected to the default (1000), never
+                                honoured; an enrichment_database Proteomics
+                                does not offer (MSigDB) falls back to GO
+                                rather than being silently accepted; the hit
+                                table carries the exact same shared column
+                                set Transcriptomics' own hit table uses
+                                (entity_noun changes prose only, never a
+                                column name); and every CSV download
+                                (hits/mapping/modules/per-module enrichment)
+                                works. Mapping coverage is checked against a
+                                wide floor (>50%), not a pinned historical
+                                percentage - a first run measured 81.6% where
+                                an earlier one-off measurement during design
+                                had found ~94.7%, both comfortably above the
+                                actual 10%/50% gates that matter; UniProt's
+                                own live ID Mapping service is not under this
+                                app's control and can vary run to run.
+
+playwright_proteomics_network.py
+                                44 checks. FIRST real-browser coverage of PPI
+                                Network / Module Detection. Drives the REAL
+                                flow end to end: tile -> STRING-species
+                                organism selector -> upload the bundled
+                                example -> resolve -> continue to PPI Network
+                                / Module Detection -> configure -> run (real
+                                STRING download + 500-permutation propagation
+                                + GO fetch) -> results, confirming the
+                                descriptor-driven generalization of
+                                Transcriptomics' own Network config/results
+                                screens (NETWORK_TILE_DESCRIPTORS,
+                                renderNetworkConfigScreen/
+                                renderNetworkResultsScreen in app.js) reaches
+                                the DOM correctly rather than leaking
+                                Transcriptomics wording: "Seed proteins" not
+                                "Seed genes", a "Protein mapping" nav tab
+                                (not "Gene mapping") whose caption reads
+                                "Matched by accession...", the module-label
+                                checkboxes offering Reactome AND Complex
+                                Portal but NOT MSigDB, and the
+                                Proteomics-specific note explaining why
+                                Reactome/Complex Portal work here (unlike
+                                Transcriptomics' Network tile). Also confirms
+                                a real run completes, its CSV download
+                                carries a "proteomics_network"-prefixed
+                                filename, and there are zero console/page
+                                errors across the whole flow. PLUS
+                                (multi-database): checking GO AND Complex
+                                Portal together does NOT uncheck either
+                                (unlike the old single-select dropdown); the
+                                run's own stored config echoes both databases,
+                                in the order checked; every labelled module's
+                                payload carries a "candidates" dict, not just
+                                a single winning block; the "Module
+                                enrichment" pane's own Database selector is
+                                populated from a REAL run's candidates (this
+                                run: GO's three namespaces plus Complex
+                                Portal), switching it changes the displayed
+                                annotation-source caption, and the parity fix
+                                (Terms shown / Dot gradient / Bar color
+                                controls, previously hardcoded with none at
+                                all) landed alongside it.
+
+test_proteomics_ptm_retriever.py
+                                29 checks. Proteomics_ptm_retriever.py,
+                                offline (UniProt ID Mapping monkeypatched).
+                                Covers what is UNIQUE to this module - the
+                                site-level input contract that
+                                Proteomics_module_retriever.py cannot express
+                                at all (no residue/position anywhere in that
+                                module's RESOLVED_COLUMNS). normalize_site
+                                handles every accepted shape (bare "S473",
+                                3-letter "Ser473", phospho-prefixed "pS473",
+                                lowercase, non-STY residues, split
+                                residue+position columns, MaxQuant's
+                                semicolon-joined multi-protein position where
+                                only the first is used); detect_columns
+                                accepts either a combined site column or a
+                                split residue+position pair and raises
+                                naming exactly what's missing otherwise. THE
+                                HEADLINE TEST: isoform preservation - unlike
+                                every other Proteomics tile (which strips
+                                isoform suffixes via strip_isoform because
+                                GO/Reactome/etc. annotate the canonical
+                                entry), a phosphosite's position is
+                                isoform-specific, so "P04637_S315" and
+                                "P04637-2_S315" must both survive resolution
+                                as DISTINCT rows rather than collapsing into
+                                one; canonical_accession/canonical_site_id
+                                are confirmed to be a SEPARATE pair used only
+                                for external-database matching, never for row
+                                identity. Also covers protein-group ambiguity
+                                (a multi-member group is flagged
+                                ambiguous_group=True, drop_ambiguous_groups=
+                                True removes it, a single-member group is
+                                not flagged), multiplicity collapse (three
+                                multiplicity-class rows for the same site
+                                collapse to exactly one, keeping the
+                                SMALLEST-pvalue row's exact log2FC rather
+                                than an average - averaging would mix two
+                                distinct biological measurements),
+                                localization-probability filtering (both the
+                                present-and-filtering case and the
+                                absent-so-honestly-False case, never silently
+                                treated as satisfied), unparseable-site
+                                dropping with an honest count, and reuse of
+                                the existing contaminant/decoy filter.
+
+test_proteomics_ptm.py          21 checks. Proteomics_ptm.py, offline (a
+                                small synthetic iPTMnet ptm.txt fixture
+                                monkeypatched in place of the real download -
+                                12 real-shaped rows: KIN1 phosphorylates 6
+                                sites, KIN2 phosphorylates 6 different sites,
+                                plus a mouse-organism row and an
+                                ACETYLATION-type row that must both be
+                                excluded). Uses a RESERVED FAKE taxon id
+                                ("0002"), never a real one like "9606" -
+                                build_kinase_substrate_universe's parsed-JSON
+                                cache (cache/ora_universe/iPTMnet_v{version}_
+                                {taxon_id}.json) is SHARED with real
+                                production runs and keyed only on taxon_id;
+                                an earlier version of this file used the real
+                                human id with force_refresh=True and silently
+                                overwrote a real user's cached human kinase
+                                universe (hundreds of kinases) with this
+                                file's 2-kinase fixture, which then made
+                                run_kinase_activity report "no kinase met the
+                                minimum substrate-site count" on a
+                                perfectly good real upload - bug found and
+                                fixed 2026-09-21 (see also
+                                playwright_proteomics_ptm.py's entry for the
+                                separate chart-controls bug found in the same
+                                investigation). Covers what is UNIQUE to this
+                                module - the shared regulon numerics
+                                (_ulm_score/_null_slopes_shared/
+                                _permutation_p_value/
+                                _empirical_null_calibration) are already
+                                covered by test_regulon_engine.py and are
+                                imported here unchanged (git diff --stat
+                                Transcriptomics_regulon.py stays empty -
+                                gated on explicitly), never retested.
+                                build_kinase_substrate_universe confirms the
+                                organism-name and ptm_type filters both work
+                                (only the human PHOSPHORYLATION rows survive;
+                                the mouse row and the ACETYLATION row are
+                                excluded) and that a missing taxon_name or an
+                                organism with zero matching rows both refuse
+                                cleanly with an explanatory caveat rather
+                                than raising. THE HEADLINE CLAIM, verified
+                                end to end on a fixture with a KNOWN planted
+                                ground truth rather than just "the code ran
+                                without crashing": on a synthetic experiment
+                                where KIN1's 6 substrate sites are strongly
+                                up-regulated and KIN2's 6 substrate sites are
+                                noise, run_kinase_activity scores KIN1 far
+                                above KIN2 with a genuinely significant
+                                calibrated FDR, and run_kinase_substrate_ora
+                                independently finds KIN1 (only) enriched
+                                among up-regulated sites via the same
+                                canonical_site_id space. Also confirms the
+                                min_kinase_sites gate and the "too few tested
+                                sites overall" guard both return an
+                                explained, empty (not None - the house
+                                convention for these result tables) result
+                                rather than crashing, and that per-kinase
+                                regression detail is stored keyed by the
+                                kinase's OWN substrate site_ids (not
+                                canonical_site_ids).
+
+live_e2e_proteomics_ptm.py      26 checks. Real HTTP end-to-end test (no
+                                browser) for the new /api/proteomics/ptm/
+                                {upload,resolve,configure,run,download}
+                                routes, run against the bundled example file
+                                (Data3/example_proteomics_phosphosites.csv -
+                                300 rows built directly from REAL iPTMnet
+                                data: 25 real MAPK1 substrate sites simulated
+                                strongly UP, 15 real AKT1 substrate sites
+                                simulated DOWN, 260 background sites as
+                                noise). Runs the real pipeline: real UniProt
+                                ID Mapping resolve (154/300 mapped, the rest
+                                dropped mostly by the localization-
+                                probability filter), real iPTMnet fetch,
+                                kinase activity ULM, kinase substrate ORA.
+                                Confirms isoform preservation on REAL
+                                resolved data (62 isoform-suffixed sites
+                                survived; spot-checked that an isoform row's
+                                accession differs from, but starts with, its
+                                canonical_accession). THE CENTRAL BIOLOGICAL
+                                CORRECTNESS CHECK, on real data end to end:
+                                MAPK1 is the top-ranked kinase in the
+                                activity table (score=14.96, calibrated
+                                FDR~1.5e-49, 24 substrate sites tested) and
+                                AKT1 has a negative activity score (-7.07,
+                                FDR~8.3e-12) - exactly matching the
+                                simulated signal design; MAPK1 also tops the
+                                substrate-ORA "up" table independently
+                                (Fisher's FDR~1.5e-23). Also confirms
+                                configure-without-resolve is refused (400),
+                                all 3 CSV downloads work (activity, ora,
+                                resolved), and an unknown table name is
+                                rejected (400).
+
+playwright_proteomics_ptm.py    38 checks. Real-browser coverage of the 4th
+                                and final Proteomics tile, newly enabled
+                                (removed from
+                                PROTEOMICS_TILES_NOT_YET_IMPLEMENTED).
+                                Drives the REAL flow end to end: tile
+                                enabled -> UniProt-taxonomy organism search
+                                (a live external lookup, unlike STRING's
+                                local species file used by the other
+                                Proteomics tiles, so needs a more generous
+                                wait after typing the query) -> upload the
+                                bundled site-level example -> resolve (real
+                                UniProt ID Mapping, isoform-preserving) ->
+                                continue to config -> run (real iPTMnet
+                                fetch + kinase activity ULM + kinase
+                                substrate ORA, 500 permutations) -> results.
+                                Confirms the site-level upload section (not
+                                the protein-level one) is shown for this
+                                tile, MAPK1 (the kinase whose substrate sites
+                                were simulated strongly UP in the bundled
+                                example) is surfaced correctly in BOTH the
+                                "Kinase activity" and "Kinase substrate
+                                enrichment" result panes, the CSV download
+                                carries a "proteomics_ptm"-prefixed filename,
+                                and there are zero console/page errors across
+                                the whole flow. PLUS (chart controls, bug
+                                found and fixed 2026-09-21): a user reported
+                                the "Kinase substrate enrichment" dot/bar
+                                plots showed none of the usual chart controls
+                                other tiles offer - the pane was hardcoded
+                                with topN=20/fontSize=12/default colors and
+                                no way to change any of them, and the kinase
+                                activity bar plot likewise had no topN
+                                control. Reproduced directly against the
+                                real example first (isolating it from a
+                                SEPARATE bug found the same day: an earlier
+                                offline test run had polluted the shared
+                                iPTMnet universe cache for the real human
+                                taxon id with a 2-kinase test fixture - fixed
+                                in test_proteomics_ptm.py by switching that
+                                test to a reserved fake taxon id "0002" - see
+                                that file's own header comment). Once the
+                                cache was restored and the controls gap
+                                confirmed as a real, separate UI bug, both
+                                panes were brought up to the same feature
+                                parity the PPI Network "Module enrichment"
+                                pane already has (Terms shown/Rank & show
+                                by/Font size/Dot gradient/Bar color). This
+                                suite now confirms every one of those
+                                controls is actually PRESENT on screen (not
+                                just that the underlying chart-building
+                                function accepts the options), that toggling
+                                each one (dot gradient, font size, "Kinases
+                                shown" topN, bar color) actually redraws the
+                                chart without a console error, and that the
+                                controls persist across a direction-key
+                                switch rather than being wiped by the
+                                table/chart re-render.
+
 test_format_term_name.py        49 checks. Genomics_module.format_term_name -
                                 pathway/term names rendered lowercase-first
                                 ("cytoplasmic translation") across every
@@ -734,6 +1086,357 @@ test_format_term_name.py        49 checks. Genomics_module.format_term_name -
                                 _run_ora_for_sets directly and confirms both
                                 a normal name and a hazard name come out
                                 correctly in the real result table.
+
+test_metabolomics_concentration.py
+                                58 checks. Metabolomics_module's concentration-
+                                table pipeline (parse_concentration_table,
+                                compute_compound_statistics,
+                                build_scores_from_stats), offline. Exists
+                                because the first Metabolomics input contract
+                                was WRONG: it asked for a user-supplied
+                                log2FC/pvalue/padj per compound (a
+                                differential-expression convention metabolomics
+                                does not use). Covers both table orientations
+                                (samples-in-rows and the transposed
+                                compounds-in-rows lipidomics layout), group-
+                                column detection and its honest failures (one
+                                group, no label column), explicit overrides
+                                being honoured or rejected - never silently
+                                replaced by the auto-detected column - a
+                                planted 4x shift recovered as log2fc > 1.5 with
+                                p < 0.001 while an unchanged compound is not
+                                significant, min_per_group dropping compounds
+                                (counted, never imputed), and the score handed
+                                to the Wilcoxon engine matching the computed
+                                statistic.
+test_metabolomics_crosswalk.py  29 checks. The identifier-bridging layer,
+                                offline (bulk fetches monkeypatched to a small
+                                fixture): source merge and graceful loss of an
+                                unreachable source, the match-tier order,
+                                tier counts partitioning matched rows, the
+                                InChIKey-skeleton fallback being counted
+                                separately and never overriding an exact
+                                match, and lipid shorthand being class-yes /
+                                pathway-no. PLUS the universe_scope split:
+                                experiment scope narrows to the user's own
+                                compounds, database scope covers the whole
+                                crosswalk, and a lipid SHORTHAND compound is
+                                unioned into its own class under database
+                                scope (an earlier version selected these by a
+                                "SHORTHAND:" key prefix, silently dropping a
+                                shorthand name that RefMet also lists - caught
+                                by this file).
+test_metabolomics_ora.py        62 checks. run_ora (compound-LIST input,
+                                database universe) and
+                                run_quantitative_enrichment (measured
+                                universe), offline. Only the KEGG download and
+                                the universe cache are faked, so the REAL
+                                builder and overview-map exclusion run (an
+                                earlier version replaced the builder with a
+                                fake that re-implemented the exclusion, which
+                                tested the fake). Covers: KEGG map01000-01099
+                                never entering a result table and the real TCA
+                                pathway winning; the overlap column showing
+                                the user's own names, semicolon-joined, with a
+                                comma-containing name surviving as ONE member;
+                                no up/down split; database universe larger
+                                than measured; a background list narrowing it;
+                                Chemical Class from the crosswalk taxonomy.
+                                KEGG is ORGANISM-SPECIFIC (KEGG serves no
+                                organism-specific compound links, and a map's
+                                compounds do not vary by organism, so the
+                                organism selects which MAPS are tested): terms
+                                carry the organism's ids and names, a map the
+                                organism lacks is excluded and shrinks the
+                                universe (asserted on the universe, not just
+                                the rows), a second organism gets a DIFFERENT
+                                term set from the SAME shared link data, the
+                                overview-map exclusion still holds AFTER
+                                re-keying to hsa..., no genome / ambiguous
+                                organism -> EMPTY with a note and no fallback,
+                                a confirmed code reaches the resolver, and the
+                                organism caveat survives beside a note. An
+                                EXPLICIT KEGG organism (the KEGG search box) is
+                                used as given with the organism derivation not
+                                consulted at all (a stub that raises proves
+                                it), wins over an ambiguous derived organism
+                                through run_ora AND run_quantitative_
+                                enrichment, and a code KEGG has no maps for is
+                                empty with its own note; the failure notes are
+                                re-worded for Metabolomics (the shared
+                                resolver's say "try GO or MSigDB"). The
+                                resolver itself is stubbed (it reaches KEGG
+                                through Transcriptomics_module's own alias,
+                                which faking this module's _kegg_safe_get does
+                                not intercept). Two deliberate mutants - the
+                                organism filter removed, and _empty_block
+                                dropping the caveat - were confirmed to turn
+                                these checks red. Organism ids are read from the
+                                5-digit TAIL (4-character codes, 'path:' prefix).
+test_metabolomics_retriever.py  14 of 15 checks pass. Metabolomics_retriever.py
+                                (a deliberate independent fork of
+                                test_compound_resolver.py so Metabolic
+                                Connection can never be disturbed): its own
+                                cache directory (cache/metabolomics), tolerance
+                                of empty/corrupt cache files, the output
+                                column contract. KNOWN FAILURE, not caused by
+                                the fork: "HMDB IDs can be enriched from
+                                PubChem synonym data" fails identically in the
+                                ORIGINAL test_compound_resolver.py - the
+                                inherited inline test is not isolated from
+                                whatever real cache state is on disk (the CID
+                                it mocks resolves from cache instead).
+test_metabolomics_session.py    16 checks. Direct in-process tests of API.py's
+                                job functions (no live server, no network -
+                                same pattern as test_organism_consistency.py),
+                                covering two session-state bugs found after
+                                the module shipped. FIX 1: the LIST tiles
+                                (ORA/Chemical Class/Lipid Class) never
+                                deduplicated an exact-repeated compound Name -
+                                remove_duplicate_input_names existed but was
+                                only ever called from the CLI resolver, never
+                                from the API path. Now wired in for the list
+                                path only (dedupe_names=True by default);
+                                confirmed the CONCENTRATION path still never
+                                dedupes, since a repeated column Name there is
+                                a genuine second feature/adduct, not a
+                                duplicate. FIX 2: the list and concentration
+                                paths share ONE organism (taxon_id/taxon_name),
+                                but each resolve job only cleared its OWN
+                                downstream results - resolving one path for a
+                                new organism left the other path's cached,
+                                organism-dependent results silently stale.
+                                Now resolving either path for a genuinely NEW
+                                organism also clears the other path's
+                                organism-dependent results (ORA <-> Quant),
+                                while re-resolving for the SAME organism
+                                leaves them alone, Chemical/Lipid Class are
+                                left untouched either way (they never use the
+                                organism), and quant_stats_df/meta (per-
+                                compound statistics) are never cleared by an
+                                organism change. Both fixes were mutation-
+                                tested: reverting either one in API.py turns
+                                the corresponding checks here red.
+test_metabolomics_topology.py  43 checks. Pathway Topology Analysis
+                                (Metabolomics_module.run_pathway_topology),
+                                offline - only KEGG's network edges are
+                                faked, so the REAL enrichment path
+                                (build_kegg_compound_universe, _eligible_
+                                keys, _drop_zero_overlap, _run_fisher_for_
+                                namespace / _run_wilcoxon_for_namespace) runs
+                                unchanged, reused from test_metabolomics_
+                                ora.py's own KEGG coverage. HEADLINE
+                                GUARANTEE: run_pathway_topology calls the
+                                exact same building blocks run_ora / run_
+                                quantitative_enrichment use for their own
+                                KEGG entry, so p-values/FDRs are checked
+                                BYTE-IDENTICAL against a live run_ora /
+                                run_quantitative_enrichment call on the same
+                                fixture, in both input modes (list -> Fisher,
+                                concentration table -> Wilcoxon). Also:
+                                parse_kegg_kgml (reversible reactions add
+                                both edge directions, irreversible only one,
+                                a multi-id KGML entry becomes one node per
+                                id, glycan gl: ids are kept as graph nodes,
+                                a real map with zero <reaction> elements
+                                returns an empty edge list rather than an
+                                error); _brandes_betweenness (this module's
+                                own implementation, no networkx) checked
+                                against a BRUTE-FORCE shortest-path
+                                enumeration on 25 random directed graphs;
+                                pathway_impact's well-defined flag
+                                (SENSITIVITY: a zero-reaction map's impact is
+                                0.0 but explicitly flagged, never silently
+                                indistinguishable from a genuine zero);
+                                fetch_pathway_graph's cache (a 'nodata' 404
+                                is cached, an 'error' never is) and its
+                                organism-specificity (SENSITIVITY: the SAME
+                                map number for two different organisms
+                                yields two DIFFERENT reaction graphs, proving
+                                the cache key includes the organism); and a
+                                no-KEGG-genome organism returning empty with
+                                a note rather than a fallback. Also:
+                                build_kegg_compound_name_index / fetch_
+                                pathway_graph label each node with its REAL
+                                compound name (from KEGG's own list/compound
+                                bulk file, cached separately from the KGML
+                                fetches) rather than the bare C-number, with a
+                                bare-id fallback for a node absent from the
+                                index; the fake KEGG responder's /list/
+                                compound handling is excluded from the KGML
+                                fetch-count assertions above (a separate,
+                                independently-cached artifact).
+
+test_multiomics_joint.py        96 checks. Multi-omics Joint Pathway Enrichment engine
+                                (Multiomics_module), offline, fixtures only.
+                                HEADLINE GUARANTEE: the per-omics p-value inside a
+                                joint result equals the one that omics' OWN ORA
+                                engine produces for the same input, checked
+                                against the exact function each module uses
+                                internally (Genomics' _run_fisher_for_namespace,
+                                Transcriptomics' _run_ora_for_sets, Metabolomics'/
+                                Proteomics' _drop_zero_overlap + _run_fisher_for_
+                                namespace). The design rules, each mutation-tested
+                                (a mutant breaks the named check, then the file is
+                                restored byte-identical): (1) a zero-hit pathway
+                                keeps p = 1.0 for the combination, whereas the
+                                single-omics engine drops it; (2) a pathway nobody
+                                hit never enters the combined family; (3) a
+                                pathway tested in only some omics goes to a partial
+                                table and is never padded with p = 1.0; (4) an
+                                omics with no annotated hit is left out and fewer
+                                than two usable omics gives an empty result with a
+                                note; (5) Benjamini-Hochberg is applied ONCE, over
+                                the combined p-values only (a mutant applying it
+                                twice fails); (6) Stouffer is not offered - the
+                                test shows WHY (one omics at p = 1e-10 plus one at
+                                p = 1.0 gives p = 0.90 under Stouffer, 2.4e-9 under
+                                Fisher). Fisher equals a hand-computed -2*sum(ln p)
+                                against chi-squared on 2k df; Tippett equals
+                                1-(1-min p)^k. BROWN'S METHOD (the default; Brown
+                                1975, empirical version Poole 2016), each property
+                                checked and mutation-tested (7 engine mutants, all
+                                caught): rho = 0 equals Fisher exactly; an omics
+                                combined with an exact copy of itself returns its
+                                own p (Fisher does not); Brown >= Fisher wherever
+                                Fisher's p <= 0.28 (an honesty test: above ~0.28
+                                the tails cross, so the claim is NOT made there);
+                                negative rho clamped to 0; rho = Pearson of
+                                -2 ln p over ALL jointly tested pathways, checked
+                                against a pure-python Pearson (numpy.corrcoef
+                                crashes the interpreter in this environment); fewer
+                                than 20 pathways falls back to Fisher with a note.
+                                REGRESSION: Transcriptomics' symbol
+                                sets carry 'genes' as a sorted LIST, not a set - the
+                                first draft crashed on it. The per-omics input
+                                builders are checked to call that omics' own
+                                universe builders and to pass the ONE shared KEGG
+                                organism code through.
+
+test_multiomics_mapping.py       124 checks. Cross-omics Pathway Mapping engine
+                                (Multiomics_mapping) and the structure fetchers in
+                                Multiomics_module_retriever, offline - small embedded
+                                KGML / Reactome diagram+graph fixtures and mocked HTTP.
+                                The rules, each mutation-tested (38 mutants across this
+                                file, the retriever and API.py: all caught, files
+                                restored byte-identical): the KGML parser keeps GENE
+                                entries and the reaction -> enzyme link (Metabolomics'
+                                parser drops both), a glycan is never a compound, a
+                                multi-gene box keeps every gene; the Reactome parser
+                                opens a complex / set to its UniProt / ChEBI leaves,
+                                guards cycles, strips an isoform suffix, keeps a
+                                cofactor inside a complex OUT of the metabolite members,
+                                treats a set of only small molecules as a metabolite,
+                                and restricts a sub-pathway to its own reactions;
+                                three states per omics (hit / measured / absent, never
+                                two) and a box is hit if ANY member is; every match
+                                records its identifier bridge (Entrez / UniProt / gene
+                                symbol -> KEGG gene, KEGG gene -> UniProt, symbol only
+                                when no UniProt is known, ChEBI, and the InChIKey
+                                skeleton for another protonation state - which never
+                                overrides an exact match and never matches a different
+                                skeleton); a reaction link needs enzyme-hit +
+                                metabolite-hit or enzyme-hit in two omics, and a
+                                'concordant' / 'discordant' call needs both expression
+                                omics; the picker ranks by omics count FIRST and drops
+                                zero-hit pathways; the fetchers never cache a transport
+                                error, do cache a definite 'no map', and draw a pathway
+                                with no diagram from its NEAREST ancestor.
+                                SECOND ROUND (the maps the user opened and found
+                                wrong): KEGG's global overview maps draw a gene as a
+                                LINE with no x / y - the parser keeps the polyline
+                                (corner points de-duplicated) and the middle vertex, a
+                                line ortholog is decoration, never a node; a group (a
+                                drawn complex) holds the union of its components' genes
+                                and is hit if any is; KGML relations are read with every
+                                subtype (a relation to a missing entry and a maplink
+                                are skipped; 'compound' is not a type); interaction
+                                links need BOTH ends hit; a drawn complex is not a box
+                                and a gene drawn in several boxes is ONE member hit;
+                                Reactome overview pathways (only ProcessNodes) are
+                                detected, their sub-pathways resolved one by one, an
+                                unreachable lookup is an error and NOT cached, a
+                                sub-pathway reached twice is listed once. 22 more
+                                engine / retriever mutants, all caught.
+                                THIRD ROUND (readable big maps): a line gene keeps
+                                KEGG's colour for it (upper-cased: '#b3b3e6' and
+                                '#B3B3E6' are one colour) and a pathway label the map
+                                number it links to; KEGG's classification (br08901) is
+                                read at its B level for the METABOLISM branch only
+                                (disease pathways share metabolic enzymes and once named
+                                a colour 'Neurodegenerative disease'); a colour is named
+                                by the class most of its genes' pathways belong to, the
+                                overview maps do not vote, a tie goes to the
+                                alphabetically first class, an unclassified colour is
+                                'Other'; the legend lists each class once with its lines
+                                and hits and its most frequent colour as the default. 9
+                                more mutants, all caught.
+test_multiomics_mapping_session.py  69 checks. The mapping routes and jobs in API.py,
+                                offline (no server, no network). State and clearing (a
+                                re-resolve, a re-upload and a re-configure drop the
+                                mapping); validation (MetaCyc / no database, a
+                                malformed pathway id - '../../etc/passwd', a Reactome
+                                id for KEGG - is refused before it can reach a URL, and
+                                no job starts); the picker and the run use the SAME
+                                hit rule as Joint (shared helpers), resolve the KEGG
+                                organism ONCE, skip Genomics' KEGG-id pass for a
+                                Reactome map, relabel KEGG compounds, report a missing
+                                organism / a missing pathway / a transport error
+                                explicitly, are strict-JSON safe, and leave the four
+                                single-omics session sub-dicts untouched. Also: the
+                                payload carries only the omics that touched a box
+                                ('absent' is left out - a global map has ~5,000 boxes),
+                                a line gene's polyline and a group's components, the
+                                relations and the interaction links (and a CSV for
+                                them; an unknown table name never reaches a path); an
+                                overview result lists its sub-pathways with the
+                                picker's hit counts, building the counts itself when no
+                                picker exists yet. 7 more API mutants, all caught.
+                                THIRD ROUND: a line map's result lists its pathway
+                                classes (KEGG colour, lines, hits), every line gene and
+                                every metabolic pathway label carries its class, a map of
+                                boxes and a Reactome diagram have none. 3 more mutants.
+test_multiomics_retriever.py    22 checks. Multiomics_module_retriever (the thin glue file),
+                                offline. It must add NO resolution logic of its
+                                own: every upload / resolve call is routed, with
+                                spies on the real modules, to that omics' OWN
+                                loader / resolver with the arguments its own tile
+                                passes (Genomics gene symbols get the organism,
+                                Ensembl IDs do not; Transcriptomics auto-detects
+                                its identifier type). DE selection pools up AND
+                                down and equals Transcriptomics' select_degs /
+                                Proteomics' select_significant_proteins for
+                                direction 'all'; the reference set is everything
+                                TESTED, not a database. Ambiguous / unresolved
+                                Genomics rows are dropped, never guessed.
+                                Mutation-tested: a direction-split selection,
+                                keeping ambiguous genes, a forced Transcriptomics
+                                identifier type, and a significant-only reference
+                                set each turn a named check red.
+
+test_multiomics_session.py      47 checks. The Multi-omics session state and jobs in API.py,
+                                no server: route functions and jobs are called
+                                in-process with stubs. ISOLATION (the user's
+                                explicit concern): a full select -> resolve ->
+                                configure -> run pass leaves session['ora'] /
+                                ['transcriptomics'] / ['proteomics'] /
+                                ['metabolomics'] untouched. ONE KEGG ORGANISM per
+                                run: resolve_kegg_organism_code is called exactly
+                                once for a four-omics, two-database run and the
+                                SAME code reaches every omics' KEGG builder and
+                                Genomics' KEGG-ID pass; with no usable organism no
+                                KEGG builder is called at all (no fallback) while
+                                Reactome still runs; a stale confirmation made for
+                                another organism is ignored. A failed resolve
+                                commits nothing (organism, earlier omics' tables
+                                and results all stay as they were). Route
+                                validation: <2 omics, out-of-order steps, Stouffer,
+                                bad cutoffs / term sizes. Mutation-tested: a
+                                per-omics organism resolution, committing the
+                                organism before the resolvers run, KEGG builders
+                                still called without an organism, and the run job
+                                writing into the Metabolomics session each fail a
+                                named check.
 
 
 ---------------------------------------------------------------------------
@@ -777,7 +1480,7 @@ regression_ora_gsea.py          22 checks. The pre-existing GO-only ORA/GSEA
                                 test_msigdb_fetcher.py (direct function
                                 calls) or playwright_regulon.py (browser).
 
-live_e2e_transcriptomics_network.py  22 checks. Full real HTTP round trip
+live_e2e_transcriptomics_network.py  25 checks. Full real HTTP round trip
                                 for Transcriptomics Network / Module
                                 Detection - upload -> resolve -> configure ->
                                 run -> download x3 -> guards - against the
@@ -995,6 +1698,132 @@ live_kegg_universe.py           39 checks. LIVE network test for KEGG
                                 retriever), same pattern as live_msigdb_urls.py
                                 above.
 
+live_e2e_metabolomics.py        97 checks. Real HTTP end-to-end test (no
+                                browser) of all five Metabolomics tiles:
+                                upload -> resolve (real PubChem/KEGG name
+                                resolution + the local LIPID MAPS/RefMet
+                                crosswalk) -> configure -> run -> download.
+                                Asserts the BIOLOGY the bundled examples plant
+                                rather than shapes: ORA's KEGG top term is a
+                                real pathway (not an overview map) against the
+                                database universe, Chemical Class recovers
+                                "TCA acids", Lipid Class reaches
+                                Glycerophosphocholines from shorthand PC
+                                names, and Quantitative Enrichment finds the
+                                planted TCA/glycolysis increase UP and the lipid
+                                decrease DOWN (two-sided). Also the input-
+                                contract errors that motivated the rework: a
+                                list with no Name column, a single-group
+                                table, an unknown orientation and an unknown
+                                group column each rejected with a message.
+                                KEGG organism-specificity against REAL KEGG:
+                                human terms are hsa-prefixed with a caveat
+                                naming the organism, yeast gets a strictly
+                                smaller universe from the same shared link
+                                file, an organism KEGG has no genome for is
+                                EMPTY with a note (never a fallback), and B.
+                                subtilis (14 KEGG strains) is empty until a
+                                KEGG organism is picked explicitly:
+                                /api/metabolomics/kegg/check-organism returns
+                                the organism's name and map count and rejects an
+                                unknown or malformed code, configure
+                                re-validates it, an explicit pick (bsu) makes
+                                KEGG test bsu maps, and beside a human
+                                organism an explicit yeast pick still tests
+                                yeast maps with its own smaller universe.
+                                Also cross-tile staleness: resolving Quant for
+                                a different organism (mouse) makes ORA's
+                                already-computed KEGG results undownloadable
+                                (400) until ORA is re-run for the current
+                                organism, and a repeated compound name in an
+                                uploaded list is kept at upload time but
+                                removed exactly once at resolve time, with
+                                n_input_rows still reporting the original
+                                (pre-dedup) count. Pathway Topology Analysis
+                                (KEGG only, both input modes): checked
+                                directly against a fresh ORA / Quantitative
+                                Enrichment KEGG run on the SAME input -
+                                p-values and FDRs must be BYTE-IDENTICAL
+                                (run_pathway_topology calls the exact same
+                                building blocks internally), every row
+                                carries Impact in [0, 1], a graph is fetched
+                                for every tested pathway and only those, and
+                                a no-KEGG-genome organism is empty with a
+                                note. Needs network.
+
+live_e2e_multiomics_mapping.py  93 checks. Real HTTP end-to-end test of Cross-omics Pathway
+                                Mapping (port 8009, real network, fresh session per
+                                run): four omics uploaded and resolved, the KEGG and
+                                Reactome pickers, KEGG hsa00020, Reactome R-HSA-71403
+                                and a sub-pathway with no diagram of its own
+                                (R-HSA-70171, drawn inside Glucose metabolism). It
+                                recomputes INDEPENDENTLY from the raw files: the
+                                Genomics hits on the KEGG map equal the genes found by
+                                re-reading KEGG's KGML and gene list (18 of 29), and
+                                every Transcriptomics member's log2FC and hit/not-hit
+                                equals the uploaded CSV row at the cutoffs. Also: a
+                                stricter cutoff never adds a hit and turns dropped
+                                genes into 'measured', not 'absent'; citrate synthase
+                                is linked to citrate; no protein / complex box is ever
+                                a Metabolomics hit; MetaCyc and malformed ids are
+                                refused; a re-upload clears the mapping. Two of its
+                                first assertions were WRONG, not the code - the bundled
+                                expression tables plant no TCA signal, so TCA is hit by
+                                Genomics + Metabolomics (2 omics, rank 69 of 340 as the
+                                ranking puts omics count first) - and were corrected to
+                                what the data supports rather than loosened.
+                                SECOND ROUND, on the maps that looked wrong: hsa01100
+                                (all 1,342 genes carry a polyline starting where KEGG's
+                                own coords start - recomputed from KEGG's raw file - and
+                                none sits at (0, 0); the Genomics hits equal a re-read of
+                                the file; the payload is ~1.8 MB), hsa04210 (all 135
+                                relations and the 4 groups match KEGG's file; the 14
+                                interaction links are exactly the relations with both
+                                ends hit, recounted from the payload) and Reactome's
+                                Disease / Metabolism / Immune System (reported as
+                                overviews with their sub-pathways, whose counts equal
+                                the picker's; Reactome nests overviews, so the test
+                                follows them down - Infectious disease > Viral
+                                Infection Pathways > Dengue ... - to a real diagram).
+                                THIRD ROUND: hsa01100 has 9 pathway classes, every one a
+                                class of KEGG's metabolism classification read
+                                INDEPENDENTLY from br08901; all 1,342 line genes carry
+                                one and each of KEGG's 14 line colours maps to exactly
+                                one class; citrate synthase (a TCA-cycle enzyme) comes
+                                out as Carbohydrate metabolism; all 169 pathway labels
+                                carry the class br08901 gives their map.
+live_e2e_multiomics.py          126 checks. Real HTTP end-to-end test of Multi-omics Joint
+                                Pathway Enrichment (no browser): choose omics ->
+                                upload one file each -> resolve with each omics'
+                                OWN resolver (UniProt / mygene.info / UniProt ID
+                                mapping / PubChem + crosswalk) -> KEGG organism ->
+                                configure -> run -> download. Asserts the BIOLOGY
+                                the examples plant (TCA-cycle genes + TCA-cycle
+                                compounds): KEGG's TCA cycle and glycolysis are
+                                jointly significant with a combined p-value
+                                stronger than either omics alone (TCA: 7e-50 vs
+                                5.6e-41 for the better single omics), and Reactome
+                                puts a TCA / glycolysis pathway in its top results.
+                                HEADLINE: in a SECOND session the real Metabolomics
+                                ORA tile (KEGG + Reactome) and the real Genomics
+                                ORA tile (KEGG + Reactome) are run on the same
+                                input, and every per-omics p-value in the joint
+                                result equals theirs (46 pathways compared). Also:
+                                Tippett is a real second method (1-(1-min p)^2),
+                                Stouffer is refused, a four-omics run with the
+                                Transcriptomics and Proteomics DE tables (cutoffs
+                                applied by Omiscera, up and down pooled; 567 of
+                                2969 genes significant) combines four p-values per
+                                row, a plain gene list is REJECTED for
+                                Transcriptomics, the partial-coverage table never
+                                carries a combined p-value, one KEGG organism is
+                                reported for the whole run, and the downloads are
+                                real CSVs. Every p-value comparison uses a RELATIVE
+                                tolerance: an earlier absolute one (1e-9) could not
+                                tell 1e-40 from 1e-30, so the tile-equality checks
+                                were vacuous for strong pathways. Each run uses a
+                                fresh session id (the server keeps sessions, and
+                                re-choosing omics keeps their uploads). Needs network.
 
 ---------------------------------------------------------------------------
 NEEDS A LIVE SERVER **AND** PLAYWRIGHT (real Chromium, real clicks)
@@ -1044,7 +1873,7 @@ playwright_genomics_results_cards.py  13 checks. The FIRST browser coverage
                                 synthetic STATE injection, which would risk
                                 silently drifting from the real payload shape
                                 and giving false confidence).
-playwright_transcriptomics_network.py  37 checks. The FIRST real-browser
+playwright_transcriptomics_network.py  41 checks. The FIRST real-browser
                                 coverage of the Transcriptomics Network /
                                 Module Detection tile - the fourth
                                 Transcriptomics analysis, replacing the
@@ -1085,15 +1914,27 @@ playwright_transcriptomics_network.py  37 checks. The FIRST real-browser
                                 n_hits_seed/n_hits/n_recruited_all_family
                                 exactly, each check independently gated on
                                 whether that specific caveat is expected to
-                                appear at all.
+                                appear at all. PLUS (multi-database): the
+                                config screen's "Label modules using" row is
+                                now checkboxes (GO + every MSigDB collection
+                                pill, since renderMsigdbCollectionSelector
+                                reuses the same ora-db-pill markup) rather
+                                than a single dropdown, GO is checked by
+                                default, MSigDB starts unchecked, and the
+                                draft's own enrichmentDatabases is confirmed
+                                to be an ARRAY (["GO"]), not the old single
+                                string.
 playwright_proteomics_ora.py    57 checks. The FIRST real-browser coverage of
                                 the Proteomics module (Milestone 1: the
                                 foundation plus Over-Representation
                                 Analysis). Drives the real flow end to end -
                                 tile -> sub-tile gating (ORA and, since
                                 Milestone 2, Quantitative Enrichment both
-                                enabled; PPI Network / PTM still correctly
-                                disabled) -> organism -> upload -> REAL
+                                enabled; PPI Network / PTM confirmed enabled
+                                too once those milestones landed - see
+                                playwright_proteomics_network.py and
+                                playwright_proteomics_ptm.py for their own
+                                dedicated coverage) -> organism -> upload -> REAL
                                 UniProt ID Mapping resolve of all 3500
                                 example accessions -> configure -> run
                                 against real InterPro/Complex Portal/UniProt
@@ -1377,6 +2218,300 @@ playwright_msigdb.py            68 checks. Same real-browser approach for
                                 multi-collection run produced a pile of
                                 indistinguishable "... (1).csv" files).
 
+playwright_metabolomics.py      423 checks. Real-browser coverage of the five
+                                Metabolomics tiles, written because the first
+                                Metabolomics UI was never opened in a browser
+                                and was rejected on sight (statistics columns
+                                metabolomics does not use, every database on
+                                one screen, a look unlike the rest of the app).
+                                Asserts: five separate tiles; no log2FC/pvalue/
+                                padj input on the list tiles; house-style
+                                structure - flat module screen with the shared
+                                file widget and inline example link (no
+                                numbered card-per-step wizard), exactly ONE
+                                result <select> and ONE result card; every
+                                chart control present AND redrawing through
+                                each option; and chart hover/axis text saying
+                                "Compound", never "Gene" (the builders were
+                                written for genes). Also the Quantitative
+                                tile's layout/group override round trip, the
+                                derived statistics shown and downloadable, and
+                                burden columns renamed for compounds.
+                                Also: checking KEGG on a pathway tile shows the
+                                KEGG organism box (the ONLY organism search
+                                box on the setup screen), which reports the
+                                derived organism by default; typing
+                                'saccharomyces' searches real KEGG and lists
+                                'code | name', picking validates it and can be
+                                cleared, and on the Quantitative tile an
+                                explicit KEGG organism beside a human organism
+                                reaches the run (sce maps, caveat says chosen
+                                explicitly); unchecking KEGG removes the box;
+                                the CLASS tiles offer NO enrichment map
+                                (asserted absent - class terms are disjoint,
+                                so the map could never have an edge) but keep
+                                the dot plot, and DO offer a class-composition
+                                pie:
+                                its slices sum to the number of distinct
+                                matched compounds, one colour picker per real
+                                class, a picked colour recolours the drawn
+                                slice and survives a threshold change, the
+                                level and "Classes shown" controls redraw
+                                (capped, with nothing lost), every slice has a
+                                distinct colour. The pie's percentage labels:
+                                Plotly's own slice text is off (it drops small
+                                slices) and every slice gets a label as a
+                                draggable annotation; SENSITIVITY - each
+                                leader line must end inside ITS OWN slice just
+                                inside the rim (checked from the angles, at
+                                100% and 200% zoom; a deliberate mutant that
+                                mirrored the tips turned 6 checks red);
+                                Hide/Show, a real mouse drag moves a label
+                                while its line stays attached, the position
+                                survives a redraw, Reset restores it, and Zoom
+                                200% doubles the figure. Slice borders (white /
+                                black / none) and "Label slices of at least"
+                                (a threshold chosen per panel so it genuinely
+                                separates that panel's slices). A synthetic
+                                60-CLASS pie sizes itself: every slice
+                                labelled, no two labels closer than a line, none
+                                clipped, the whole 60-entry legend fits without
+                                scrolling, Zoom 50%/200% keep every label.
+                                REGRESSION (found in a 1280px window): long
+                                class names made Plotly grow the right margin
+                                for the legend, shrinking the plot area and
+                                sliding the pie out from under its leader tips;
+                                asserted at 700/900/1280px that the plot area
+                                keeps the size asked for and every tip sits on
+                                the rim of the pie Plotly really drew. A mutant
+                                that removed the legend-width reservation
+                                collapsed the plot area to 76px and turned
+                                those checks red. No pie on any pathway panel,
+                                including the KEGG panel of the mixed-family
+                                Quantitative tile.
+                                Pathway Topology Analysis: the input-mode
+                                choice (defaults to "list"), the node-
+                                importance selector and KEGG organism box on
+                                setup, NO database picker (there is only
+                                ever one), and on results NEITHER the usual
+                                "Compound set overview" pane NOR a class-
+                                composition pane - instead a "Pathway impact"
+                                pane and a "Pathway graph" pane. Also
+                                concentration-table mode: switching the input
+                                select updates topologyInput, the same
+                                group-contrast fields Quantitative Enrichment
+                                uses appear, the chosen measure and Wilcoxon/
+                                burden column shape reach the run, and
+                                topology's own statistics preview is shown.
+                                Pathway impact plot: a categorical dot plot
+                                (buildDotPlot's own convention) with every
+                                pathway's real NAME on the y-axis, not
+                                floating text over a continuous axis -
+                                checked that the trace stays mode "markers"
+                                (no on-plot text of its own) and every y
+                                value is a real name; EVERY tested pathway is
+                                drawn by default (point count == row count,
+                                not just the significant ones), and "Terms
+                                shown" narrows it (asked 10, got exactly 10).
+                                Pathway graph: node markers carry a real
+                                COMPOUND name (not a bare KEGG id - checked by
+                                regex), but as a Plotly ANNOTATION anchored to
+                                each node, not the marker trace's own text -
+                                same mechanism as the class-composition pie's
+                                percentage labels (buildClassCompositionPie),
+                                reused here for the same reason: a SENSITIVITY
+                                check drags one node's label with a REAL mouse
+                                gesture and confirms the annotation's anchor
+                                (x, y - the node's own KGML position) does NOT
+                                move while its tail (ax, ay - the label) does,
+                                the moved position survives a Hide/Show
+                                redraw (stored on the run, like the pie's
+                                dragged labels), and "Reset label positions"
+                                puts it back; "Compound labels" -> Hide drops
+                                every annotation (0 left) rather than just
+                                changing trace mode. Annotation/plot queries
+                                are taken off the LAST .js-plotly-plot in the
+                                DOM, since the impact pane's chart div is
+                                hidden, not removed, once shown; the caption
+                                explaining isolated (unconnected) nodes as
+                                genuine KEGG data, and the one explaining
+                                nodes/labels can be dragged, are both present.
+                                Impact plot REGRESSION (found from a user
+                                screenshot): a hardcoded x-axis range clipped
+                                the biggest marker at either end until
+                                "Autoscale" was clicked by hand - checked that
+                                xaxis.autorange is genuinely true on first
+                                draw (gd.layout.xaxis.range itself is NOT a
+                                reliable signal: Plotly writes the computed
+                                range back into it once autoranging runs, so
+                                it is never undefined post-render). Node drag:
+                                _makeNetworkDraggable (already used by the
+                                enrichment map / gene-concept network charts)
+                                was wired onto the pathway graph's own nodes
+                                too, with an onMove callback that keeps a
+                                dragged node's OWN label annotation anchored
+                                to its new position - checked with a real
+                                mouse gesture (node position computed the same
+                                way the helper's own hit-test does, since a
+                                Plotly marker has no selectable DOM element)
+                                that the node moves AND its annotation's x/y
+                                anchor moves with it, to the same new spot.
+                                SENSITIVITY (a real regression hit while
+                                building this): node-dragging's hit-test
+                                tolerance (20px) reaches a label sitting only
+                                16px from its own node by default, so it was
+                                silently stealing every click meant for
+                                Plotly's own annotation-tail label drag,
+                                breaking the label-drag checks above the
+                                moment node-dragging was added - fixed by
+                                having _makeNetworkDraggable's mousedown
+                                handler step aside (evt.target.closest
+                                ('.annotation')) for a click that lands on an
+                                annotation, a no-op for every OTHER chart that
+                                uses the same shared helper since none of them
+                                carry annotations.
+                                Needs network.
+
+playwright_multiomics_mapping.py  105 checks. Real-browser test of Cross-omics Pathway
+                                Mapping on real data (port 8009, real network): the
+                                second Multi-omics box is live and shows only its name;
+                                four omics -> upload -> resolve -> 'Continue to pathway
+                                mapping' -> the KEGG picker (340 pathways, capped at
+                                150 rows, search by name and by ID) -> KEGG hsa00020 ->
+                                the four panes -> a pathway the expression tables DO hit
+                                (direction triangles whose shape agrees with the
+                                direction in their own hover) -> Reactome R-HSA-71403 and
+                                the diagram-less Glycolysis (the overview says it was
+                                drawn inside Glucose metabolism) -> back, and re-opening
+                                the box reuses the resolved uploads (the Joint box still
+                                starts clean) -> 'Map this pathway' from a Joint result.
+                                THE EVIDENCE CHIPS NEVER COVER EACH OTHER: the pixel
+                                distance between every pair of chips on one box is
+                                measured at first draw, zoomed in and zoomed back out
+                                (11.0px against a 9px marker), on a map with boxes
+                                carrying three or more chips - without such a box the
+                                check would be vacuous. Downloads are real CSVs.
+                                SECOND ROUND, in the real browser: hsa01100 draws with
+                                no pile in a corner (0 of 1,342 handles within 4px of
+                                the top-left-most one), grey lines for the genes nobody
+                                hit and coloured ones for the hits, only the hits
+                                labelled by default (the count equals the number of hit
+                                boxes); hsa04210 draws its 135 relations, the dark ones
+                                are exactly the relations with both ends hit, 4 group
+                                outlines, an 'Interaction links' pane and CSV, and
+                                every hit box has its chips; Reactome's Disease shows NO chart but the
+                                sub-pathway table, and pressing Map down the nesting
+                                reaches a real diagram.
+                                THIRD ROUND: hsa01100 is drawn at its own size (about
+                                5,000 x 3,300px, in a 1,050px frame that scrolls), has a
+                                colour picker per pathway class, every hit gene is a
+                                thick full-strength line with its chips, choosing red for
+                                Lipid metabolism recolours exactly its lines and
+                                'KEGG colours' restores them, and the label overlap is
+                                MEASURED: 154 of 204 hit labels sit on another label when
+                                the map is squeezed to the page, 21 of 204 at 100%. The
+                                zoom tools are checked on this real 5,000px map too.
+playwright_multiomics_mapping_chart.py  114 checks. The same chart on SYNTHETIC data, in
+                                seconds (the server only serves app.js): a hand-built
+                                result is put into STATE and the real render path draws
+                                it, so every expected value is known in advance, at two
+                                window widths. Shapes (triangle up / down, diamond for
+                                disagreeing members, filled circle for a list hit, a
+                                HOLLOW circle in its own trace for measured-not-
+                                significant, no chip when absent), FIXED slots (an
+                                absent omics leaves its slot empty instead of shifting
+                                the others), chips below their box, no label on a box
+                                without evidence, a darker border on a hit, chip
+                                spacing >= a marker at first draw / zoomed in 5x /
+                                zoomed out / far out, KEGG substrate-to-product lines
+                                vs Reactome's own segments with dotted catalyst links,
+                                links to other pathways as plain text, empty-state
+                                messages. 19 frontend mutants (stacked chips, no
+                                re-placement, no relayout listener, swapped triangles,
+                                filled instead of hollow, chips above the box, ...):
+                                17 caught; the other 2 change no behaviour (a list omics
+                                never has a direction, so 'draw a list hit as a
+                                triangle' is the same code path, and a link node never
+                                reaches the box traces). app.js restored byte-identical.
+                                SECOND ROUND: the relation styles (arrow, bar, plain,
+                                dashed arrow, dash-dot; dark only when BOTH ends are hit;
+                                an arrow stops short of its target; '+p'), group
+                                outlines, label modes (the default on a map of over 300
+                                boxes is hits only), the overview screen, and a teardown
+                                regression check (not mutation-sensitive: see its
+                                comment). THIRD ROUND (dragging was taken out at the
+                                user's request: it was incomplete and hard to use):
+                                line genes coloured by pathway CLASS (hit = full
+                                strength and thick, measured = firmer, untouched =
+                                faint, hits on top, drawn along the polyline with y
+                                flipped, chips at a hit line's middle, no straight
+                                reaction lines, pathway labels in their class colour); a
+                                colour picker per class that recolours exactly that class
+                                (and its labels) and 'KEGG colours' that restores it; a
+                                wide map defaults to 100% in a scrolling frame, the Size
+                                menu scales the chart exactly (50% / 200%), 'fit' is the
+                                page's width, the wheel scrolls at a fixed size, chips
+                                stay a marker apart at every size, 'Download map' opens
+                                a menu you can reach on a 2,160px chart; and dragging
+                                moves nothing. 25 more mutants over the round, all
+                                caught; app.js restored byte-identical. TOOLS: at a fixed
+                                size the chart's own toolbar is off-screen, so Zoom tool,
+                                Pan tool, Zoom in / out, Autoscale and Reset axes are
+                                repeated above the chart (hidden at fit-to-page): Zoom in
+                                halves the visible range about its centre and re-places
+                                the chips, Zoom out doubles it, Reset axes returns EXACTLY
+                                to the opening view (Plotly widens the x range to the
+                                canvas's shape, so that, not the raw data box, is the home
+                                view - my first assertion compared against the wrong one),
+                                Autoscale after zooming in contains every box again, the
+                                two tools switch the drag mode. 8 more mutants, all caught.
+playwright_multiomics.py        127 checks. Real-browser test of Multi-omics Joint Pathway
+                                Enrichment (static/app.js): the formerly INERT
+                                'Multi-Omics' button -> choose omics -> one upload
+                                each -> resolve -> setup -> run -> results -> a
+                                second, four-omics run. SENSITIVITY: clicking the
+                                button opens the screen (it used to do nothing);
+                                no upload widget appears until TWO omics are
+                                chosen, and only for the chosen ones; Stouffer is
+                                NOT in the method select; DE-cutoff fields appear
+                                only when a DE omics is chosen; the joint dot plot
+                                is a categorical dot plot with pathway NAMES on a
+                                reversed y-axis (Plotly stores 'reversed' as
+                                autorange true + a high-to-low range, so the check
+                                reads the range); the evidence plot has one trace
+                                per omics plus a combined diamond, in each omics'
+                                own colour, and the metabolomics 'Gene' ->
+                                'Compound' chart-noun swap does not mangle the
+                                omics names. REGRESSION found by this test: a
+                                member list of 82 characters sits under
+                                buildTable's 100-character clamp but still wrapped
+                                to ten lines in the ~100px column of an 18-column
+                                table, inflating its row to 195px - every member
+                                cell is now clamped to three lines (full text in
+                                the tooltip and the CSV). Test-harness lesson:
+                                Playwright fill + a synthetic change leaves the
+                                browser's own change pending, and it re-renders the
+                                panel under the NEXT click - commit with Tab. Every
+                                chart control redraws with no page error; the
+                                downloaded CSV has every combined row; the active
+                                pane survives a database switch. Mutation-tested
+                                for the row clamp only (removing it turns the
+                                195px-row check red); the other rules are
+                                asserted but were not individually mutated.
+                                TILE SCREEN: Multi-Omics opens six boxes (the
+                                planned methods); only Joint Pathway Enrichment is
+                                clickable, the other five are disabled and say
+                                'coming soon', and Back goes one level at a time.
+                                LANES: the evidence plot splits each pathway row
+                                into one lane per omics plus the diamond, because
+                                two omics at the same p-value (an omics with no hit
+                                sits at exactly 0) used to stack and hide one
+                                marker; checked in pixels on the four-omics data -
+                                coincident markers stay >= 9px apart (12.9px
+                                measured; 0px with the lanes collapsed). Needs
+                                network. A full run takes ~12 minutes (the
+                                four-omics step resolves ~6,500 identifiers).
+
 These six (playwright_regulon.py, playwright_genomics_results_cards.py,
 playwright_msigdb.py, playwright_transcriptomics_network.py,
 playwright_proteomics_ora.py, playwright_proteomics_quant.py) make real
@@ -1399,7 +2534,142 @@ in one never hides another. From the repo root, with the server up:
 Expected totals as of the last full run, in file-listing order: 117, 22, 16,
 4, 15, 5, 16, 10, 24, 58, 44, 49, 52, 8, 23, 19, 20, 31, 23, 31, 49, 21, 15,
 12, 12, 22, 22, 16, 12, 49, 39, 90, 13, 37, 40, 41, 7, 4, 15, 68 - all passing
-(1171 checks across 40 files).
+(1171 checks across 40 files). The Metabolomics files listed above were added afterwards
+and are not in that tally.
+
+MULTI-OMICS CORRELATION-BASED INTEGRATION (info/README-MultiOmics-Correlation.txt).
+Run with the server on port 8009 only for the live and browser files.
+
+test_multiomics_correlation.py  105 checks. The engine (Multiomics_correlation), offline.
+                                Every statistic against INDEPENDENT pure-python code:
+                                average ranks, Pearson and Spearman with ties and
+                                missing values (each pair with its own n; Spearman
+                                RE-RANKED over each pair's shared samples, as R and
+                                pandas do - a check proves the test can tell this
+                                from ranking each feature on its own), a
+                                hand-written incomplete-beta p-value (no scipy t), and
+                                Benjamini-Hochberg against Genomics_module's own.
+                                NULL CALIBRATION on independent random matrices: about
+                                5% of p-values below 0.05, a Kolmogorov-Smirnov bound
+                                for uniformity, nothing surviving BH (n = 20 and 12).
+                                Planted pairs recovered; sample alignment (whitespace,
+                                the case option both ways, the ones left out named, the
+                                'other orientation' hint); orientation detection both
+                                ways with a Group column, and annotation columns
+                                (gene_biotype, a compound Class, 'Compound group')
+                                that must NOT flip it; the 20% missing limit; log2;
+                                duplicate-gene averaging; the clustering order against a
+                                naive average-linkage; the layered layout against the
+                                input order. No np.corrcoef / np.cov / scipy spearmanr:
+                                they hard-crash this environment, so the engine uses
+                                elementwise numpy only.
+test_multiomics_correlation_session.py  73 checks. The routes and jobs in API.py,
+                                offline with a stubbed resolver: the order of the
+                                steps, Genomics refused, fewer than two omics refused,
+                                a re-upload / a re-choice / a re-resolve drops what
+                                depends on it, a failed run leaves no half-built result,
+                                the example files end to end, the scatter endpoint (its
+                                axis labels once overwrote the value arrays - a
+                                regression check; a protein axis names gene and
+                                accession), a repeated id 'CS (2)' resolved through
+                                'CS', downloads, strict JSON, isolation
+                                from Joint and Mapping.
+live_e2e_multiomics_correlation.py  32 checks. Real HTTP end-to-end (port 8009, real
+                                resolvers). Rebuilds from the raw CSV files, with no
+                                Omiscera code: every gene's rho / n / p / FDR in the
+                                concordance table, and the COMPLETE transcript x
+                                metabolite block (12,558 pairs, BH): the reported set
+                                must be identical to the app's; the same for the
+                                protein x metabolite block, whose proteins have
+                                missing values (every pair ranked over its own
+                                samples, one pair at a time). Planted structure
+                                (CS-citrate, IDH3A-isocitrate, MDH2-malate; the
+                                discordant genes negative); downloads equal the tables.
+playwright_multiomics_correlation.py  78 checks. Real browser (port 8009): the third
+                                box is live; Genomics cannot be chosen; the orientation
+                                menu re-reads the same file (forcing the wrong layout
+                                visibly changes the sample count); the alignment card;
+                                the concordance histogram, table and a scatter whose
+                                rho equals the table's; pairs and their scatter; the
+                                heatmap (symmetric colour scale, a dot on exactly the
+                                reported pairs, a fixed cell size measured on a 40 x 40
+                                synthetic heat); the network (every node drawn, no two
+                                nodes of a column overlap, middle-column labels above
+                                their nodes); the figure tools row on every chart;
+                                the Setup block has no overlapping controls (measured
+                                boxes); the colour-gradient menu (6 diverging scales +
+                                swap) reaches the heatmap, the histogram and the
+                                network, and the caption never names a colour;
+                                changing the case option drops a stale match; a
+                                2,500-row pair list draws 2,000 rows with a note
+                                (the number format follows the browser's locale);
+                                downloads; no page error. Set CORR_SHOT_DIR to save a
+                                screenshot of each pane to look at.
+generate_correlation_examples.py  Regenerates Data3/example_corr_*.csv (synthetic, seeded,
+                                planted structure; needs the network once for the
+                                UniProt accessions). Not a test.
+
+MULTI-OMICS NETWORK-BASED INTEGRATION (info/README-MultiOmics-Network.txt).
+Run with the server on port 8009 only for the live and browser files.
+
+test_multiomics_network.py      79 checks. The engine (Multiomics_network), offline, on a
+                                3-community STRING-like fixture. The equal-weight rule against
+                                hand computations (one omics = exactly 1.0; 3,000 transcript seeds
+                                and 4 metabolite seeds carry equal total weight; a protein hit
+                                by two omics outweighs one hit by one). The metabolite -> enzyme
+                                join against a brute-force join on random data at several limits,
+                                the InChIKey-skeleton bridge, the hub guard at its boundary
+                                (60 reactions kept, 61 left out) and the family-reaction guard at
+                                its boundary (30 proteins kept, 31 skipped). THE KEY CHECK:
+                                identical seeds from two omics reproduce the existing Proteomics
+                                network tile's propagated score, Z, p, FDR and modules exactly
+                                (difference 0.0). Seeds named by omics, per-omics module counts,
+                                the DE columns travelling with a protein. The ChEBI skeleton
+                                cache remembers 'no structure' but never a failed lookup. The
+                                pathway network against a brute-force Jaccard (threshold boundary
+                                inclusive, a compound named like a gene kept apart, components,
+                                top-N) and a layout with no two nodes closer than the gap.
+test_multiomics_network_session.py  60 checks. The routes and the job in API.py, offline with a
+                                synthetic STRING graph and stubs: the order of the steps, an
+                                organism STRING does not have (refused BY NAME), every parameter's
+                                range, nothing half-valid stored, the strict-JSON payload, four
+                                omics in one run, the metabolite table, both networks, the
+                                downloads, isolation from the single-omics tiles and from Joint,
+                                Mapping and Correlation, clearing on re-upload / re-resolve.
+live_e2e_multiomics_network.py  51 checks. Real HTTP end-to-end (port 8009, real STRING human network at
+                                confidence 700, real Reactome files, 500 permutations). Rebuilds
+                                from the raw files with no Omiscera code: each omics' seeds (STRING's
+                                own names and aliases; proteomics' padj by Benjamini-Hochberg), the
+                                metabolite -> enzyme join (Reactome's two files streamed again),
+                                the combined weights, and THE RANDOM WALK itself on the rebuilt
+                                graph - every protein's propagated score must match. Also the
+                                module seed counts and the pathway edges.
+playwright_multiomics_network.py  41 checks. Real browser (port 8009, real data): the fourth box is live;
+                                the shared upload screen leads to the network setup; the setup
+                                shows the metabolite limits only because metabolomics is chosen;
+                                the overview, the recruited-only hit table, the single-omics
+                                tiles' own figures drawn from this payload, the module
+                                composition chart, the metabolite table, and the pathway
+                                network at a fixed readable size in a scroll frame: every node
+                                drawn, no two nodes too close, NO TWO LABELS OVERLAP (measured
+                                on the page), one chip series per omics, the figure tools row.
+                                Set NET_SHOT_DIR to save a screenshot of each pane.
+playwright_multiomics_network_chart.py  58 checks. The same results screen on a SYNTHETIC payload
+                                that HAS what the real example lacks (seconds, no run): recruited
+                                proteins and their default view, modules with seeds from several
+                                omics, the composition chart (stacked, bars equal the table), the
+                                single-omics tiles' figures, module enrichment, the metabolite
+                                hub row, and a crowded pathway network (35 long Reactome names
+                                laid out by the engine): positions equal the engine's, NO TWO
+                                LABELS OVERLAP, labels show no visible '<br>', chips only where
+                                an omics hit and under their node AS DRAWN, near-identical
+                                pathways merged and said so in the hover. THE FIGURE TOOLS: a
+                                visible tools row (zoom, pan, zoom in/out, autoscale, reset axes)
+                                that works on the chart (zoom in halves the view, reset returns
+                                to the opening view), Size (50-200% and fit to page; chips keep
+                                their place at every size), name density, and the Download
+                                figure menu opening under its button. Every rule goes red
+                                when its line of app.js is broken.
 
 A NOTE ON WRITING NEW CHECKS HERE. Prefer assertions that can actually fail
 for the reason you care about. A concrete example lives in
@@ -1409,3 +2679,115 @@ non-finite value into 0 and then returns all-minimum 8px sizes - so a wrong
 column key sailed through it. The checks that replaced it compare the
 plotted values against the table they claim to come from, and were confirmed
 to go red when the column key was deliberately broken.
+
+MULTI-OMICS MOFA / FACTOR-BASED INTEGRATION (info/README-MultiOmics-MOFA.txt).
+Run with the venv of requirements.txt (C:/Users/cliente/omiscera-venv): mofapy2 needs a working numpy / scipy.
+Run with the server on port 8009 only for the live and browser files.
+
+test_multiomics_mofa.py         50 checks. The engine (Multiomics_mofa), offline, on planted 3-omics data (48
+                                samples; a shared factor, a transcript + protein factor, a metabolite-only
+                                factor; missing protein cells). Preparation rules; refusals (< 6 samples, bad
+                                settings, nothing usable); the three planted factors recovered (|r| 0.99); the
+                                R2 pattern (shared vs specific); order by variance and a fixed sign; identical
+                                results for the same seed and a different seed finding the same factors;
+                                variance explained equal to an independent re-implementation of mofapy2's
+                                definition (1e-14); stability (real factors ~1.0, injected noise factors
+                                flagged); warnings; group tests against scipy, by-hand Kruskal-Wallis and the
+                                BH of Genomics_module; the pathway test of the weights against scipy's
+                                asymptotic Mann-Whitney for all 62 pathways with ties; planted pathways found in
+                                the right direction; absolute mode; features without an identifier left out;
+                                NULL CALIBRATION (random weights x random pathways: KS 0.02, 5% below 0.05);
+                                collapse of several features of one gene.
+test_multiomics_mofa_session.py 77 checks. The routes and jobs in API.py, offline with a stubbed resolver and
+                                stubbed pathway builders: empty state; nothing allowed before the tables are
+                                matched; every setting range; group sources (a file column, a sample sheet,
+                                bad sheets); the run on the REAL example files (planted factors recovered, strict
+                                JSON, 25 top weights are the 25 largest by |weight| of both signs, group tests);
+                                groups change nothing in the fit; downloads; the enrichment job (collapse by gene,
+                                the 'unavailable' path, the real builders called with the right inputs); the
+                                fingerprint (same data keeps the result, a changed value or a renamed sample
+                                clears it); Joint's selection keeps MOFA's state; the 6-sample floor.
+                                Also: test_multiomics_correlation.py (110) gained the per-sample label columns
+                                and test_multiomics_retriever.py (24) the Entrez ids / accessions kept for MOFA.
+live_e2e_multiomics_mofa.py     34 checks. Real HTTP end-to-end (port 8009, real resolvers, real mofapy2, real
+                                Reactome). From the raw CSV files with no Omiscera code: the three planted
+                                factors recovered; the total variance explained of every omics recomputed from
+                                the factor values, the downloaded weights and the raw tables (agrees to 0.5
+                                point); every factor's group p-value against scipy; only the treatment factor
+                                separates the groups; the top weights equal the downloaded table; the
+                                pathway enrichment puts Glycolysis first; identical factors on a second run.
+playwright_multiomics_mofa.py   55 checks. Real browser (port 8009): the fifth box is live; the upload screen
+                                runs in MOFA mode (no correlation setup, a Continue button); the setup offers the
+                                metabolite file's Group column; the three planted factors recovered; every
+                                figure has the tools row, a Size menu (150% is 1.5 x wider) and Download figure;
+                                the heatmap cells equal the table; the scatter has one trace per group; only the
+                                treatment factor differs between groups; the weights bars are the 25 largest and
+                                each has its own row (two features of one gene used to stack on one row - found
+                                by looking at the screenshot); a real pathway enrichment; downloads; choosing the
+                                box again keeps the matched tables; uploading again clears the match and the MOFA
+                                result; the absolute-weights test is really the one run; no page error. Set MOFA_SHOT_DIR to save a screenshot of each pane.
+generate_mofa_examples.py       Regenerates Data3/example_mofa_*.csv and tests/fixtures/mofa_example_truth.csv
+                                (synthetic, seeded, planted structure; needs the network once for gene symbols).
+                                Not a test.
+
+MULTI-OMICS DIABLO / MULTIBLOCK INTEGRATION (info/README-MultiOmics-DIABLO.txt).
+Run with the venv of requirements.txt (C:/Users/cliente/omiscera-venv). Run with the server on port 8009 only
+for the live and browser files. Regenerating tests/fixtures/diablo_reference/out/*.csv needs a local R + mixOmics
+(tests/r_reference/README.txt) - the offline test itself needs neither.
+
+test_multiomics_diablo.py       52 checks. The engine (Multiomics_diablo), offline. Agreement with a REAL mixOmics
+                                run on a small fixed dataset (tests/fixtures/diablo_reference/, produced once by
+                                tests/r_reference/diablo_reference.R): training variates, loadings, selected-
+                                feature counts, AVE (including "undefined for a block with missing values", a
+                                mixOmics quirk replicated on purpose), predicted test-set scores, and every one of
+                                mixOmics' three classification distances plus majority and weighted vote - all
+                                equal mixOmics to float64 precision (1e-14 to 1e-15), not a looser tolerance.
+                                prepare_blocks / check_groups rules; planted recovery on the REAL 36-sample example
+                                (no R needed - the planted treatment genes/metabolites are selected, not the
+                                unrelated cholesterol/lipid signal); NO LEAKAGE in the cross-validation, checked
+                                directly (mean CV error over 12 independent pure-noise datasets is close to the
+                                0.5 chance level); the permutation test's internal consistency (p = 1/(n+1) for an
+                                impossible BER of 0 or 1); soft_threshold_keep's tied-value rule (a tied pair at
+                                the keep/drop boundary is kept or dropped TOGETHER, R's ties.method="max");
+                                weighted_vote actually uses the per-block weights (not a disguised majority vote);
+                                a tied (None) prediction always counts as an error, in its TRUE class's total (not
+                                excluded from both, which would wrongly look like a free pass);
+                                selected_feature_enrichment's Fisher exact p-value against scipy, with the
+                                restricted-universe convention the rest of the app's ORA uses.
+test_multiomics_diablo_session.py 60 checks. The routes and jobs in API.py, offline with a stubbed resolver and
+                                stubbed pathway builders: empty state; nothing allowed before the tables are
+                                matched; a group column REQUIRED (unlike MOFA, where groups are optional); group
+                                sources (a file column, a sample sheet); every setting range, including a fold
+                                count bigger than the smallest group; the run on the REAL example files (strict
+                                JSON - AVE's NaN for a block with missing values must serialise as null, the bug
+                                found live before this test existed; component search, keepX search, a small
+                                cross-validated error, a significant permutation p-value); downloads; the
+                                fingerprint (a changed table clears the config, result, enrichment, cached pathway
+                                sets and sheet); Joint's selection keeps DIABLO's state; the enrichment job (built
+                                once per result, the real builders called with the right inputs, the 'unavailable'
+                                path).
+live_e2e_multiomics_diablo.py   35 checks. Real HTTP end-to-end (port 8009, real resolvers, the real from-scratch
+                                DIABLO implementation, real Reactome). From the raw CSV files with no Omiscera
+                                code: the planted treatment genes/proteins/metabolites are selected and correlate
+                                strongly with the groups, NOT the real-but-unrelated cholesterol/lipid signal; the
+                                downloaded weights and components are mutually consistent (association check); the
+                                pathway enrichment puts Glycolysis/glucose metabolism/TCA cycle first, its top
+                                p-value equals scipy's Fisher exact; an identical re-run gives an identical
+                                cross-validated error and keepX (the seed is fixed) and correctly KEEPS the earlier
+                                enrichment (still valid for the identical selection) while reconfiguring - even to
+                                the same settings - correctly drops it.
+playwright_multiomics_diablo.py 34 checks. Real browser (port 8009): the sixth (last) box is live; the screen says
+                                DIABLO is supervised; the setup requires a group column; every result pane
+                                (Overview, Components - a scatter with one marker shape per omics and colour per
+                                group, so the omics' agreement is visible, and a by-group box plot; Selected
+                                features; Performance - the component-count search and the permutation null
+                                histogram, with the observed-BER line and label correctly inside the plot, a
+                                rendering bug found by looking at the first screenshot and fixed; Pathway
+                                enrichment with a real run; Data used; Parameters) has the figure tools / Size /
+                                Download figure; downloads; choosing the box again keeps the matched tables;
+                                uploading again clears the match and the result; no page error. Set
+                                DIABLO_SHOT_DIR to save a screenshot of each pane.
+generate_diablo_r_fixtures.py   Regenerates tests/fixtures/diablo_reference/{block_*.csv, group.csv,
+                                train/test_samples.csv} (the small, fixed input to the mixOmics agreement check;
+                                offline, reuses the MOFA example tables). Not a test; see tests/r_reference/
+                                README.txt for the R half (not shipped with the repo).

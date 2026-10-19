@@ -71,7 +71,7 @@ check(job["status"] == "done", f"resolve finished ({job['status']}, {job.get('er
 print("=== configure + run (this triggers the mouse STRING download if not already cached) ===")
 r = requests.post(f"{BASE}/api/transcriptomics/network/configure", headers=HEADERS,
                   json={"confidence": 700, "n_permutations": 500, "module_detection": True,
-                        "min_module_size": 2, "enrichment_database": "GO",
+                        "min_module_size": 2, "enrichment_databases": ["GO"],
                         "direction": "all", "weighting": "equal"},
                   timeout=120)
 check(r.status_code == 200, f"configure accepted for taxon 10090 ({r.status_code}: {r.text[:300]})")

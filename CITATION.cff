@@ -1,0 +1,15 @@
+# This file lets GitHub show a "Cite this repository" button and lets reference
+# managers (Zotero, EndNote, ...) and Google Scholar pick up the citation directly.
+# Fill in repository-code below once the GitHub repo exists (owner/repo name).
+cff-version: 1.2.0
+message: "If you use Omiscera in your research, please cite it as below."
+title: "Omiscera: a web application for genomics, transcriptomics, proteomics, metabolomics and multi-omics annotation analytics"
+type: software
+authors:
+  - family-names: "Macedo de Almeida"
+    given-names: "João Victor"
+    orcid: "https://orcid.org/0009-0004-7879-651X"
+repository-code: "https://github.com/jvohnz/Omics"
+version: "0.6"
+date-released: "2026-10-19"
+license: MIT

@@ -365,6 +365,41 @@ a { color: var(--omiscera-text); }
     margin-top: 0.4rem;
 }
 
+/* ---------------- Public pages (Information / Contact / References) ---------------- */
+
+.public-page-screen { max-width: 1100px; }
+
+.info-layout { display: flex; gap: 1.2rem; align-items: flex-start; flex-wrap: wrap; }
+
+.info-doc-list { display: flex; flex-direction: column; gap: 0.3rem; flex: 0 0 280px; min-width: 220px; }
+
+.info-doc-btn {
+    text-align: left;
+    padding: 0.5rem 0.7rem;
+    border: 1px solid var(--omiscera-card-border);
+    border-radius: 8px;
+    background: #FFFFFF;
+    cursor: pointer;
+    font-size: 0.92rem;
+}
+
+.info-doc-btn.active { background: var(--omiscera-genomics); color: #FFFFFF; border-color: var(--omiscera-genomics); }
+
+.info-doc-content { flex: 1 1 500px; min-width: 300px; max-height: 80vh; overflow: auto; }
+
+.reference-list { margin: 0; padding-left: 1.3rem; }
+.reference-list li { margin-bottom: 0.4rem; line-height: 1.4; }
+.reference-list a { font-weight: 600; }
+
+.info-doc-text {
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.86rem;
+    line-height: 1.5;
+    margin: 0;
+}
+
 /* ---------------- Cards / containers ---------------- */
 
 .rank-card, .container-card {
@@ -807,6 +842,24 @@ table.data-table tr.annot-status-sparse { background-color: var(--omiscera-annot
     padding: 0.25rem 0.45rem;
     border-radius: 6px;
     font-size: 0.88rem;
+}
+/* A chart control whose label or options are long (e.g. "Label slices of at
+   least", "Sub class (most specific)") gets a wider box, so its dropdown is not
+   squeezed. Opt-in per control - widening every chart control would reflow them all. */
+.chart-option-control-wide { flex: 1 1 300px; }
+/* Per-class colour pickers (Metabolomics class-composition pie): one compact
+   control per class, in a row of their own so a long class list does not
+   swamp the shared toggle row. */
+.chart-color-row { margin-top: 0.2rem; }
+.chart-color-control { flex: 0 1 240px; }
+.chart-option-color {
+    flex: 0 0 auto;
+    width: 2.2rem;
+    min-height: 1.9rem;
+    padding: 0;
+    border: 0;
+    background: none;
+    cursor: pointer;
 }
 .btn-small { padding: 0.2rem 0.6rem; font-size: 0.8rem; }
 
